@@ -1,0 +1,96 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/scriptorium-core",
+    "crates/scriptorium-cli",
+    "crates/scriptorium-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bogdanp/scriptorium"
+authors = ["Bogdan Polovko"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "signal"] }
+async-trait = "0.1"
+
+# Serde + formats
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0.12"
+toml = "0.8"
+
+# Frontmatter
+gray_matter = { version = "0.2", default-features = false, features = ["yaml"] }
+
+# Markdown + links
+pulldown-cmark = { version = "0.12", default-features = false }
+regex = "1"
+
+# Filesystem + walking
+ignore = "0.4"
+camino = { version = "1.1", features = ["serde1"] }
+directories = "5"
+fd-lock = "4"
+
+# Hashing + IDs
+sha2 = "0.10"
+ulid = { version = "1", features = ["serde"] }
+
+# JSON Schema
+schemars = "0.8"
+jsonschema = { version = "0.18", default-features = false }
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Git
+git2 = { version = "0.19", default-features = false }
+
+# Watching
+notify = "6"
+notify-debouncer-full = "0.3"
+
+# HTTP
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+
+# Logging + errors
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+thiserror = "1"
+miette = { version = "7", features = ["fancy"] }
+
+# Retry
+backoff = { version = "0.4", features = ["tokio"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Internal crates
+scriptorium-core = { path = "crates/scriptorium-core", version = "0.1.0" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

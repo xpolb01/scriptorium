@@ -1,0 +1,56 @@
+[package]
+name = "scriptorium-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Core engine for Scriptorium: vault, ingest, query, lint, LLM provider abstraction"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+mock-llm = []
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yml.workspace = true
+toml.workspace = true
+gray_matter.workspace = true
+pulldown-cmark.workspace = true
+regex.workspace = true
+ignore.workspace = true
+camino.workspace = true
+directories.workspace = true
+fd-lock.workspace = true
+sha2.workspace = true
+ulid.workspace = true
+schemars.workspace = true
+jsonschema.workspace = true
+rusqlite.workspace = true
+git2.workspace = true
+notify.workspace = true
+notify-debouncer-full.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+backoff.workspace = true
+chrono.workspace = true
+
+# URL ingest pipeline (fetch + readability + html→md). Used by `core::url_fetch`.
+dom_smoothie = "0.17"
+html2md = { package = "fast_html2md", version = "0.0.61" }
+tempfile = "3"
+
+[dev-dependencies]
+pretty_assertions = "1"
+proptest = "1"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+git2 = { workspace = true }

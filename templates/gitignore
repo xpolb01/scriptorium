@@ -1,0 +1,17 @@
+# Scriptorium metadata (do commit config.toml, exclude the derived caches)
+.scriptorium/embeddings.sqlite
+.scriptorium/embeddings.sqlite-journal
+.scriptorium/embeddings.sqlite-wal
+.scriptorium/embeddings.sqlite-shm
+.scriptorium/vault.lock
+.scriptorium/graph.json
+.scriptorium/lint-state.json
+.scriptorium/usage.jsonl
+
+# Obsidian workspace state (user-specific, not vault content)
+.obsidian/workspace*
+.obsidian/cache
+
+# OS junk
+.DS_Store
+Thumbs.db
