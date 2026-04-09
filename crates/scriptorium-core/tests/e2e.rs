@@ -715,6 +715,123 @@ async fn embed_reindex_after_ingest_is_cache_hit_on_repeat() {
     );
 }
 
+/// `embed::reindex` should prune orphan rows for pages that have been
+/// removed from the vault (e.g. via direct file delete, `scriptorium
+/// undo` / git revert, or rename). Before this fix, removed pages'
+/// chunks stayed in the embeddings store forever and showed up in
+/// `scriptorium_search` as "valid" hits — a data-integrity bug.
+#[tokio::test]
+async fn embed_reindex_prunes_orphan_rows_for_deleted_pages() {
+    let (dir, vault) = empty_test_vault();
+    let embed_mock = MockProvider::constant("");
+    let store = EmbeddingsStore::in_memory().unwrap();
+
+    // Seed three pages directly via write_page transactions (no ingest
+    // LLM needed).
+    for (stem, body) in [
+        ("alpha", "## A1\n\nAlpha body.\n"),
+        ("beta", "## B1\n\nBeta body.\n"),
+        ("gamma", "## G1\n\nGamma body.\n"),
+    ] {
+        let path = camino::Utf8PathBuf::from(format!("wiki/concepts/{stem}.md"));
+        let mut fm = scriptorium_core::vault::Frontmatter::new(stem);
+        fm.tags = vec!["test".into()];
+        let page = scriptorium_core::vault::Page {
+            path: path.clone(),
+            frontmatter: fm,
+            body: (*body).into(),
+        };
+        let mut tx = vault.begin();
+        tx.write_page(&page).unwrap();
+        tx.commit_without_validation("seed").unwrap();
+    }
+
+    // Reindex — all three pages embed.
+    let first = embed::reindex(&vault, &store, &embed_mock, "mock-embed-test")
+        .await
+        .unwrap();
+    assert_eq!(first, 3, "three H2 sections → three chunks embedded");
+    let after_first = store.len().unwrap();
+    assert_eq!(after_first, 3);
+
+    // Delete one page directly from disk (simulates `scriptorium undo`
+    // removing a file via git-revert, or a manual rm). The page_id row
+    // in the embeddings store is now an orphan.
+    std::fs::remove_file(dir.path().join("wiki/concepts/gamma.md")).unwrap();
+
+    // Reindex again — no new chunks to embed (alpha + beta are cache
+    // hits) but gamma's orphan row must be pruned.
+    let second = embed::reindex(&vault, &store, &embed_mock, "mock-embed-test")
+        .await
+        .unwrap();
+    assert_eq!(second, 0, "unchanged pages are cache hits, nothing new");
+    assert_eq!(
+        store.len().unwrap(),
+        2,
+        "gamma's orphan row should have been pruned, store size 3 → 2"
+    );
+}
+
+/// `embed::reindex` should also prune orphan rows for pages that are
+/// STILL in the vault but whose content has been updated — the old
+/// `content_hash` rows are superseded by new ones. Without pruning,
+/// every edit to a page would accumulate dead rows forever.
+#[tokio::test]
+async fn embed_reindex_prunes_stale_content_hash_rows_on_page_update() {
+    let (dir, vault) = empty_test_vault();
+    let embed_mock = MockProvider::constant("");
+    let store = EmbeddingsStore::in_memory().unwrap();
+
+    // Seed a page.
+    let path = camino::Utf8PathBuf::from("wiki/concepts/mutable.md");
+    let mut fm = scriptorium_core::vault::Frontmatter::new("Mutable");
+    fm.tags = vec!["test".into()];
+    let page_v1 = scriptorium_core::vault::Page {
+        path: path.clone(),
+        frontmatter: fm.clone(),
+        body: "## V1\n\nFirst version body.\n".into(),
+    };
+    {
+        let mut tx = vault.begin();
+        tx.write_page(&page_v1).unwrap();
+        tx.commit_without_validation("seed v1").unwrap();
+    }
+
+    // First reindex: embed v1.
+    let first = embed::reindex(&vault, &store, &embed_mock, "mock-embed-test")
+        .await
+        .unwrap();
+    assert_eq!(first, 1);
+    assert_eq!(store.len().unwrap(), 1);
+
+    // Overwrite the page on disk with new body (no new page_id). This
+    // simulates a `scriptorium_write_page` patch, an ingest update, or
+    // a manual edit — any path that changes `Page::content_hash` while
+    // keeping `Page::frontmatter.id` the same.
+    let existing = std::fs::read_to_string(dir.path().join(path.as_str())).unwrap();
+    let updated_body = existing.replacen(
+        "## V1\n\nFirst version body.\n",
+        "## V1\n\nFirst version body.\n\n## V2\n\nSecond version body added.\n",
+        1,
+    );
+    std::fs::write(dir.path().join(path.as_str()), updated_body).unwrap();
+
+    // Second reindex: v1 hash no longer matches, so v2 gets embedded
+    // as a new version. The old v1 rows must be pruned.
+    let second = embed::reindex(&vault, &store, &embed_mock, "mock-embed-test")
+        .await
+        .unwrap();
+    assert_eq!(
+        second, 2,
+        "updated page has two H2 sections → two new chunks embedded"
+    );
+    assert_eq!(
+        store.len().unwrap(),
+        2,
+        "store should contain only v2's chunks (1 old pruned + 2 new = 2 total, not 3)"
+    );
+}
+
 #[tokio::test]
 async fn embed_reindex_after_two_distinct_ingests_only_embeds_new_pages() {
     let (dir, vault) = empty_test_vault();

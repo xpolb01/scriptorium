@@ -15,7 +15,7 @@ use tracing::debug;
 use super::{chunk_page, EmbeddingRow, EmbeddingsStore};
 use crate::error::{Error, Result};
 use crate::llm::LlmProvider;
-use crate::vault::{Page, Vault};
+use crate::vault::{Page, PageId, Vault};
 
 /// Default chunk size, in characters. ~4000 chars ≈ ~1000 tokens, which
 /// comfortably fits every popular embedding model's per-request limit.
@@ -66,8 +66,24 @@ pub async fn embed_page(
     Ok(chunks.len())
 }
 
-/// Walk the vault and embed every page that isn't already cached. Returns
-/// the total number of chunks embedded across all pages.
+/// Walk the vault and reconcile the embeddings store with the current
+/// page set:
+///
+/// 1. Embed every page whose `(page_id, content_hash, provider, model)`
+///    row isn't already cached (the incremental case — unchanged pages
+///    are free).
+/// 2. Prune orphan rows from the store — any `(page_id, content_hash)`
+///    pair that no longer appears in the current scan. This covers
+///    both pages that were removed (delete, `scriptorium undo` /
+///    git-revert, rename) and pages whose content has since changed
+///    (old hash is no longer current).
+///
+/// Returns the number of *newly embedded* chunks (the incremental insert
+/// count). The pruned-row count is intentionally not part of this
+/// return value — callers that want observability on pruning should use
+/// [`EmbeddingsStore::retain_page_versions`] directly, or inspect
+/// [`EmbeddingsStore::len`] before and after. Most callers just want
+/// "how many new chunks did I pay to embed this run", which is `total`.
 pub async fn reindex(
     vault: &Vault,
     store: &EmbeddingsStore,
@@ -76,9 +92,32 @@ pub async fn reindex(
 ) -> Result<usize> {
     let scan = vault.scan()?;
     let mut total = 0;
+
+    // Compute each page's current hash once: `embed_page` needs it, and
+    // so does the keep-set we build for pruning. Doing it up front lets
+    // us hand the same values to both phases.
+    let mut current_versions: Vec<(PageId, String)> = Vec::with_capacity(scan.pages.len());
+    for page in &scan.pages {
+        let hash = page.content_hash()?;
+        current_versions.push((page.frontmatter.id, hash));
+    }
+
+    // Phase 1: embed pages. `embed_page` computes its own hash inside
+    // `has_page_version` to decide cache-hit/miss; for unchanged pages
+    // this is an indexed lookup, no embedding work.
     for page in &scan.pages {
         total += embed_page(store, provider, model, page).await?;
     }
+
+    // Phase 2: prune orphan rows. Any row whose (page_id, content_hash)
+    // isn't in `current_versions` is an orphan — either from a removed
+    // page or a superseded content version.
+    let keep: Vec<(PageId, &str)> = current_versions
+        .iter()
+        .map(|(id, hash)| (*id, hash.as_str()))
+        .collect();
+    store.retain_page_versions(&keep)?;
+
     Ok(total)
 }
 

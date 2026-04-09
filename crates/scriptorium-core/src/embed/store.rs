@@ -189,6 +189,78 @@ impl EmbeddingsStore {
         Ok(())
     }
 
+    /// Prune the store down to only the rows whose `(page_id, content_hash)`
+    /// appears in `keep`. Returns the total number of rows deleted.
+    ///
+    /// This reconciles the store against a fresh vault scan and handles
+    /// **both** classes of orphan:
+    ///
+    /// 1. **Removed pages**: a page that existed when it was embedded but
+    ///    has since been deleted, reverted (`scriptorium undo`), or
+    ///    renamed. Its `page_id` is no longer in any scan entry, so it is
+    ///    not in `keep`, and every row for that `page_id` is deleted.
+    /// 2. **Stale content versions**: a page that is still present in
+    ///    the vault but whose body has been edited. The new
+    ///    `content_hash` lands alongside the old rows; passing only the
+    ///    current `(page_id, current_hash)` in `keep` prunes every row
+    ///    whose `content_hash` doesn't match.
+    ///
+    /// Callers should build `keep` from a fresh `vault.scan()` + per-page
+    /// `Page::content_hash()`. The full call sequence lives in
+    /// [`crate::embed::reindex`], which already does this.
+    ///
+    /// A single SQL `DELETE` per surviving stale version is cheap for the
+    /// typical vault (tens to a few thousand pages). For vaults with
+    /// hundreds of thousands of chunks, a temporary-table JOIN would be
+    /// faster but is deliberately not implemented yet — premature.
+    pub fn retain_page_versions(&self, keep: &[(PageId, &str)]) -> Result<usize> {
+        use std::collections::HashSet;
+
+        // Build a lookup set keyed by "page_id:hash". String keys avoid
+        // adding a `Hash` bound on `PageId` for this call site.
+        let keep_keys: HashSet<String> = keep
+            .iter()
+            .map(|(id, hash)| format!("{}:{}", id, hash))
+            .collect();
+
+        // Collect the distinct (page_id, content_hash) pairs currently
+        // stored. Materialize into a Vec so the read stmt is dropped
+        // before we run the delete statements.
+        let current: Vec<(String, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT DISTINCT page_id, content_hash FROM embeddings")
+                .map_err(wrap_sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let pid: String = row.get(0)?;
+                    let hash: String = row.get(1)?;
+                    Ok((pid, hash))
+                })
+                .map_err(wrap_sql)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(wrap_sql)?);
+            }
+            out
+        };
+
+        let before = self.len()?;
+        for (pid, hash) in current {
+            let key = format!("{}:{}", pid, hash);
+            if !keep_keys.contains(&key) {
+                self.conn
+                    .execute(
+                        "DELETE FROM embeddings WHERE page_id = ?1 AND content_hash = ?2",
+                        params![pid, hash],
+                    )
+                    .map_err(wrap_sql)?;
+            }
+        }
+        let after = self.len()?;
+        Ok(before.saturating_sub(after))
+    }
+
     /// Total number of rows in the store (test / diagnostics helper).
     pub fn len(&self) -> Result<usize> {
         let count: i64 = self
@@ -451,5 +523,101 @@ mod tests {
         for (a, b) in v.iter().zip(back.iter()) {
             assert!((a - b).abs() < 1e-6);
         }
+    }
+
+    /// Retaining [A, B] when the store has A, B, C should delete every
+    /// chunk row for C and leave A and B untouched. This is the
+    /// "removed page" orphan case — a page that no longer exists in
+    /// the vault scan but still has rows in the embeddings store.
+    #[test]
+    fn retain_page_versions_removes_rows_for_deleted_pages() {
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let a = PageId::new();
+        let b = PageId::new();
+        let c = PageId::new();
+        // Two chunks per page, all with the same hash per page.
+        for (id, hash) in &[(a, "a-hash"), (b, "b-hash"), (c, "c-hash")] {
+            store
+                .upsert(&row(*id, hash, 0, "c0", unit(vec![1.0, 0.0])))
+                .unwrap();
+            store
+                .upsert(&row(*id, hash, 1, "c1", unit(vec![0.0, 1.0])))
+                .unwrap();
+        }
+        assert_eq!(store.len().unwrap(), 6);
+
+        // Keep only A and B — C is a "deleted page" orphan.
+        let keep: Vec<(PageId, &str)> = vec![(a, "a-hash"), (b, "b-hash")];
+        let pruned = store.retain_page_versions(&keep).unwrap();
+        assert_eq!(pruned, 2, "both C chunks should have been pruned");
+        assert_eq!(store.len().unwrap(), 4);
+        assert!(store.has_page_version(a, "a-hash", "mock", "mock-1").unwrap());
+        assert!(store.has_page_version(b, "b-hash", "mock", "mock-1").unwrap());
+        assert!(!store.has_page_version(c, "c-hash", "mock", "mock-1").unwrap());
+    }
+
+    /// Retaining [(A, "hash-2")] when the store has rows for A at both
+    /// "hash-1" and "hash-2" should delete the hash-1 rows and leave
+    /// hash-2 alone. This is the "stale content version" orphan case —
+    /// a page that's still in the vault but whose body has been updated,
+    /// so the old content_hash rows are superseded.
+    #[test]
+    fn retain_page_versions_removes_stale_content_versions_for_kept_page() {
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let a = PageId::new();
+        // Two versions of page A.
+        store
+            .upsert(&row(a, "hash-1", 0, "old c0", unit(vec![1.0, 0.0])))
+            .unwrap();
+        store
+            .upsert(&row(a, "hash-1", 1, "old c1", unit(vec![0.0, 1.0])))
+            .unwrap();
+        store
+            .upsert(&row(a, "hash-2", 0, "new c0", unit(vec![0.0, 1.0])))
+            .unwrap();
+        assert_eq!(store.len().unwrap(), 3);
+
+        // Keep only the new version.
+        let keep: Vec<(PageId, &str)> = vec![(a, "hash-2")];
+        let pruned = store.retain_page_versions(&keep).unwrap();
+        assert_eq!(pruned, 2, "both hash-1 rows should have been pruned");
+        assert_eq!(store.len().unwrap(), 1);
+        assert!(!store.has_page_version(a, "hash-1", "mock", "mock-1").unwrap());
+        assert!(store.has_page_version(a, "hash-2", "mock", "mock-1").unwrap());
+    }
+
+    /// An empty keep set deletes every row. Sanity check for the "vault
+    /// wiped" edge case.
+    #[test]
+    fn retain_page_versions_with_empty_keep_deletes_all() {
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let a = PageId::new();
+        store
+            .upsert(&row(a, "h", 0, "c", unit(vec![1.0, 0.0])))
+            .unwrap();
+        store
+            .upsert(&row(a, "h", 1, "c", unit(vec![0.0, 1.0])))
+            .unwrap();
+        let pruned = store.retain_page_versions(&[]).unwrap();
+        assert_eq!(pruned, 2);
+        assert!(store.is_empty().unwrap());
+    }
+
+    /// Keeping everything that's already in the store is a no-op.
+    #[test]
+    fn retain_page_versions_is_noop_when_keep_matches_store() {
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let a = PageId::new();
+        let b = PageId::new();
+        store
+            .upsert(&row(a, "ha", 0, "a0", unit(vec![1.0, 0.0])))
+            .unwrap();
+        store
+            .upsert(&row(b, "hb", 0, "b0", unit(vec![0.0, 1.0])))
+            .unwrap();
+        let keep: Vec<(PageId, &str)> = vec![(a, "ha"), (b, "hb")];
+        let pruned = store.retain_page_versions(&keep).unwrap();
+        assert_eq!(pruned, 0);
+        assert_eq!(store.len().unwrap(), 2);
     }
 }
