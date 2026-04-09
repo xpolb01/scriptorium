@@ -445,6 +445,184 @@ async fn query_strips_citations_for_pages_not_retrieved() {
     assert_eq!(report.cited_stems, vec!["alpha".to_string()]);
 }
 
+// ---------- ingest commits interned source + produces non-empty commit ----------
+//
+// Regression tests pinning two related bugs that produced empty and
+// partially-written commits in scriptorium-vault:
+//
+// 1. `VaultTx::commit` → `git::commit_paths` → libgit2 `index.add_all`
+//    was silently producing empty commits when `commit_paths` received
+//    relative paths with a `./` prefix (which happens when the CLI opens
+//    the vault at `"."` and `apply_and_commit` does `root.join("log.md")`
+//    → `./log.md`). libgit2's pathspec matcher doesn't treat `./log.md`
+//    as equivalent to the index entry `log.md`.
+//
+// 2. `intern_source` writes the interned source to disk via
+//    `std::fs::write`, bypassing the VaultTx. The interned file never
+//    entered git, so every wiki page's `sources: [...]` frontmatter
+//    referenced a file that didn't exist in the git history.
+//
+// The fix for (1) is in `git::stage_paths` (normalize to absolute before
+// strip_prefix, use `add_path` per file). The fix for (2) is in
+// `ingest::ingest_with_options` (stage the interned source via
+// `tx.put_file`). Both must hold for this test to pass.
+
+#[tokio::test]
+async fn ingest_commit_is_non_empty_and_contains_both_source_and_wiki_page() {
+    let (dir, vault) = empty_test_vault();
+
+    let plan = IngestPlan {
+        summary: "commit coverage".into(),
+        pages: vec![IngestPageAction {
+            action: IngestAction::Create,
+            path: "wiki/concepts/covered.md".into(),
+            title: "Covered".into(),
+            tags: vec!["test".into()],
+            body: "## Body\n\nPlain body with no wikilinks.\n".into(),
+        }],
+        log_entry: "ingested source".into(),
+    };
+    let mock = MockProvider::constant(serde_json::to_string(&plan).unwrap());
+    let source = dir.path().join("sources/articles/coverage-source.md");
+    std::fs::write(&source, "Coverage source contents.\n").unwrap();
+
+    let report = ingest::ingest(&vault, &mock, &source).await.unwrap();
+    assert_eq!(report.created, 1);
+    assert_eq!(report.commit_id.len(), 40);
+
+    // Inspect the HEAD commit's tree. It MUST contain:
+    //   - wiki/concepts/covered.md (the page)
+    //   - log.md (the append)
+    //   - the interned source under sources/articles/<hash>-<slug>.md
+    //   - (optionally index.md if it was regenerated)
+    let repo = git2::Repository::open(dir.path()).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    let tree = head.tree().unwrap();
+
+    // Non-empty commit assertion — guards against the `./log.md` bug.
+    // `empty_test_vault` returns a vault with no prior commits, so this
+    // ingest is the initial commit (no parent). In that case, the guard
+    // becomes "tree is not empty" (enforced by the walk assertions below).
+    // If a parent exists, assert tree divergence.
+    if let Ok(parent) = head.parent(0) {
+        assert_ne!(
+            head.tree_id(),
+            parent.tree_id(),
+            "commit tree matches parent tree — ingest produced an empty commit \
+             (the `./log.md` libgit2 pathspec bug)"
+        );
+    }
+
+    // Walk wiki/concepts/covered.md
+    let wiki_oid = tree.get_name("wiki").expect("wiki/ tree").id();
+    let wiki_tree = repo.find_tree(wiki_oid).unwrap();
+    let concepts_oid = wiki_tree.get_name("concepts").expect("wiki/concepts/").id();
+    let concepts_tree = repo.find_tree(concepts_oid).unwrap();
+    assert!(
+        concepts_tree.get_name("covered.md").is_some(),
+        "commit tree missing wiki/concepts/covered.md"
+    );
+
+    // Walk sources/articles/<hash>-<slug>.md — the interned source.
+    // We don't know the hash prefix ahead of time, so just enumerate.
+    let sources_oid = tree.get_name("sources").expect("sources/ tree").id();
+    let sources_tree = repo.find_tree(sources_oid).unwrap();
+    let articles_oid = sources_tree
+        .get_name("articles")
+        .expect("sources/articles/ tree")
+        .id();
+    let articles_tree = repo.find_tree(articles_oid).unwrap();
+    let any_source = (0..articles_tree.len())
+        .map(|i| articles_tree.get(i).unwrap())
+        .find(|entry| {
+            let name = entry.name().unwrap_or("");
+            name.contains("coverage-source") && name.ends_with(".md")
+        });
+    assert!(
+        any_source.is_some(),
+        "commit tree missing interned source under sources/articles/<hash>-coverage-source.md — \
+         tx.put_file for the interned source was not committed"
+    );
+
+    // log.md is in the tree with the new entry.
+    let log_oid = tree.get_name("log.md").expect("log.md in tree").id();
+    let log_blob = repo.find_blob(log_oid).unwrap();
+    let log_body = std::str::from_utf8(log_blob.content()).unwrap();
+    assert!(
+        log_body.contains("ingested source"),
+        "committed log.md missing the append: {log_body:?}"
+    );
+}
+
+/// Regression for the second ingest scenario: `empty_test_vault` uses an
+/// absolute TempDir path, but the production failure happened when the
+/// CLI ran from inside the vault with `-C .`. This test explicitly
+/// exercises a `Vault` opened via a relative path to cover that code
+/// path at the e2e level.
+#[tokio::test]
+async fn ingest_commit_is_non_empty_when_vault_opened_via_relative_path() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("wiki/concepts")).unwrap();
+    std::fs::create_dir_all(dir.path().join("sources/articles")).unwrap();
+    std::fs::write(
+        dir.path().join("CLAUDE.md"),
+        "# Vault Rules\n\nBe concise.\n",
+    )
+    .unwrap();
+
+    // CHANGE current directory into the temp vault and open with a
+    // RELATIVE path. This reproduces the CLI flow where `scriptorium
+    // ingest` is run from inside the vault without `-C`.
+    let orig_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(dir.path()).unwrap();
+    // Open with `.` to force vault.root() to be a relative path.
+    let vault = Vault::open(std::path::Path::new(".")).unwrap();
+
+    let plan = IngestPlan {
+        summary: "relative path test".into(),
+        pages: vec![IngestPageAction {
+            action: IngestAction::Create,
+            path: "wiki/concepts/rel.md".into(),
+            title: "Rel".into(),
+            tags: vec![],
+            body: "plain body\n".into(),
+        }],
+        log_entry: "relative".into(),
+    };
+    let mock = MockProvider::constant(serde_json::to_string(&plan).unwrap());
+    let source = dir.path().join("sources/articles/rel-source.md");
+    std::fs::write(&source, "rel source\n").unwrap();
+
+    let report = ingest::ingest(&vault, &mock, &source).await.unwrap();
+
+    // Restore cwd BEFORE assertions so a test failure doesn't leave the
+    // test process in the tempdir (which is about to be removed).
+    std::env::set_current_dir(&orig_cwd).unwrap();
+
+    assert_eq!(report.created, 1);
+    // The critical assertion: non-empty commit.
+    let repo = git2::Repository::open(dir.path()).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    let parent = head.parent(0).ok();
+    if let Some(parent) = parent {
+        assert_ne!(
+            head.tree_id(),
+            parent.tree_id(),
+            "relative-vault-path ingest produced an empty commit — the \
+             `./log.md` bug is back"
+        );
+    }
+    // Page is in the tree.
+    let tree = head.tree().unwrap();
+    let wiki = repo
+        .find_tree(tree.get_name("wiki").expect("wiki/").id())
+        .unwrap();
+    let concepts = repo
+        .find_tree(wiki.get_name("concepts").expect("concepts/").id())
+        .unwrap();
+    assert!(concepts.get_name("rel.md").is_some());
+}
+
 // ---------- ingest + embed::reindex contract ----------
 //
 // These tests pin the building blocks the CLI/MCP dispatch sites compose

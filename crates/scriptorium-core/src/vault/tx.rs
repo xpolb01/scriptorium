@@ -243,12 +243,19 @@ impl VaultTx<'_> {
 /// borrow-checker gymnastics.
 fn validate_pending(vault: &Vault, pending: &BTreeMap<Utf8PathBuf, Pending>) -> Result<LintReport> {
     let mut scan = vault.scan()?;
-    // Overlay the pending writes on top of the scan. Only `Put` entries that
-    // parse cleanly as a `Page` participate in link-graph validation; arbitrary
-    // file writes (log.md, raw sources) cannot introduce broken wikilinks.
+    // Overlay the pending writes on top of the scan. Only `Put` entries under
+    // `wiki/` are page candidates and participate in link-graph validation;
+    // everything else (log.md, raw sources under `sources/`, top-level
+    // derived files like index.md) is excluded — sources are immutable
+    // inputs by definition and a source's own frontmatter or wikilinks must
+    // never fail a wiki-page validation.
     for (path, op) in pending {
         match op {
             Pending::Put(content) => {
+                if !path.starts_with("wiki/") {
+                    // Non-wiki put: not a wiki page, skip parse + overlay.
+                    continue;
+                }
                 scan.pages.retain(|p| &p.path != path);
                 if let Ok(page) = Page::parse(path.clone(), content) {
                     scan.pages.push(page);

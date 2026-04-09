@@ -167,6 +167,16 @@ pub async fn ingest_with_options(
     // and is patched in lockstep with each `tx.write_page` call.
     let mut future_pages: Vec<Page> = scan.pages.clone();
 
+    // Stage the interned source file into the transaction so it lands in
+    // the same git commit as the wiki pages that reference it. Without
+    // this, `intern_source` writes the bytes to disk via `std::fs::write`
+    // but the file never enters git — the resulting wiki pages carry a
+    // `sources: [...]` frontmatter pointing at an untracked file. This
+    // is idempotent: re-ingesting the same source writes the same bytes
+    // to the same content-hash-prefixed path, so staging it again is a
+    // no-op from git's perspective (same blob oid).
+    tx.put_file(&interned, source_text.clone())?;
+
     for action in &plan.pages {
         let path = Utf8PathBuf::from(&action.path);
         let existing = scan.pages.iter().find(|p| p.path == path);
