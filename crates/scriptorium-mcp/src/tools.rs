@@ -105,18 +105,22 @@ fn all_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "scriptorium_ingest",
-            description: "Ingest a source into the vault. Provide either `source` (absolute path to a local file) or `url` (HTTP URL to fetch, run through Readability, and convert to markdown). Returns the commit id, or a dry-run diff if `dry_run` is true.",
+            description: "Ingest a source into the vault. Provide either `source` (absolute path to a local file) or `url` (HTTP URL to fetch, run through Readability, and convert to markdown) — exactly one is required. Returns the commit id, or a dry-run diff if `dry_run` is true.",
+            // IMPORTANT: do NOT express the "source XOR url" constraint using
+            // `oneOf` / `anyOf` / `allOf` at the top level of this schema.
+            // The Anthropic API's `tools.*.custom.input_schema` rejects those
+            // combinators at the top level with a 400 that POISONS the tool
+            // registry — every subsequent API call in the session 400s until
+            // the tool is removed. The XOR is already enforced at runtime by
+            // `ingest_tool` which returns a clear InvalidArgs error on
+            // (None, None) and (Some, Some). Keep the schema flat.
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "source":  {"type": "string", "description": "Absolute path to a local source file. Mutually exclusive with `url`."},
-                    "url":     {"type": "string", "description": "URL to fetch and ingest as if it were a local file. Mutually exclusive with `source`."},
+                    "source":  {"type": "string", "description": "Absolute path to a local source file. Mutually exclusive with `url`; exactly one of `source` or `url` is required."},
+                    "url":     {"type": "string", "description": "URL to fetch and ingest as if it were a local file. Mutually exclusive with `source`; exactly one of `source` or `url` is required."},
                     "dry_run": {"type": "boolean", "default": false, "description": "If true, stage the ingest, return the diff, and do not commit."}
-                },
-                "oneOf": [
-                    {"required": ["source"]},
-                    {"required": ["url"]}
-                ]
+                }
             }),
         },
         ToolSpec {
@@ -525,6 +529,40 @@ mod tests {
         assert!(names.contains(&"scriptorium_log_tail"));
         assert!(names.contains(&"scriptorium_list_pages"));
         assert!(names.contains(&"scriptorium_lint"));
+    }
+
+    /// Regression guard: the Anthropic API's
+    /// `tools.*.custom.input_schema` rejects `oneOf` / `anyOf` / `allOf`
+    /// at the top level of a tool's input schema with a 400 that
+    /// POISONS the tool registry for the rest of the session — every
+    /// subsequent API call also fails until the tool is removed.
+    ///
+    /// scriptorium_ingest previously used `oneOf` at the top level to
+    /// express "source XOR url", which broke Claude Code sessions that
+    /// tried to load it. Runtime handlers do the XOR check instead. No
+    /// tool spec should ever re-introduce a top-level combinator.
+    #[test]
+    fn tool_specs_have_no_top_level_json_schema_combinators() {
+        let reg = ToolRegistry::new();
+        let specs = reg.describe_all();
+        let forbidden = ["oneOf", "anyOf", "allOf", "not"];
+        for spec in &specs {
+            let name = spec["name"].as_str().unwrap_or("?");
+            let input_schema = &spec["inputSchema"];
+            assert!(
+                input_schema.is_object(),
+                "tool `{name}` has a non-object input schema"
+            );
+            for key in &forbidden {
+                assert!(
+                    input_schema.get(key).is_none(),
+                    "tool `{name}` has top-level `{key}` in its input schema. \
+                     The Anthropic API rejects this with a 400 that poisons \
+                     the whole tool registry. Express constraints at runtime \
+                     in the tool handler instead."
+                );
+            }
+        }
     }
 
     // ---------- ingest_tool: post-ingest auto-reindex coverage ----------
