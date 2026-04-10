@@ -918,3 +918,103 @@ async fn mock_provider_round_trips_a_structured_response() {
         .unwrap();
     assert_eq!(vecs, vecs2, "embeddings are deterministic");
 }
+
+#[tokio::test]
+async fn ingest_salvages_missing_log_entry_from_llm_response() {
+    // Reproduces today's production bug: the LLM returns an IngestPlan with
+    // `summary` and `pages` but omits `log_entry`. With the salvage layer
+    // in place, the ingest should succeed and the missing log_entry should
+    // be synthesized from the summary.
+    let (dir, vault) = empty_test_vault();
+
+    // Craft raw JSON directly (NOT via the `IngestPlan` Serialize path,
+    // because serializing a real `IngestPlan` always includes log_entry).
+    let raw = serde_json::json!({
+        "summary": "salvage test",
+        "pages": [{
+            "action": "create",
+            "path": "wiki/concepts/salvage.md",
+            "title": "Salvage",
+            "tags": [],
+            "body": "Body with no wikilinks.\n"
+        }]
+    });
+    let mock = MockProvider::constant(raw.to_string());
+    let source = dir.path().join("sources/articles/salvage.md");
+    std::fs::write(&source, "body").unwrap();
+
+    let report = ingest::ingest(&vault, &mock, &source)
+        .await
+        .expect("ingest must succeed via log_entry salvage");
+    assert_eq!(report.created, 1);
+    assert_eq!(report.summary, "salvage test");
+
+    // The synthesized log entry landed in log.md with the auto-synthesized
+    // marker, so a human reviewing the log knows it wasn't the model's text.
+    let log_contents = std::fs::read_to_string(dir.path().join("log.md")).unwrap();
+    assert!(log_contents.contains("salvage test"));
+    assert!(
+        log_contents.contains("auto-synthesized"),
+        "synthesized log entry should be labelled: {log_contents}"
+    );
+}
+
+#[tokio::test]
+async fn ingest_persists_failure_record_on_unsalvageable_response() {
+    // When the LLM returns JSON missing a field the salvage layer cannot
+    // recover (e.g. `pages` is absent, which has no sensible default), the
+    // ingest must fail loudly AND persist the raw response to
+    // `<vault>/.ingest-failures/` for later debugging.
+    let (dir, vault) = empty_test_vault();
+
+    let unsalvageable = r#"{"summary": "broken"}"#; // no `pages` field
+    let mock = MockProvider::constant(unsalvageable.to_string());
+    let source = dir.path().join("sources/articles/broken.md");
+    std::fs::write(&source, "body").unwrap();
+
+    let err = ingest::ingest(&vault, &mock, &source).await.unwrap_err();
+    assert!(
+        err.to_string().contains("invalid IngestPlan"),
+        "error should mention invalid IngestPlan: {err}"
+    );
+    assert!(
+        err.to_string().contains(".ingest-failures/"),
+        "error should point at the persisted record path: {err}"
+    );
+
+    // Failure record must exist under .ingest-failures/.
+    let failures_dir = dir.path().join(".ingest-failures");
+    assert!(
+        failures_dir.exists(),
+        ".ingest-failures directory must be created"
+    );
+    let entries: Vec<_> = std::fs::read_dir(&failures_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "exactly one failure file must be written"
+    );
+    let filename = entries[0].file_name();
+    let filename = filename.to_string_lossy();
+    assert!(
+        filename.ends_with("-broken.json"),
+        "filename should include source stem: {filename}"
+    );
+
+    // Record contents must include the raw response, parse error, and prompt.
+    let contents = std::fs::read_to_string(entries[0].path()).unwrap();
+    let record: serde_json::Value = serde_json::from_str(&contents).unwrap();
+    assert_eq!(record["raw_response"], unsalvageable);
+    assert!(record["parse_error"].as_str().unwrap().contains("pages"));
+    assert_eq!(record["provider"], "mock");
+    assert!(record["prompt_system"].is_string());
+    assert!(record["prompt_user_messages"].is_array());
+    assert!(record["timestamp"].is_string());
+
+    // No wiki page was written and log.md was not touched.
+    assert!(!dir.path().join("wiki/concepts/broken.md").exists());
+    assert!(!dir.path().join("log.md").exists());
+}

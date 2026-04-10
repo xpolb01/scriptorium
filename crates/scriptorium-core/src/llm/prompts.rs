@@ -31,7 +31,25 @@ use super::{CompletionRequest, Message, Role};
 /// One plan may create zero or more new pages and update zero or more
 /// existing ones. The engine applies each action deterministically after
 /// re-validating the plan against [`IngestPlan::schema`].
+///
+/// ## Wire-compatibility salvage
+///
+/// Observed in production: the model occasionally omits the `log_entry`
+/// field on large ingests (likely when it runs out of output budget before
+/// finishing the object). To keep ingest moving instead of aborting the
+/// whole commit, `IngestPlan` is deserialized via an intermediate
+/// [`IngestPlanRaw`] that treats `log_entry` as optional and synthesizes a
+/// fallback from `summary` and `pages` when the model doesn't supply one.
+/// `summary` and `pages` remain hard requirements.
+///
+/// **Important**: `JsonSchema` still derives from *this* struct (the
+/// target, not the raw wrapper), so the schema reported to Anthropic's
+/// strict mode keeps `log_entry` in `required`. Strict mode will still
+/// prevent the bug at the API boundary; the `try_from` layer only catches
+/// the fallback providers (mock, Ollama) and any future regression.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[serde(try_from = "IngestPlanRaw")]
 pub struct IngestPlan {
     /// One-line human summary of what the source contained.
     pub summary: String,
@@ -40,6 +58,48 @@ pub struct IngestPlan {
     pub pages: Vec<IngestPageAction>,
     /// The entry to append to `log.md`. Should be a single line.
     pub log_entry: String,
+}
+
+/// Lenient wire shape used only as a deserialization waypoint. Accepts
+/// responses where `log_entry` is missing or empty and synthesizes it from
+/// the summary + page count. `summary` and `pages` remain hard requirements
+/// — if the model omits either of those there is nothing sensible to
+/// synthesize from, and the ingest should fail loudly.
+///
+/// This struct is crate-private and never appears in the public API; it
+/// exists purely as the target of `#[serde(try_from)]` on [`IngestPlan`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IngestPlanRaw {
+    summary: String,
+    pages: Vec<IngestPageAction>,
+    #[serde(default)]
+    log_entry: Option<String>,
+}
+
+impl TryFrom<IngestPlanRaw> for IngestPlan {
+    type Error = String;
+    fn try_from(r: IngestPlanRaw) -> Result<Self, Self::Error> {
+        let log_entry = r
+            .log_entry
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| derive_log_entry(&r.summary, &r.pages));
+        Ok(Self {
+            summary: r.summary,
+            pages: r.pages,
+            log_entry,
+        })
+    }
+}
+
+/// Synthesize a one-line `log_entry` from the rest of an [`IngestPlan`] when
+/// the model didn't emit one. The output shape mirrors the normal log
+/// entries so the resulting `log.md` stays uniform.
+fn derive_log_entry(summary: &str, pages: &[IngestPageAction]) -> String {
+    let first_line = summary.lines().next().unwrap_or("ingest").trim();
+    let page_count = pages.len();
+    let suffix = if page_count == 1 { "page" } else { "pages" };
+    format!("{first_line} ({page_count} {suffix}, log_entry auto-synthesized)")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -149,7 +209,9 @@ pub fn ingest_prompt(
          ## Task\n\n\
          Return an `IngestPlan` with (1) a one-line `summary`, (2) `pages` \
          describing create/update actions, (3) a one-line `log_entry` for \
-         `log.md`. Respond with JSON only.",
+         `log.md`. All three fields are REQUIRED — omitting any one will \
+         cause the ingest to be rejected. Respond with JSON only: no prose, \
+         no apology, no markdown fence.",
         pages = ctx.render_pages()
     );
     CompletionRequest {
@@ -158,7 +220,13 @@ pub fn ingest_prompt(
             role: Role::User,
             content: user,
         }],
-        max_tokens: 4096,
+        // 16K output budget. A single ingest over a mid-size source routinely
+        // produces 4–6 wiki pages (titles + bodies) plus the summary and
+        // log_entry — ~8K tokens of actual content is common, and the old
+        // 4K ceiling truncated responses mid-tool-call, producing partial
+        // JSON missing required fields. 16K comfortably fits the long tail
+        // without wasting context on the short tail.
+        max_tokens: 16_384,
         temperature: Some(0.2),
         response_schema: Some(IngestPlan::schema()),
     }
@@ -263,6 +331,120 @@ mod tests {
         let parsed: IngestPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.summary, plan.summary);
         assert_eq!(parsed.pages[0].action, IngestAction::Create);
+    }
+
+    #[test]
+    fn ingest_plan_salvage_synthesizes_missing_log_entry() {
+        // This is the exact shape that caused today's production failure:
+        // summary and pages are present, log_entry is missing entirely.
+        let input = r#"{
+            "summary": "Cross-system survey of LLM structured output",
+            "pages": [{
+                "action": "create",
+                "path": "wiki/patterns/test.md",
+                "title": "Test",
+                "body": "body\n"
+            }]
+        }"#;
+        let plan: IngestPlan =
+            serde_json::from_str(input).expect("salvage must accept missing log_entry");
+        assert_eq!(plan.summary, "Cross-system survey of LLM structured output");
+        assert_eq!(plan.pages.len(), 1);
+        assert!(
+            !plan.log_entry.trim().is_empty(),
+            "synthesized log_entry must be non-empty"
+        );
+        assert!(
+            plan.log_entry.contains("auto-synthesized"),
+            "synthesized entry should be marked as such: {}",
+            plan.log_entry
+        );
+    }
+
+    #[test]
+    fn ingest_plan_salvage_synthesizes_empty_log_entry() {
+        // Whitespace-only log_entry counts as missing.
+        let input = r#"{
+            "summary": "whitespace test",
+            "pages": [],
+            "log_entry": "   "
+        }"#;
+        let plan: IngestPlan = serde_json::from_str(input).unwrap();
+        assert!(!plan.log_entry.trim().is_empty());
+        assert!(plan.log_entry.contains("auto-synthesized"));
+    }
+
+    #[test]
+    fn ingest_plan_salvage_rejects_missing_summary() {
+        // Salvage must be targeted: if summary is missing, there's nothing
+        // sensible to synthesize from, so the ingest should fail loudly.
+        let input = r#"{ "pages": [], "log_entry": "x" }"#;
+        let result: Result<IngestPlan, _> = serde_json::from_str(input);
+        assert!(result.is_err(), "missing summary must still fail");
+    }
+
+    #[test]
+    fn ingest_plan_salvage_rejects_missing_pages() {
+        // Same as above for `pages`: without knowing which pages the model
+        // wanted to write, we cannot invent them.
+        let input = r#"{ "summary": "x", "log_entry": "x" }"#;
+        let result: Result<IngestPlan, _> = serde_json::from_str(input);
+        assert!(result.is_err(), "missing pages must still fail");
+    }
+
+    #[test]
+    fn ingest_plan_salvage_rejects_unknown_fields() {
+        // deny_unknown_fields is required for Anthropic strict mode
+        // (additionalProperties: false) and also catches LLM drift early.
+        let input = r#"{
+            "summary": "x",
+            "pages": [],
+            "log_entry": "x",
+            "bogus": "field"
+        }"#;
+        let result: Result<IngestPlan, _> = serde_json::from_str(input);
+        assert!(result.is_err(), "unknown fields must be rejected");
+    }
+
+    #[test]
+    fn ingest_plan_schema_still_requires_log_entry() {
+        // This is the critical compatibility test between `try_from` and
+        // `JsonSchema`. schemars derives the schema from the target type
+        // (IngestPlan), not the raw wrapper (IngestPlanRaw), so `log_entry`
+        // must still appear in `required`. If this assertion ever fails,
+        // Anthropic strict mode will stop enforcing the field and we'll
+        // silently regress to the old bug.
+        let schema = IngestPlan::schema();
+        let required = schema["required"]
+            .as_array()
+            .expect("schema has required array");
+        let names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            names.contains(&"log_entry"),
+            "log_entry must remain required in schema, got: {names:?}"
+        );
+        assert!(names.contains(&"summary"));
+        assert!(names.contains(&"pages"));
+    }
+
+    #[test]
+    fn derive_log_entry_is_stable_and_descriptive() {
+        let entry = derive_log_entry(
+            "Cross-system survey of LLM structured output",
+            &[IngestPageAction {
+                action: IngestAction::Create,
+                path: "wiki/a.md".into(),
+                title: "A".into(),
+                tags: vec![],
+                body: "x".into(),
+            }],
+        );
+        assert!(entry.contains("Cross-system survey"));
+        assert!(entry.contains("1 page"));
+        assert!(!entry.contains("1 pages"));
+
+        let multi = derive_log_entry("topic", &vec![]);
+        assert!(multi.contains("0 pages"));
     }
 
     #[test]

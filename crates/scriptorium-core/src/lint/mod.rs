@@ -14,7 +14,10 @@
 pub mod broken_links;
 pub mod fix;
 pub mod frontmatter;
+pub mod missing_tags;
 pub mod orphans;
+pub mod page_structure;
+pub mod stale;
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
@@ -122,6 +125,9 @@ pub fn run(vault: &Vault) -> Result<LintReport> {
     issues.extend(frontmatter::check(&scan.pages));
     issues.extend(broken_links::check(&graph));
     issues.extend(orphans::check(&graph));
+    issues.extend(stale::check(vault, &scan.pages));
+    issues.extend(missing_tags::check(&scan.pages));
+    issues.extend(page_structure::check(&scan.pages));
     // Stable sort by severity then path then rule so diffs of `lint` output
     // between runs are clean.
     issues.sort_by(|a, b| {

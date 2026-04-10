@@ -8,6 +8,10 @@
 .scriptorium/lint-state.json
 .scriptorium/usage.jsonl
 
+# Persisted LLM failure records from `scriptorium ingest` parse errors.
+# These are local debugging artefacts, never part of vault history.
+.ingest-failures/
+
 # Obsidian workspace state (user-specific, not vault content)
 .obsidian/workspace*
 .obsidian/cache

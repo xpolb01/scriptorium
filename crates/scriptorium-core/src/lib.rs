@@ -15,7 +15,9 @@
 //! validates them with mechanical lint, takes a vault lock, fsyncs files, and
 //! creates a single git commit. Git is the durable undo log.
 
+pub mod bulk_ingest;
 pub mod config;
+pub mod doctor;
 pub mod embed;
 pub mod error;
 pub mod git;
@@ -23,9 +25,11 @@ pub mod index;
 pub mod ingest;
 pub mod lint;
 pub mod llm;
+pub mod maintain;
 pub mod query;
 pub mod reindex;
 pub mod schema;
+pub mod search;
 pub mod url_fetch;
 pub mod vault;
 pub mod watch;

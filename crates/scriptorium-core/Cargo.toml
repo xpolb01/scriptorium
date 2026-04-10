@@ -14,6 +14,7 @@ workspace = true
 [features]
 default = []
 mock-llm = []
+hnsw = ["dep:usearch"]
 
 [dependencies]
 tokio.workspace = true
@@ -48,6 +49,10 @@ chrono.workspace = true
 dom_smoothie = "0.17"
 html2md = { package = "fast_html2md", version = "0.0.61" }
 tempfile = "3"
+
+# Optional: HNSW vector index for O(log n) nearest-neighbor search at scale.
+# Requires C++ toolchain at build time. Enable via `--features hnsw`.
+usearch = { version = "2", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1"

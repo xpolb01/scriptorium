@@ -28,6 +28,32 @@ pub struct Chunk {
 /// preferring H2/H3 heading boundaries. Empty bodies produce no chunks.
 pub fn chunk_page(body: &str, max_chars: usize) -> Vec<Chunk> {
     assert!(max_chars > 0, "max_chars must be positive");
+    let sections = split_into_sections(body);
+
+    // Split any oversize sections by paragraph, assigning consecutive indices.
+    let mut out = Vec::with_capacity(sections.len());
+    let mut idx = 0usize;
+    for section in sections {
+        for sub in split_by_paragraph(&section.text, max_chars) {
+            out.push(Chunk {
+                idx,
+                heading: section.heading.clone(),
+                text: sub,
+            });
+            idx += 1;
+        }
+    }
+    out
+}
+
+pub(crate) struct Section {
+    pub heading: Option<String>,
+    pub text: String,
+}
+
+/// Split a body into heading-delimited sections. Reused by the recursive
+/// and semantic chunkers to preserve heading context.
+pub(crate) fn split_into_sections(body: &str) -> Vec<Section> {
     let mut sections: Vec<Section> = Vec::new();
     let mut current_heading: Option<String> = None;
     let mut current_text = String::new();
@@ -52,29 +78,10 @@ pub fn chunk_page(body: &str, max_chars: usize) -> Vec<Chunk> {
             text: current_text,
         });
     }
-
-    // Split any oversize sections by paragraph, assigning consecutive indices.
-    let mut out = Vec::with_capacity(sections.len());
-    let mut idx = 0usize;
-    for section in sections {
-        for sub in split_by_paragraph(&section.text, max_chars) {
-            out.push(Chunk {
-                idx,
-                heading: section.heading.clone(),
-                text: sub,
-            });
-            idx += 1;
-        }
-    }
-    out
+    sections
 }
 
-struct Section {
-    heading: Option<String>,
-    text: String,
-}
-
-fn heading_text(line: &str) -> Option<String> {
+pub(crate) fn heading_text(line: &str) -> Option<String> {
     // Only H2 and H3 become chunk boundaries. H1 is usually the page title
     // (duplicated from frontmatter) and H4+ is too fine-grained for
     // retrieval.

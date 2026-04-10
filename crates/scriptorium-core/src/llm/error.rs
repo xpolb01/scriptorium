@@ -23,6 +23,18 @@ pub enum LlmError {
     #[error("response could not be parsed: {0}")]
     InvalidResponse(String),
 
+    #[error(
+        "{provider} truncated the response at the max_tokens ceiling \
+         ({output_tokens}/{max_tokens}); the structured output is incomplete \
+         and cannot be parsed. Raise max_tokens on the CompletionRequest or \
+         shorten the source."
+    )]
+    Truncated {
+        provider: String,
+        output_tokens: u64,
+        max_tokens: u32,
+    },
+
     #[error("operation not supported by {provider}: {operation}")]
     Unsupported { provider: String, operation: String },
 

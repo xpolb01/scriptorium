@@ -88,6 +88,8 @@ impl ToolRegistry {
             "scriptorium_write_page" => write_page_tool(args, ctx),
             "scriptorium_search" => search_tool(args, ctx).await,
             "scriptorium_log_tail" => log_tail_tool(args, ctx),
+            "scriptorium_doctor" => doctor_tool(ctx),
+            "scriptorium_maintain" => maintain_tool(args, ctx).await,
             other => Err(ToolError::NotFound(other.to_string())),
         }
     }
@@ -101,6 +103,7 @@ impl Default for ToolRegistry {
 
 // ---------- tool specs ----------
 
+#[allow(clippy::too_many_lines)]
 fn all_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
@@ -189,6 +192,32 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "n": {"type": "integer", "default": 20, "minimum": 1, "maximum": 200}
                 }
+            }),
+        },
+        ToolSpec {
+            name: "scriptorium_maintain",
+            description: "Run maintenance tasks: lint, stale page detection, \
+                          embedding coverage, and optionally auto-fix safe \
+                          issues (re-embed stale pages, fix bad timestamps).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "fix": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Auto-fix safe issues (re-embed stale, fix timestamps)"
+                    }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "scriptorium_doctor",
+            description: "Run health checks on the vault: git repo, schema, \
+                          embeddings coverage, broken links, git status. \
+                          No LLM required. Returns a structured report.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
             }),
         },
     ]
@@ -460,6 +489,33 @@ fn log_tail_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError> 
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(args.n);
     Ok(lines[start..].join("\n"))
+}
+
+async fn maintain_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError> {
+    let fix = args
+        .get("fix")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let store = open_store(ctx)?;
+    let options = scriptorium_core::maintain::MaintainOptions { fix };
+    let report = scriptorium_core::maintain::maintain(
+        &ctx.vault,
+        &store,
+        Some(ctx.embed_provider.as_ref()),
+        &ctx.embeddings_model,
+        &options,
+    )
+    .await
+    .map_err(|e| ToolError::Failed(format!("maintain: {e}")))?;
+    serde_json::to_string_pretty(&report)
+        .map_err(|e| ToolError::Failed(format!("json: {e}")))
+}
+
+fn doctor_tool(ctx: &ServerContext) -> Result<String, ToolError> {
+    let store = open_store(ctx).ok();
+    let report =
+        scriptorium_core::doctor::run_doctor(&ctx.vault, store.as_ref());
+    serde_json::to_string_pretty(&report).map_err(|e| ToolError::Failed(format!("json: {e}")))
 }
 
 // ---------- helpers ----------

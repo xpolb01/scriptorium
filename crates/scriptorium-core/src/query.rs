@@ -1,35 +1,38 @@
-//! Query pipeline: question → retrieval → LLM → cited answer.
+//! Query pipeline: question → hybrid retrieval → LLM → cited answer.
 //!
 //! ```text
-//! question  ──►  provider.embed()  ──►  store.search(top_k)
-//!                                             │
-//!                                             ▼
-//!                              dedupe chunks → page ids
-//!                                             │
-//!                                             ▼
-//!                       link_graph one-hop backlink expansion
-//!                                             │
-//!                                             ▼
+//! question  ──►  expand_query() → embed variants → vector search (N lists)
+//!                                                   keyword search (1 list)
+//!                                                         │
+//!                                                         ▼
+//!                                          RRF fusion → dedup pipeline
+//!                                                         │
+//!                                                         ▼
+//!                              dedupe chunks → page ids → backlink expansion
+//!                                                         │
+//!                                                         ▼
 //!                         PromptContext { schema, relevant_pages }
-//!                                             │
-//!                                             ▼
+//!                                                         │
+//!                                                         ▼
 //!                             query_prompt()  ──►  provider.complete()
-//!                                             │
-//!                                             ▼
-//!                                      QueryAnswer (JSON)
+//!                                                         │
+//!                                                         ▼
+//!                                                  QueryAnswer (JSON)
 //! ```
 //!
-//! The pipeline uses the [`EmbeddingsStore`] populated by
-//! [`crate::embed::reindex`] for retrieval. For tests, the mock provider
-//! gives deterministic embeddings so retrieval is reproducible without
-//! needing any real vectors.
+//! Retrieval uses [`crate::search::hybrid_search`], which combines vector
+//! similarity, FTS5 keyword search, multi-query expansion, and RRF fusion
+//! into a single ranked result set. For tests, the mock provider gives
+//! deterministic embeddings and expansion gracefully degrades.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::embed::EmbeddingsStore;
 use crate::error::{Error, Result};
+use crate::lint::stale;
 use crate::llm::{query_prompt, record_usage, LlmProvider, PromptContext, QueryAnswer};
 use crate::schema::Schema;
+use crate::search::{self, HybridSearchOpts};
 use crate::vault::{LinkGraph, Page, PageId, Vault};
 
 /// Report accompanying a [`query`] result: the answer itself plus which pages
@@ -39,6 +42,9 @@ pub struct QueryReport {
     pub answer: QueryAnswer,
     pub retrieved: Vec<PageId>,
     pub cited_stems: Vec<String>,
+    /// Pages in the retrieved set whose source material is newer than the
+    /// page's last update. These pages may contain outdated information.
+    pub stale_pages: Vec<PageId>,
 }
 
 /// Run the full query pipeline.
@@ -62,20 +68,21 @@ pub async fn query(
     question: &str,
     top_k: usize,
 ) -> Result<QueryReport> {
-    // 1. Embed the question via the embeddings provider.
-    let mut query_vecs = embed_provider
-        .embed(&[question.to_string()])
-        .await
-        .map_err(|e| Error::Other(anyhow::anyhow!("query embed: {e}")))?;
-    let query_vec = query_vecs
-        .pop()
-        .ok_or_else(|| Error::Other(anyhow::anyhow!("embed provider returned no embedding")))?;
+    // 1-3. Hybrid search: vector + keyword + RRF fusion + dedup.
+    let scan = vault.scan()?;
+    let opts = HybridSearchOpts::with_top_k(top_k);
+    let hits = search::hybrid_search(
+        store,
+        embed_provider,
+        llm_provider,
+        model,
+        question,
+        &scan.pages,
+        &opts,
+    )
+    .await?;
 
-    // 2. Vector top-k over chunks. Search is scoped to the embeddings
-    //    provider's name + model so we never mix vectors across spaces.
-    let hits = store.search(&query_vec, embed_provider.name(), model, top_k)?;
-
-    // 3. Dedupe chunks → pages, keeping each page's best chunk score.
+    // Build page scores from the fused results.
     let mut page_scores: HashMap<PageId, f32> = HashMap::new();
     for hit in &hits {
         page_scores
@@ -84,8 +91,7 @@ pub async fn query(
             .or_insert(hit.score);
     }
 
-    // 4. Load the vault and build the graph for backlink expansion.
-    let scan = vault.scan()?;
+    // 4. Build the graph for backlink expansion.
     let graph = LinkGraph::build(&scan.pages);
 
     let mut relevant_ids: HashSet<PageId> = page_scores.keys().copied().collect();
@@ -148,9 +154,17 @@ pub async fn query(
         }
     }
 
+    // 9. Detect stale pages in the retrieved set.
+    let stale_pages: Vec<PageId> = relevant_refs
+        .iter()
+        .filter(|p| stale::is_stale(vault, p))
+        .map(|p| p.frontmatter.id)
+        .collect();
+
     Ok(QueryReport {
         answer,
         retrieved,
         cited_stems: cited,
+        stale_pages,
     })
 }

@@ -100,6 +100,41 @@ enum Command {
     /// Undo the most recent scriptorium commit via `git revert HEAD`.
     Undo,
 
+    /// Run health checks on the vault: git repo, schema, embeddings,
+    /// links, git status. No LLM required.
+    Doctor {
+        /// Output as JSON instead of a human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run maintenance tasks: lint, stale detection, embedding coverage.
+    /// Optionally auto-fix safe issues.
+    Maintain {
+        /// Auto-fix safe issues (re-embed stale pages, fix bad timestamps).
+        #[arg(long)]
+        fix: bool,
+        /// Override the embeddings provider declared in config.
+        #[arg(long, value_enum)]
+        provider: Option<ProviderKind>,
+    },
+
+    /// Bulk-ingest all eligible files from a directory. Supports checkpoint
+    /// resume — interrupted imports pick up where they left off.
+    BulkIngest {
+        /// Directory containing source files to ingest.
+        dir: PathBuf,
+        /// Override the provider declared in config.
+        #[arg(long, value_enum)]
+        provider: Option<ProviderKind>,
+        /// Start fresh, ignoring any existing checkpoint.
+        #[arg(long)]
+        fresh: bool,
+        /// Dry run: report what would be ingested without committing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Show the resolved config for this vault.
     Config,
 
@@ -326,6 +361,106 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let vault = open_vault(&vault_path)?;
             undo(&vault)?;
             println!("undo: reverted the most recent scriptorium commit");
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Doctor { json } => {
+            let vault = open_vault(&vault_path)?;
+            let store = open_store(&vault).ok();
+            let report =
+                scriptorium_core::doctor::run_doctor(&vault, store.as_ref());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .map_err(|e| miette!("json: {e}"))?
+                );
+            } else {
+                print_doctor_report(&report);
+            }
+            let exit = if report.has_failures() {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            };
+            Ok(exit)
+        }
+        Command::Maintain { fix, provider } => {
+            let vault = open_vault(&vault_path)?;
+            let cfg = load_config(&vault);
+            let store = open_store(&vault)?;
+            let embed_provider = build_provider(
+                provider.unwrap_or_else(|| embed_provider_from(&cfg)),
+            )?;
+            let options = scriptorium_core::maintain::MaintainOptions { fix };
+            let report = scriptorium_core::maintain::maintain(
+                &vault,
+                &store,
+                Some(embed_provider.as_ref()),
+                &cfg.embeddings.model,
+                &options,
+            )
+            .await
+            .into_diagnostic()?;
+            let s = report.summary();
+            println!("Maintenance Report");
+            println!("==================");
+            println!("  Lint: {} error(s), {} warning(s)", s.errors, s.warnings);
+            println!("  Stale pages: {}", s.stale_pages);
+            println!("  Stale embeddings: {}", s.stale_embeddings);
+            println!(
+                "  Embedding coverage: {}/{}",
+                s.embedded, s.total_pages
+            );
+            if fix {
+                println!("  Auto-fixed: {}", s.auto_fixed);
+                println!("  Chunks re-embedded: {}", s.chunks_reembedded);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::BulkIngest {
+            dir,
+            provider,
+            fresh,
+            dry_run,
+        } => {
+            let vault = open_vault(&vault_path)?;
+            let cfg = load_config(&vault);
+            let llm = build_provider(
+                provider.unwrap_or_else(|| provider_from(&cfg)),
+            )?;
+            if fresh {
+                let cp = vault.meta_dir().join("bulk-ingest-checkpoint.json");
+                let _ = std::fs::remove_file(cp.as_std_path());
+            }
+            let options = scriptorium_core::bulk_ingest::BulkIngestOptions {
+                dry_run,
+                ..Default::default()
+            };
+            let report = scriptorium_core::bulk_ingest::bulk_ingest(
+                &vault,
+                llm.as_ref(),
+                &dir,
+                &options,
+                |cur, total, path| {
+                    eprintln!("[{cur}/{total}] {}", path.display());
+                },
+            )
+            .await
+            .into_diagnostic()?;
+            println!("Bulk Ingest Report");
+            println!("==================");
+            println!("  Discovered: {}", report.total_discovered);
+            println!("  Skipped (checkpoint): {}", report.skipped_checkpoint);
+            println!(
+                "  Skipped (already interned): {}",
+                report.skipped_already_interned
+            );
+            println!("  Ingested: {}", report.ingested);
+            println!("  Failed: {}", report.failed.len());
+            for err in &report.failed {
+                eprintln!("    {} — {}", err.path.display(), err.error);
+            }
+            println!("  Elapsed: {:.1}s", report.elapsed.as_secs_f64());
             Ok(ExitCode::SUCCESS)
         }
         Command::Config => {
@@ -574,4 +709,24 @@ fn print_lint_report(report: &core::LintReport) {
         }
     }
     println!("lint: {errors} error(s), {warnings} warning(s), {infos} info");
+}
+
+fn print_doctor_report(report: &scriptorium_core::doctor::DoctorReport) {
+    use scriptorium_core::doctor::CheckStatus;
+    println!("Scriptorium Health Check");
+    println!("========================");
+    for check in &report.checks {
+        let tag = match check.status {
+            CheckStatus::Ok => "  [OK]  ",
+            CheckStatus::Warn => "  [WARN]",
+            CheckStatus::Fail => "  [FAIL]",
+        };
+        println!("{tag} {}: {}", check.name, check.message);
+    }
+    let summary = match report.status {
+        scriptorium_core::doctor::OverallStatus::Healthy => "All checks passed.",
+        scriptorium_core::doctor::OverallStatus::Degraded => "Some warnings found.",
+        scriptorium_core::doctor::OverallStatus::Unhealthy => "Failures detected!",
+    };
+    println!("\n{summary}");
 }

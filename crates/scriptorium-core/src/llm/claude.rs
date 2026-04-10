@@ -93,6 +93,11 @@ impl LlmProvider for ClaudeProvider {
             })
             .collect::<Vec<_>>();
 
+        // NB: we deliberately do not enable extended thinking on these
+        // requests. Extended thinking is incompatible with forced tool_choice
+        // and returns HTTP 400 ("Thinking may not be enabled when tool_choice
+        // forces tool use"). If a future change adds thinking, switch
+        // `tool_choice` to `"any"` instead of forcing a named tool.
         let mut body = json!({
             "model": self.config.model,
             "max_tokens": req.max_tokens,
@@ -104,14 +109,29 @@ impl LlmProvider for ClaudeProvider {
         }
 
         // Structured output: wrap the requested schema in a single "tool" and
-        // force the model to invoke it. The tool's `input` then *is* our JSON
-        // response.
+        // force the model to invoke it via `strict: true`. With strict mode,
+        // Anthropic uses grammar-constrained sampling server-side so the model
+        // structurally cannot omit required fields or emit wrong types — the
+        // exact bug class that motivated this call path. Without strict,
+        // `tool_choice` only prefills the assistant turn and does not enforce
+        // `required`. See
+        // <https://platform.claude.com/docs/en/agents-and-tools/tool-use/strict-tool-use>.
+        //
+        // `cache_control: ephemeral` on the (sole) tool makes the tool
+        // definition a cache breakpoint so subsequent ingests with the same
+        // schema pay the 0.1x cache-read rate instead of the full schema
+        // cost on every call. See prompt-caching docs.
         if let Some(schema) = req.response_schema.as_ref() {
             let tool_name = "emit_structured_response";
+            let cleaned_schema = clean_schema_for_anthropic(schema);
             body["tools"] = json!([{
                 "name": tool_name,
-                "description": "Return a single structured JSON response.",
-                "input_schema": schema,
+                "description": "Return a single structured JSON response. \
+                                Call this tool exactly once with all required \
+                                fields populated.",
+                "strict": true,
+                "cache_control": { "type": "ephemeral" },
+                "input_schema": cleaned_schema,
             }]);
             body["tool_choice"] = json!({ "type": "tool", "name": tool_name });
         }
@@ -143,6 +163,20 @@ impl LlmProvider for ClaudeProvider {
                 Ok(parsed)
             })
             .await?;
+
+        // Detect truncation BEFORE extracting text. When the model hits the
+        // max_tokens ceiling mid-generation while a `tool_use` block is
+        // open, Anthropic still returns a `tool_use` block but its `input`
+        // JSON is incomplete (missing fields that come later in the object).
+        // Surface this as a distinct error so the caller can raise the
+        // budget instead of getting a confusing "missing field" serde error.
+        if resp.stop_reason.as_deref() == Some("max_tokens") {
+            return Err(LlmError::Truncated {
+                provider: "claude".into(),
+                output_tokens: resp.usage.output_tokens,
+                max_tokens: req.max_tokens,
+            });
+        }
 
         // Extract text: prefer tool_use.input (structured), fall back to text blocks.
         let text = extract_text(&resp)?;
@@ -183,18 +217,22 @@ fn classify(status: StatusCode, err: LlmError) -> Retry {
 }
 
 fn extract_text(resp: &MessagesResponse) -> Result<String, LlmError> {
+    // Prefer tool_use: that's our structured-output slot. We must scan the
+    // whole block list before falling back to text, because Anthropic may
+    // return `[Text, ToolUse]` when the model narrates before calling the
+    // tool — taking the first text block would silently discard the
+    // structured response.
     for block in &resp.content {
-        match block {
-            ContentBlock::ToolUse { input, .. } => {
-                return serde_json::to_string(input).map_err(|e| {
-                    LlmError::InvalidResponse(format!("serialize tool_use input: {e}"))
-                });
-            }
-            ContentBlock::Text { text } => {
-                // Keep as a fallback if no tool_use block appears.
-                return Ok(text.clone());
-            }
-            ContentBlock::Unknown => {}
+        if let ContentBlock::ToolUse { input, .. } = block {
+            return serde_json::to_string(input).map_err(|e| {
+                LlmError::InvalidResponse(format!("serialize tool_use input: {e}"))
+            });
+        }
+    }
+    // Fall back to any text block if the model didn't emit a tool_use.
+    for block in &resp.content {
+        if let ContentBlock::Text { text } = block {
+            return Ok(text.clone());
         }
     }
     Err(LlmError::InvalidResponse(
@@ -202,11 +240,69 @@ fn extract_text(resp: &MessagesResponse) -> Result<String, LlmError> {
     ))
 }
 
+/// Normalize a `schemars`-derived JSON Schema so it satisfies Anthropic's
+/// strict-mode subset:
+///
+/// 1. Strip `$schema` and `title` from the root — Anthropic rejects them.
+/// 2. Recursively set `additionalProperties: false` on every node with
+///    `"type": "object"`, including schemas nested under `definitions`.
+///    schemars 0.8 does not emit this by default, but Anthropic strict mode
+///    requires it on every object.
+///
+/// The cleaner is conservative: it only *adds* `additionalProperties: false`
+/// when missing, so a schema that already sets it explicitly is untouched.
+fn clean_schema_for_anthropic(schema: &serde_json::Value) -> serde_json::Value {
+    let mut v = schema.clone();
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("$schema");
+        obj.remove("title");
+    }
+    force_additional_properties_false(&mut v);
+    v
+}
+
+fn force_additional_properties_false(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            if map.get("type").and_then(|t| t.as_str()) == Some("object")
+                && !map.contains_key("additionalProperties")
+            {
+                map.insert(
+                    "additionalProperties".into(),
+                    serde_json::Value::Bool(false),
+                );
+            }
+            for (_k, child) in map.iter_mut() {
+                force_additional_properties_false(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                force_additional_properties_false(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct MessagesResponse {
     model: String,
     content: Vec<ContentBlock>,
     usage: ApiUsage,
+    /// Why the model stopped generating. Common values:
+    /// - `end_turn`: natural stop (good)
+    /// - `tool_use`: the model called the forced tool (also good — the
+    ///   content block will be a `ToolUse` with `input`)
+    /// - `max_tokens`: we hit the budget before the model finished.
+    ///   With forced `tool_choice` this produces a truncated `tool_use.input`
+    ///   that is missing required fields, and the downstream `from_str`
+    ///   will blow up. We detect this here and surface a dedicated error
+    ///   so callers can raise the budget and retry.
+    /// - `refusal`: model declined — do not retry.
+    /// - `stop_sequence`: hit a stop string (not used by scriptorium).
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -289,6 +385,7 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: 1,
             },
+            stop_reason: Some("tool_use".into()),
         };
         let text = extract_text(&resp).unwrap();
         assert!(text.contains("\"hello\""));
@@ -305,7 +402,293 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: 1,
             },
+            stop_reason: Some("end_turn".into()),
         };
         assert_eq!(extract_text(&resp).unwrap(), "plain answer");
+    }
+
+    #[test]
+    fn extract_prefers_tool_use_even_when_text_appears_first() {
+        // Anthropic may return `[Text, ToolUse]` when the model narrates
+        // before calling the tool. Previously extract_text returned the
+        // first block it saw, silently dropping the structured response.
+        let resp = MessagesResponse {
+            model: "claude".into(),
+            content: vec![
+                ContentBlock::Text {
+                    text: "Let me call the tool...".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "1".into(),
+                    name: "emit_structured_response".into(),
+                    input: serde_json::json!({"summary": "hi"}),
+                },
+            ],
+            usage: ApiUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+            stop_reason: Some("tool_use".into()),
+        };
+        let text = extract_text(&resp).unwrap();
+        assert!(text.contains("\"summary\""));
+        assert!(!text.contains("narrates"));
+        assert!(!text.contains("Let me"));
+    }
+
+    #[test]
+    fn messages_response_deserializes_stop_reason() {
+        // Contract check: Anthropic's real response shape includes
+        // `stop_reason` at the top level. Deserializing a minimal
+        // fixture must populate it so the truncation guard can fire.
+        let raw = serde_json::json!({
+            "id": "msg_01",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-4-6",
+            "stop_reason": "max_tokens",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_01",
+                    "name": "emit_structured_response",
+                    "input": { "partial": "response" }
+                }
+            ],
+            "usage": { "input_tokens": 100, "output_tokens": 4096 }
+        });
+        let resp: MessagesResponse = serde_json::from_value(raw).unwrap();
+        assert_eq!(resp.stop_reason.as_deref(), Some("max_tokens"));
+        assert_eq!(resp.usage.output_tokens, 4096);
+    }
+
+    #[test]
+    fn messages_response_deserializes_missing_stop_reason() {
+        // Backward-compat: if an older fixture (or a test) omits
+        // stop_reason, the struct must still parse.
+        let raw = serde_json::json!({
+            "id": "msg_01",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude",
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        });
+        let resp: MessagesResponse = serde_json::from_value(raw).unwrap();
+        assert!(resp.stop_reason.is_none());
+    }
+
+    #[test]
+    fn schema_cleaner_strips_schema_and_title_at_root() {
+        let input = serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "title": "IngestPlan",
+            "type": "object",
+            "properties": {
+                "summary": { "type": "string" }
+            },
+            "required": ["summary"]
+        });
+        let cleaned = clean_schema_for_anthropic(&input);
+        assert!(cleaned.get("$schema").is_none(), "$schema must be stripped");
+        assert!(cleaned.get("title").is_none(), "title must be stripped");
+        assert_eq!(cleaned["type"], "object");
+        assert_eq!(cleaned["properties"]["summary"]["type"], "string");
+    }
+
+    #[test]
+    fn schema_cleaner_forces_additional_properties_false_recursively() {
+        // Shape mirrors what schemars 0.8 produces for IngestPlan: a root
+        // object with a `definitions` table holding a nested object under
+        // `IngestPageAction`. Both objects must end up with
+        // additionalProperties: false.
+        let input = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pages": {
+                    "type": "array",
+                    "items": { "$ref": "#/definitions/IngestPageAction" }
+                }
+            },
+            "required": ["pages"],
+            "definitions": {
+                "IngestPageAction": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string" }
+                    },
+                    "required": ["title"]
+                }
+            }
+        });
+        let cleaned = clean_schema_for_anthropic(&input);
+        assert_eq!(
+            cleaned["additionalProperties"],
+            false,
+            "root object must have additionalProperties: false"
+        );
+        assert_eq!(
+            cleaned["definitions"]["IngestPageAction"]["additionalProperties"],
+            false,
+            "nested object in definitions must have additionalProperties: false"
+        );
+    }
+
+    #[test]
+    fn schema_cleaner_does_not_touch_non_object_nodes() {
+        let input = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
+            }
+        });
+        let cleaned = clean_schema_for_anthropic(&input);
+        // Array and string schemas must not grow an additionalProperties key.
+        assert!(cleaned["properties"]["tags"]
+            .get("additionalProperties")
+            .is_none());
+        assert!(cleaned["properties"]["tags"]["items"]
+            .get("additionalProperties")
+            .is_none());
+    }
+
+    #[test]
+    fn schema_cleaner_preserves_existing_additional_properties() {
+        // If a schema already sets additionalProperties explicitly (even to
+        // true), the cleaner must not clobber that choice.
+        let input = serde_json::json!({
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {}
+        });
+        let cleaned = clean_schema_for_anthropic(&input);
+        assert_eq!(cleaned["additionalProperties"], true);
+    }
+
+    #[test]
+    fn cleaner_produces_strict_compatible_ingest_plan_schema() {
+        // End-to-end check: feed the real IngestPlan schema through the
+        // cleaner and assert every object in the output has
+        // additionalProperties: false. This is the canonical pre-flight for
+        // Anthropic strict mode — if this passes, the API will accept the
+        // tool definition.
+        use crate::llm::IngestPlan;
+        let cleaned = clean_schema_for_anthropic(&IngestPlan::schema());
+        assert!(cleaned.get("$schema").is_none());
+        assert!(cleaned.get("title").is_none());
+        assert_visit_all_objects_have_additional_properties_false(&cleaned);
+    }
+
+    fn assert_visit_all_objects_have_additional_properties_false(v: &serde_json::Value) {
+        if let Some(obj) = v.as_object() {
+            if obj.get("type").and_then(|t| t.as_str()) == Some("object") {
+                assert_eq!(
+                    obj.get("additionalProperties"),
+                    Some(&serde_json::Value::Bool(false)),
+                    "object missing additionalProperties: false: {}",
+                    serde_json::to_string_pretty(v).unwrap()
+                );
+            }
+            for child in obj.values() {
+                assert_visit_all_objects_have_additional_properties_false(child);
+            }
+        } else if let Some(arr) = v.as_array() {
+            for item in arr {
+                assert_visit_all_objects_have_additional_properties_false(item);
+            }
+        }
+    }
+
+    /// Rebuild the request body the same way `complete()` does, so we can
+    /// assert what actually goes on the wire without needing an HTTP mock.
+    fn build_request_body_for_test(req: &CompletionRequest) -> serde_json::Value {
+        let messages = req
+            .messages
+            .iter()
+            .map(|m| {
+                json!({
+                    "role": match m.role {
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                    },
+                    "content": m.content,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut body = json!({
+            "model": "claude-opus-4-6",
+            "max_tokens": req.max_tokens,
+            "system": req.system,
+            "messages": messages,
+        });
+        if let Some(temp) = req.temperature {
+            body["temperature"] = json!(temp);
+        }
+        if let Some(schema) = req.response_schema.as_ref() {
+            let tool_name = "emit_structured_response";
+            let cleaned_schema = clean_schema_for_anthropic(schema);
+            body["tools"] = json!([{
+                "name": tool_name,
+                "description": "Return a single structured JSON response. \
+                                Call this tool exactly once with all required \
+                                fields populated.",
+                "strict": true,
+                "cache_control": { "type": "ephemeral" },
+                "input_schema": cleaned_schema,
+            }]);
+            body["tool_choice"] = json!({ "type": "tool", "name": tool_name });
+        }
+        body
+    }
+
+    #[test]
+    fn request_body_with_schema_enables_strict_mode() {
+        use crate::llm::{CompletionRequest, IngestPlan, Message, Role};
+        let req = CompletionRequest {
+            system: "system".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: "user".into(),
+            }],
+            max_tokens: 256,
+            temperature: Some(0.2),
+            response_schema: Some(IngestPlan::schema()),
+        };
+        let body = build_request_body_for_test(&req);
+        assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["tool_choice"],
+            json!({ "type": "tool", "name": "emit_structured_response" })
+        );
+        // The input_schema must not leak schemars-specific root keys.
+        assert!(body["tools"][0]["input_schema"].get("$schema").is_none());
+        assert!(body["tools"][0]["input_schema"].get("title").is_none());
+        // And must have additionalProperties: false at the root.
+        assert_eq!(
+            body["tools"][0]["input_schema"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn request_body_without_schema_has_no_tools() {
+        use crate::llm::{CompletionRequest, Message, Role};
+        let req = CompletionRequest {
+            system: "system".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: "user".into(),
+            }],
+            max_tokens: 256,
+            temperature: None,
+            response_schema: None,
+        };
+        let body = build_request_body_for_test(&req);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
     }
 }

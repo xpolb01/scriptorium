@@ -1,10 +1,11 @@
-//! Helpers that tie [`chunk_page`](super::chunk_page),
-//! [`EmbeddingsStore`](super::EmbeddingsStore), and an [`LlmProvider`]
-//! together so callers don't have to reassemble the pipeline each time.
+//! Helpers that tie chunking, [`EmbeddingsStore`](super::EmbeddingsStore),
+//! and an [`LlmProvider`] together so callers don't have to reassemble the
+//! pipeline each time.
 //!
 //! - [`embed_page`] embeds a single page, skipping the work if the store
 //!   already has a row for this `(page_id, content_hash, provider, model)`.
 //! - [`reindex`] walks the vault and embeds every page it finds.
+//! - [`chunk_with_strategy`] dispatches to the configured chunker.
 //!
 //! Both are intentionally async — the `LlmProvider::embed` call hits the
 //! network for real providers. The mock provider returns immediately so the
@@ -12,7 +13,8 @@
 
 use tracing::debug;
 
-use super::{chunk_page, EmbeddingRow, EmbeddingsStore};
+use super::{chunk_page, chunk_page_recursive, chunk_page_semantic, Chunk, EmbeddingRow, EmbeddingsStore};
+use crate::config::ChunkStrategy;
 use crate::error::{Error, Result};
 use crate::llm::LlmProvider;
 use crate::vault::{Page, PageId, Vault};
@@ -21,21 +23,55 @@ use crate::vault::{Page, PageId, Vault};
 /// comfortably fits every popular embedding model's per-request limit.
 pub const DEFAULT_CHUNK_CHARS: usize = 4000;
 
+/// Split a page body into chunks using the specified strategy.
+///
+/// `embed_provider` is only needed for [`ChunkStrategy::Semantic`]; pass
+/// `None` for heading or recursive strategies.
+pub async fn chunk_with_strategy(
+    body: &str,
+    max_chars: usize,
+    strategy: ChunkStrategy,
+    embed_provider: Option<(&dyn LlmProvider, &str)>,
+) -> Result<Vec<Chunk>> {
+    match strategy {
+        ChunkStrategy::Heading => Ok(chunk_page(body, max_chars)),
+        ChunkStrategy::Recursive => Ok(chunk_page_recursive(body, max_chars)),
+        ChunkStrategy::Semantic => {
+            let (provider, model) = embed_provider.ok_or_else(|| {
+                Error::Other(anyhow::anyhow!(
+                    "semantic chunking requires an embedding provider"
+                ))
+            })?;
+            chunk_page_semantic(body, max_chars, provider, model).await
+        }
+    }
+}
+
 /// Embed a single page, inserting one row per chunk. Returns the number of
 /// chunks embedded, or `0` if the store already had cached vectors for the
 /// current `(page_id, content_hash, provider, model)`.
+///
+/// Uses the specified `strategy` for chunking. Pass `ChunkStrategy::default()`
+/// for the standard recursive chunker.
 pub async fn embed_page(
     store: &EmbeddingsStore,
     provider: &dyn LlmProvider,
     model: &str,
     page: &Page,
+    strategy: ChunkStrategy,
 ) -> Result<usize> {
     let hash = page.content_hash()?;
     if store.has_page_version(page.frontmatter.id, &hash, provider.name(), model)? {
         debug!(page = %page.path, "embed cache hit");
         return Ok(0);
     }
-    let chunks = chunk_page(&page.body, DEFAULT_CHUNK_CHARS);
+    let chunks = chunk_with_strategy(
+        &page.body,
+        DEFAULT_CHUNK_CHARS,
+        strategy,
+        Some((provider, model)),
+    )
+    .await?;
     if chunks.is_empty() {
         return Ok(0);
     }
@@ -90,6 +126,17 @@ pub async fn reindex(
     provider: &dyn LlmProvider,
     model: &str,
 ) -> Result<usize> {
+    reindex_with_strategy(vault, store, provider, model, ChunkStrategy::default()).await
+}
+
+/// Like [`reindex`] but with an explicit chunking strategy.
+pub async fn reindex_with_strategy(
+    vault: &Vault,
+    store: &EmbeddingsStore,
+    provider: &dyn LlmProvider,
+    model: &str,
+    strategy: ChunkStrategy,
+) -> Result<usize> {
     let scan = vault.scan()?;
     let mut total = 0;
 
@@ -106,7 +153,7 @@ pub async fn reindex(
     // `has_page_version` to decide cache-hit/miss; for unchanged pages
     // this is an indexed lookup, no embedding work.
     for page in &scan.pages {
-        total += embed_page(store, provider, model, page).await?;
+        total += embed_page(store, provider, model, page, strategy).await?;
     }
 
     // Phase 2: prune orphan rows. Any row whose (page_id, content_hash)
@@ -154,11 +201,16 @@ mod tests {
         let store = EmbeddingsStore::in_memory().unwrap();
         let mock = MockProvider::constant("");
         let page = make_page("alpha", "## First\n\nSome content.\n\n## Second\n\nMore.\n");
-        let inserted = embed_page(&store, &mock, "mock-1", &page).await.unwrap();
+        // Use Heading strategy for this test since the body has clear H2 sections.
+        let inserted = embed_page(&store, &mock, "mock-1", &page, ChunkStrategy::Heading)
+            .await
+            .unwrap();
         assert_eq!(inserted, 2, "two H2 sections → two chunks");
         assert_eq!(store.len().unwrap(), 2);
         // A second call is a cache hit.
-        let again = embed_page(&store, &mock, "mock-1", &page).await.unwrap();
+        let again = embed_page(&store, &mock, "mock-1", &page, ChunkStrategy::Heading)
+            .await
+            .unwrap();
         assert_eq!(again, 0);
         assert_eq!(store.len().unwrap(), 2);
     }
@@ -168,7 +220,9 @@ mod tests {
         let store = EmbeddingsStore::in_memory().unwrap();
         let mock = MockProvider::constant("");
         let page = make_page("empty", "");
-        let inserted = embed_page(&store, &mock, "mock-1", &page).await.unwrap();
+        let inserted = embed_page(&store, &mock, "mock-1", &page, ChunkStrategy::default())
+            .await
+            .unwrap();
         assert_eq!(inserted, 0);
         assert_eq!(store.len().unwrap(), 0);
     }

@@ -134,6 +134,10 @@ pub async fn ingest_with_options(
         .and_then(|s| s.to_str())
         .unwrap_or("source");
     let req = ingest_prompt(&ctx, label, &source_text);
+    // Clone the request so we can reference it on the failure-persistence
+    // path if the parse fails. `CompletionRequest` is `Clone` and the clone
+    // is cheap (one system string, one user string, a schema `Value`).
+    let req_for_failure = req.clone();
 
     // 5. Call the LLM and parse the structured response.
     let response = provider
@@ -148,12 +152,32 @@ pub async fn ingest_with_options(
         &response.model,
         &response.usage,
     );
-    let plan: IngestPlan = serde_json::from_str(&response.text).map_err(|e| {
-        Error::Other(anyhow::anyhow!(
-            "llm ingest returned invalid IngestPlan json: {e}; raw = {}",
-            response.text
-        ))
-    })?;
+    let plan: IngestPlan = match serde_json::from_str::<IngestPlan>(&response.text) {
+        Ok(plan) => plan,
+        Err(parse_err) => {
+            // Persist the full context so the bug is debuggable after the
+            // fact. Don't let a failure to write the failure record mask
+            // the underlying parse error — log and continue on secondary
+            // failures.
+            if let Err(persist_err) = persist_ingest_failure(
+                vault,
+                source_path,
+                provider.name(),
+                &response,
+                &parse_err,
+                &req_for_failure,
+            ) {
+                tracing::warn!(
+                    error = %persist_err,
+                    "failed to persist ingest-failure record"
+                );
+            }
+            return Err(Error::Other(anyhow::anyhow!(
+                "llm ingest returned invalid IngestPlan json: {parse_err}; \
+                 raw response saved to <vault>/.ingest-failures/"
+            )));
+        }
+    };
 
     // 6. Translate the plan into a VaultTx. Reuse the scan we did for
     //    retrieval — the vault state hasn't changed since step 4.
@@ -401,6 +425,58 @@ fn sha256_hex(bytes: &[u8]) -> String {
         out.push(HEX_DIGITS[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+/// Write a JSON record of a failed ingest to `<vault>/.ingest-failures/`
+/// so the raw LLM response is preserved for debugging. This directory is
+/// git-ignored via the vault's `.gitignore` template so failure records
+/// never pollute vault history.
+///
+/// The record captures:
+/// - A timestamp and the source path being ingested
+/// - The provider, model, and token usage of the failing call
+/// - The parse error message
+/// - The complete raw response text from the model
+/// - The system prompt and all user message contents
+///
+/// Failures to write the record are NOT propagated — the caller is already
+/// in an error path and the primary error (the parse failure) should
+/// surface unchanged. A secondary write failure is logged via `tracing`.
+fn persist_ingest_failure(
+    vault: &Vault,
+    source_path: &Path,
+    provider_name: &str,
+    response: &crate::llm::CompletionResponse,
+    parse_error: &serde_json::Error,
+    req: &crate::llm::CompletionRequest,
+) -> Result<()> {
+    let dir = vault.root().join(".ingest-failures");
+    std::fs::create_dir_all(dir.as_std_path())
+        .map_err(|e| Error::io(dir.as_std_path().to_path_buf(), e))?;
+    let ts = Utc::now().format("%Y-%m-%dT%H-%M-%S%.3f");
+    let src_stem = source_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+    let file_path = dir.join(format!("{ts}-{src_stem}.json"));
+    let user_messages: Vec<String> = req.messages.iter().map(|m| m.content.clone()).collect();
+    let record = serde_json::json!({
+        "timestamp": Utc::now().to_rfc3339(),
+        "source_path": source_path.to_string_lossy(),
+        "provider": provider_name,
+        "model": response.model,
+        "input_tokens": response.usage.input_tokens,
+        "output_tokens": response.usage.output_tokens,
+        "parse_error": parse_error.to_string(),
+        "raw_response": response.text,
+        "prompt_system": req.system,
+        "prompt_user_messages": user_messages,
+    });
+    let pretty = serde_json::to_string_pretty(&record)
+        .map_err(|e| Error::Other(anyhow::anyhow!("serialize failure record: {e}")))?;
+    std::fs::write(file_path.as_std_path(), pretty)
+        .map_err(|e| Error::io(file_path.as_std_path().to_path_buf(), e))?;
+    Ok(())
 }
 
 #[cfg(test)]

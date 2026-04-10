@@ -1,6 +1,6 @@
-//! SQLite-backed embeddings store with cosine top-k search.
+//! SQLite-backed embeddings store with cosine top-k and FTS5 keyword search.
 //!
-//! Schema:
+//! ## Schema
 //!
 //! ```sql
 //! CREATE TABLE embeddings (
@@ -15,6 +15,15 @@
 //!   vector        BLOB    NOT NULL,  -- little-endian f32[dim]
 //!   PRIMARY KEY (page_id, content_hash, chunk_idx, provider, model)
 //! );
+//!
+//! -- FTS5 full-text index over chunk text for keyword/BM25 search.
+//! -- Kept in sync manually during upsert/delete/retain operations.
+//! -- `provider` and `model` are UNINDEXED (stored but not tokenized),
+//! -- used for provider-scoped filtering without a JOIN.
+//! CREATE VIRTUAL TABLE fts_chunks USING fts5(
+//!   page_id, chunk_text, heading, provider UNINDEXED, model UNINDEXED,
+//!   tokenize='porter unicode61'
+//! );
 //! ```
 //!
 //! The primary key enforces both identity and cache semantics: once you
@@ -23,9 +32,14 @@
 //! When a page changes, its `content_hash` changes, and the insert lands
 //! alongside the old rows (which can be garbage-collected separately).
 //!
-//! Search is a straight linear scan for the moment. For a vault with tens of
-//! thousands of chunks this is still millisecond-scale; upgrading to an ANN
-//! index (HNSW, `DiskANN`) is a drop-in replacement of this one module.
+//! Vector search is a straight linear scan for the moment. For a vault with
+//! tens of thousands of chunks this is still millisecond-scale; upgrading to
+//! an ANN index (HNSW via `usearch`, or `sqlite-vec` `DiskANN`) is planned as
+//! Phase 3 of the v2 roadmap.
+//!
+//! Keyword search uses FTS5 with porter stemming + Unicode normalization,
+//! giving BM25-ranked results that complement the vector search path. The
+//! two are fused via RRF in the hybrid search module (`crate::search`).
 
 use std::path::Path;
 
@@ -57,7 +71,8 @@ pub struct EmbeddingRow {
     pub vector: Vec<f32>,
 }
 
-/// One result from [`EmbeddingsStore::search`].
+/// One result from [`EmbeddingsStore::search`] or
+/// [`crate::search::hybrid_search`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchHit {
     pub page_id: PageId,
@@ -65,10 +80,20 @@ pub struct SearchHit {
     pub heading: Option<String>,
     pub chunk_text: String,
     pub score: f32,
+    /// Vault-relative page path, populated during hybrid search by joining
+    /// against the vault scan. Used for type-diversity dedup (derives type
+    /// from the wiki directory, e.g. `wiki/concepts/` → `"concepts"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_path: Option<String>,
 }
 
 pub struct EmbeddingsStore {
     conn: Connection,
+    /// In-process vector index for fast nearest-neighbor search. Kept in
+    /// sync with the `SQLite` `embeddings` table during `upsert`/`retain`.
+    /// Defaults to [`LinearIndex`] (brute-force scan); can be upgraded to
+    /// HNSW via the `hnsw` cargo feature.
+    vector_index: Box<dyn super::vector_index::VectorIndex>,
 }
 
 impl EmbeddingsStore {
@@ -105,10 +130,61 @@ impl EmbeddingsStore {
                 ON embeddings(page_id, content_hash);
             CREATE INDEX IF NOT EXISTS idx_embeddings_provider_model
                 ON embeddings(provider, model);
+            CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
+                page_id,
+                chunk_text,
+                heading,
+                provider UNINDEXED,
+                model UNINDEXED,
+                tokenize='porter unicode61'
+            );
             ",
         )
         .map_err(wrap_sql)?;
-        Ok(Self { conn })
+
+        // Backfill: if the FTS5 table is empty but the embeddings table has
+        // rows, populate FTS5 from the existing data. This handles the
+        // migration path for databases created before FTS5 was added.
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM fts_chunks", [], |r| r.get(0))
+            .map_err(wrap_sql)?;
+        let emb_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))
+            .map_err(wrap_sql)?;
+        if fts_count == 0 && emb_count > 0 {
+            conn.execute_batch(
+                r"
+                INSERT INTO fts_chunks(rowid, page_id, chunk_text, heading, provider, model)
+                SELECT rowid, page_id, chunk_text, heading, provider, model FROM embeddings;
+                ",
+            )
+            .map_err(wrap_sql)?;
+        }
+
+        // Build the in-process vector index from existing rows.
+        let vector_index: Box<dyn super::vector_index::VectorIndex> =
+            Box::new(super::vector_index::LinearIndex::new());
+        if emb_count > 0 {
+            let mut stmt = conn
+                .prepare("SELECT rowid, dim, vector FROM embeddings")
+                .map_err(wrap_sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let rowid: i64 = row.get(0)?;
+                    let dim: i64 = row.get(1)?;
+                    let bytes: Vec<u8> = row.get(2)?;
+                    Ok((rowid, dim, bytes))
+                })
+                .map_err(wrap_sql)?;
+            for r in rows {
+                let (rowid, _dim, bytes) = r.map_err(wrap_sql)?;
+                let vector = bytes_to_vec(&bytes);
+                #[allow(clippy::cast_sign_loss)]
+                let _ = vector_index.insert(rowid as u64, &vector);
+            }
+        }
+
+        Ok(Self { conn, vector_index })
     }
 
     /// Insert or replace a single row.
@@ -118,6 +194,7 @@ impl EmbeddingsStore {
             .map_err(|_| Error::Other(anyhow::anyhow!("chunk_idx overflow")))?;
         let dim = i64::try_from(row.vector.len())
             .map_err(|_| Error::Other(anyhow::anyhow!("dim overflow")))?;
+        let page_id_str = row.page_id.to_string();
         self.conn
             .execute(
                 r"
@@ -133,7 +210,7 @@ impl EmbeddingsStore {
                     vector     = excluded.vector
                 ",
                 params![
-                    row.page_id.to_string(),
+                    page_id_str,
                     row.content_hash,
                     chunk_idx,
                     row.chunk_text,
@@ -145,6 +222,35 @@ impl EmbeddingsStore {
                 ],
             )
             .map_err(wrap_sql)?;
+
+        // Sync the FTS5 index. Get the rowid of the just-upserted row and
+        // insert-or-replace in the FTS5 table.
+        let rowid: i64 = self
+            .conn
+            .query_row(
+                r"SELECT rowid FROM embeddings
+                  WHERE page_id = ?1 AND content_hash = ?2 AND chunk_idx = ?3
+                    AND provider = ?4 AND model = ?5",
+                params![page_id_str, row.content_hash, chunk_idx, row.provider, row.model],
+                |r| r.get(0),
+            )
+            .map_err(wrap_sql)?;
+        // Delete then re-insert (FTS5 contentless tables don't support UPDATE).
+        self.conn
+            .execute("DELETE FROM fts_chunks WHERE rowid = ?1", params![rowid])
+            .map_err(wrap_sql)?;
+        self.conn
+            .execute(
+                r"INSERT INTO fts_chunks(rowid, page_id, chunk_text, heading, provider, model)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![rowid, page_id_str, row.chunk_text, row.heading, row.provider, row.model],
+            )
+            .map_err(wrap_sql)?;
+
+        // Sync the in-process vector index.
+        #[allow(clippy::cast_sign_loss)]
+        self.vector_index.insert(rowid as u64, &row.vector)?;
+
         Ok(())
     }
 
@@ -177,13 +283,36 @@ impl EmbeddingsStore {
         Ok(found.is_some())
     }
 
+    /// Does this page+hash have *any* embedding row, regardless of which
+    /// provider/model produced it? Used by the maintain command to detect
+    /// pages whose content changed since the last embed.
+    pub fn has_any_version(&self, page_id: PageId, content_hash: &str) -> Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                r"SELECT 1 FROM embeddings
+                  WHERE page_id = ?1 AND content_hash = ?2
+                  LIMIT 1",
+                params![page_id.to_string(), content_hash],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(wrap_sql)?;
+        Ok(found.is_some())
+    }
+
     /// Delete every row belonging to a specific (`page_id`, `content_hash`),
     /// leaving other versions alone.
     pub fn delete_version(&self, page_id: PageId, content_hash: &str) -> Result<()> {
+        let pid = page_id.to_string();
+        // Clean FTS5 + vector index first (need rowids before embeddings rows are gone).
+        let rowids = self.rowids_for_version(&pid, content_hash)?;
+        self.delete_fts_rows(&rowids)?;
+        self.delete_index_rows(&rowids)?;
         self.conn
             .execute(
                 "DELETE FROM embeddings WHERE page_id = ?1 AND content_hash = ?2",
-                params![page_id.to_string(), content_hash],
+                params![pid, content_hash],
             )
             .map_err(wrap_sql)?;
         Ok(())
@@ -220,7 +349,7 @@ impl EmbeddingsStore {
         // adding a `Hash` bound on `PageId` for this call site.
         let keep_keys: HashSet<String> = keep
             .iter()
-            .map(|(id, hash)| format!("{}:{}", id, hash))
+            .map(|(id, hash)| format!("{id}:{hash}"))
             .collect();
 
         // Collect the distinct (page_id, content_hash) pairs currently
@@ -247,8 +376,12 @@ impl EmbeddingsStore {
 
         let before = self.len()?;
         for (pid, hash) in current {
-            let key = format!("{}:{}", pid, hash);
+            let key = format!("{pid}:{hash}");
             if !keep_keys.contains(&key) {
+                // Clean FTS5 + vector index before deleting embeddings rows.
+                let rowids = self.rowids_for_version(&pid, &hash)?;
+                self.delete_fts_rows(&rowids)?;
+                self.delete_index_rows(&rowids)?;
                 self.conn
                     .execute(
                         "DELETE FROM embeddings WHERE page_id = ?1 AND content_hash = ?2",
@@ -272,6 +405,123 @@ impl EmbeddingsStore {
 
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
+    }
+
+    /// Number of distinct pages that have at least one embedding row.
+    pub fn distinct_page_count(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT page_id) FROM embeddings",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(wrap_sql)?;
+        Ok(usize::try_from(count).unwrap_or_default())
+    }
+
+    /// BM25-ranked keyword search over chunk text using the FTS5 index.
+    ///
+    /// `query` is passed directly to FTS5's `MATCH` operator, which accepts
+    /// terms, phrases (`"foo bar"`), boolean operators (`foo AND bar`,
+    /// `foo OR bar`, `foo NOT bar`), and prefix queries (`foo*`). Invalid
+    /// syntax returns an empty result set (not an error).
+    ///
+    /// Results are scoped to `(provider, model)` so they match the vector
+    /// search scope, ensuring RRF fusion merges comparable result sets.
+    pub fn keyword_search(
+        &self,
+        query: &str,
+        provider: &str,
+        model: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        if limit == 0 || query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        // FTS5 MATCH can error on malformed queries (unbalanced quotes, etc).
+        // Treat that as "no results" rather than a hard failure.
+        let Ok(mut stmt) = self.conn.prepare(
+            r"SELECT rowid, page_id, chunk_text, heading, rank
+              FROM fts_chunks
+              WHERE fts_chunks MATCH ?1
+                AND provider = ?2 AND model = ?3
+              ORDER BY rank
+              LIMIT ?4",
+        ) else {
+            return Ok(Vec::new());
+        };
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let Ok(rows) = stmt.query_map(params![query, provider, model, limit_i64], |row| {
+            let _rowid: i64 = row.get(0)?;
+            let page_id_str: String = row.get(1)?;
+            let chunk_text: String = row.get(2)?;
+            let heading: Option<String> = row.get(3)?;
+            let rank: f64 = row.get(4)?;
+            Ok((page_id_str, chunk_text, heading, rank))
+        }) else {
+            return Ok(Vec::new());
+        };
+
+        let mut hits = Vec::new();
+        for row in rows {
+            let Ok((page_id_str, chunk_text, heading, rank)) = row else {
+                continue;
+            };
+            let Ok(page_id) = PageId::parse(&page_id_str) else {
+                continue;
+            };
+            // FTS5 rank is negative (more negative = better). Convert to a
+            // positive score so it can be compared with cosine scores.
+            #[allow(clippy::cast_possible_truncation)]
+            let score = (-rank) as f32;
+            hits.push(SearchHit {
+                page_id,
+                chunk_idx: 0, // FTS5 doesn't carry chunk_idx; filled by caller if needed
+                heading,
+                chunk_text,
+                score,
+                page_path: None,
+            });
+        }
+        Ok(hits)
+    }
+
+    // ── FTS5 internal helpers ─────────────────────────────────────────
+
+    /// Collect the rowids of all embeddings rows for a given (`page_id`, `content_hash`).
+    fn rowids_for_version(&self, page_id: &str, content_hash: &str) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rowid FROM embeddings WHERE page_id = ?1 AND content_hash = ?2")
+            .map_err(wrap_sql)?;
+        let rows = stmt
+            .query_map(params![page_id, content_hash], |row| row.get(0))
+            .map_err(wrap_sql)?;
+        let mut ids = Vec::new();
+        for r in rows {
+            ids.push(r.map_err(wrap_sql)?);
+        }
+        Ok(ids)
+    }
+
+    /// Delete FTS5 rows by their rowid.
+    fn delete_fts_rows(&self, rowids: &[i64]) -> Result<()> {
+        for &id in rowids {
+            self.conn
+                .execute("DELETE FROM fts_chunks WHERE rowid = ?1", params![id])
+                .map_err(wrap_sql)?;
+        }
+        Ok(())
+    }
+
+    /// Remove entries from the in-process vector index by rowid.
+    fn delete_index_rows(&self, rowids: &[i64]) -> Result<()> {
+        for &id in rowids {
+            #[allow(clippy::cast_sign_loss)]
+            self.vector_index.remove(id as u64)?;
+        }
+        Ok(())
     }
 
     /// Cosine top-k search over chunks stored for the given provider/model.
@@ -346,6 +596,7 @@ impl EmbeddingsStore {
                 heading,
                 chunk_text,
                 score,
+                page_path: None,
             };
             insert_sorted(&mut best, hit, top_k);
         }
@@ -619,5 +870,125 @@ mod tests {
         let pruned = store.retain_page_versions(&keep).unwrap();
         assert_eq!(pruned, 0);
         assert_eq!(store.len().unwrap(), 2);
+    }
+
+    // ── FTS5 keyword search tests ─────────────────────────────────────
+
+    /// Verify that `upsert` populates the FTS5 table alongside the
+    /// embeddings table.
+    #[test]
+    fn upsert_populates_fts5() {
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let id = PageId::new();
+        store
+            .upsert(&row(id, "h1", 0, "the quick brown fox", unit(vec![1.0, 0.0])))
+            .unwrap();
+        let fts_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM fts_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 1, "FTS5 should have one row after upsert");
+    }
+
+    /// Verify that `retain_page_versions` removes FTS5 rows alongside
+    /// embeddings rows.
+    #[test]
+    fn retain_page_versions_cleans_fts5() {
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let a = PageId::new();
+        let b = PageId::new();
+        store
+            .upsert(&row(a, "ha", 0, "alpha content", unit(vec![1.0, 0.0])))
+            .unwrap();
+        store
+            .upsert(&row(b, "hb", 0, "beta content", unit(vec![0.0, 1.0])))
+            .unwrap();
+        // Keep only A.
+        store.retain_page_versions(&[(a, "ha")]).unwrap();
+        let fts_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM fts_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 1, "FTS5 should have only one row after prune");
+        // Keyword search for "beta" should return nothing.
+        let hits = store.keyword_search("beta", "mock", "mock-1", 10).unwrap();
+        assert!(hits.is_empty(), "pruned chunk should not appear in keyword search");
+    }
+
+    /// Keyword search returns chunks matching the query term.
+    #[test]
+    fn keyword_search_returns_matching_chunks() {
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let id = PageId::new();
+        store
+            .upsert(&row(id, "h1", 0, "photosynthesis is vital for plants", unit(vec![1.0, 0.0, 0.0])))
+            .unwrap();
+        store
+            .upsert(&row(id, "h1", 1, "quantum mechanics explains wave behavior", unit(vec![0.0, 1.0, 0.0])))
+            .unwrap();
+        store
+            .upsert(&row(id, "h1", 2, "climate change affects biodiversity", unit(vec![0.0, 0.0, 1.0])))
+            .unwrap();
+        let hits = store.keyword_search("photosynthesis", "mock", "mock-1", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].chunk_text.contains("photosynthesis"));
+    }
+
+    /// FTS5 porter stemming: "running" matches a chunk containing "run".
+    #[test]
+    fn keyword_search_handles_stemming() {
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let id = PageId::new();
+        store
+            .upsert(&row(id, "h1", 0, "the dog likes to run in the park", unit(vec![1.0, 0.0])))
+            .unwrap();
+        let hits = store.keyword_search("running", "mock", "mock-1", 10).unwrap();
+        assert_eq!(hits.len(), 1, "porter stemming should match 'running' to 'run'");
+    }
+
+    /// No matches returns empty, not an error.
+    #[test]
+    fn keyword_search_returns_empty_on_no_match() {
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let id = PageId::new();
+        store
+            .upsert(&row(id, "h1", 0, "alpha beta gamma", unit(vec![1.0, 0.0])))
+            .unwrap();
+        let hits = store.keyword_search("zygote", "mock", "mock-1", 10).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    /// Keyword search is scoped to the specified (provider, model).
+    #[test]
+    fn keyword_search_scoped_by_provider_model() {
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let id = PageId::new();
+        let mut r1 = row(id, "h1", 0, "shared keyword content", unit(vec![1.0, 0.0]));
+        r1.provider = "openai".into();
+        r1.model = "ada-002".into();
+        store.upsert(&r1).unwrap();
+        let mut r2 = row(id, "h1", 1, "shared keyword content here too", unit(vec![0.0, 1.0]));
+        r2.provider = "mock".into();
+        r2.model = "mock-1".into();
+        store.upsert(&r2).unwrap();
+        // Search scoped to mock — should only find one.
+        let hits = store.keyword_search("shared keyword", "mock", "mock-1", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        // Search scoped to openai — should only find one.
+        let hits = store.keyword_search("shared keyword", "openai", "ada-002", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// `distinct_page_count` reports the number of unique pages in the store.
+    #[test]
+    fn distinct_page_count_reports_unique_pages() {
+        let store = EmbeddingsStore::in_memory().unwrap();
+        assert_eq!(store.distinct_page_count().unwrap(), 0);
+        let a = PageId::new();
+        let b = PageId::new();
+        store.upsert(&row(a, "ha", 0, "a0", unit(vec![1.0, 0.0]))).unwrap();
+        store.upsert(&row(a, "ha", 1, "a1", unit(vec![0.0, 1.0]))).unwrap();
+        store.upsert(&row(b, "hb", 0, "b0", unit(vec![1.0, 0.0]))).unwrap();
+        assert_eq!(store.distinct_page_count().unwrap(), 2, "two pages, not three rows");
     }
 }
