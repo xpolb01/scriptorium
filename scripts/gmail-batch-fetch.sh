@@ -22,8 +22,8 @@
 #   "id": "19d591f3d1f03426",
 #   "threadId": "19d58f015c2e7700",
 #   "subject": "Re: Atlassian",
-#   "from": "Drew Mouacdie <andrew@thehealthbus.com>",
-#   "to": "Bogdan Polovko <bogdan@thehealthbus.com>",
+#   "from": "Alice Smith <alice@example.com>",
+#   "to": "Bob Jones <bob@example.com>",
 #   "date": "Sat, 4 Apr 2026 11:31:39 -0400",
 #   "body": "full email body text...",
 #   "attachments": [

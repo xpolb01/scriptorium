@@ -21,3 +21,22 @@
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Sensitive / local config
+.claude/
+.serverless/
+*.local.json
+.env
+.env.*
+credentials.json
+gcp-oauth.keys.json
+service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# IDE
+.idea/
+.vscode/
+*.swp

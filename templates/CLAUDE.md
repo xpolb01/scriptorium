@@ -102,7 +102,7 @@ Status tags (exactly one per page):
 Domain tags (at least one per page, format `domain/<name>`):
 
 Add domain tags as needed (e.g. `domain/rust`, `domain/llm`,
-`domain/bhc`). Propose new ones in the log entry before first use.
+`domain/ml`). Propose new ones in the log entry before first use.
 
 ## Skills
 
