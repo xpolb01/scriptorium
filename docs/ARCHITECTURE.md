@@ -1,7 +1,7 @@
 # Scriptorium — Architecture
 
 > A walkthrough of what Scriptorium is, why it exists, and how the 3 crates /
-> ~9k lines of Rust fit together. If you've never seen this project before,
+> ~28k lines of Rust fit together. If you've never seen this project before,
 > read this end-to-end — you'll leave knowing where to look in the source for
 > any follow-up question.
 
@@ -27,11 +27,12 @@ assumed.
 1. [Why Scriptorium exists](#1-why-scriptorium-exists)
 2. [What it is](#2-what-it-is)
 3. [How it's built](#3-how-its-built)
-4. [Testing](#4-testing)
-5. [Deferred to v2](#5-deferred-to-v2)
-6. [Glossary](#6-glossary)
-7. [Reading the source](#7-reading-the-source)
-8. [Operating it: costs and troubleshooting](#8-operating-it-costs-and-troubleshooting)
+4. [Self-improving agents](#4-self-improving-agents)
+5. [Testing](#5-testing)
+6. [Roadmap](#6-roadmap)
+7. [Glossary](#7-glossary)
+8. [Reading the source](#8-reading-the-source)
+9. [Operating it: costs and troubleshooting](#9-operating-it-costs-and-troubleshooting)
 
 ---
 
@@ -333,18 +334,21 @@ It's cheap enough that we rebuild from scratch after every mutation.
 
 ### 2.5 Operations the user sees
 
-Scriptorium exposes nine CLI commands and eight MCP tools. They fall into
-three buckets:
+Scriptorium exposes 20+ CLI commands and 16 MCP tools. They fall into
+five buckets:
 
 | Bucket | CLI commands | MCP tools |
 |---|---|---|
-| **Inspect** | `config`, `lint` | `scriptorium_lint`, `scriptorium_list_pages`, `scriptorium_read_page`, `scriptorium_search`, `scriptorium_log_tail` |
-| **Mutate** | `init`, `ingest`, `query`, `reindex`, `undo`, `watch` | `scriptorium_ingest`, `scriptorium_query`, `scriptorium_write_page` |
+| **Inspect** | `config`, `lint`, `doctor` | `scriptorium_lint`, `scriptorium_doctor`, `scriptorium_list_pages`, `scriptorium_read_page`, `scriptorium_search`, `scriptorium_log_tail` |
+| **Mutate** | `init`, `ingest`, `bulk-ingest`, `query`, `reindex`, `undo`, `watch`, `maintain` | `scriptorium_ingest`, `scriptorium_query`, `scriptorium_write_page`, `scriptorium_maintain` |
+| **Learn** | `learn list\|search\|add\|prune`, `bench` | `scriptorium_learn_capture`, `scriptorium_learn_search`, `scriptorium_learn_retrieve`, `scriptorium_bench` |
+| **Meta** | `setup`, `skill list\|show\|init`, `vault list\|add\|remove\|default\|show`, `social facebook` | `scriptorium_skill_list`, `scriptorium_skill_read` |
 | **Serve** | `serve` | — |
 
 See [§3.5](#35-ingest-flow) for the ingest pipeline, [§3.6](#36-query-flow)
-for query, and [§3.13](#313-the-mcp-server) for how the MCP tools expose the
-core operations over JSON-RPC.
+for query, [§3.14](#314-hybrid-search) for the retrieval system, and
+[§3.13](#313-the-mcp-server) for how the MCP tools expose the core operations
+over JSON-RPC.
 
 ---
 
@@ -356,24 +360,28 @@ core operations over JSON-RPC.
 flowchart TB
     User([User / Claude Code])
     subgraph clients["Client binaries"]
-        CLI[scriptorium CLI<br/><i>clap subcommands</i>]
-        MCP[scriptorium MCP<br/><i>stdio JSON-RPC</i>]
+        CLI[scriptorium CLI<br/><i>20+ clap subcommands</i>]
+        MCP[scriptorium MCP<br/><i>stdio JSON-RPC, 16 tools</i>]
     end
     subgraph core["scriptorium-core (library)"]
         direction TB
-        Ingest["ingest<br/>query<br/>watch"]
+        Ingest["ingest / query<br/>bulk_ingest / watch"]
+        Search["search<br/>hybrid: vector + FTS5 + RRF"]
         Vault["vault<br/>Page, LinkGraph, VaultTx"]
         Llm["llm<br/>LlmProvider trait"]
         Embed["embed<br/>chunker + store"]
-        Lint["lint<br/>broken / orphans / frontmatter"]
+        Lint["lint + doctor<br/>maintain"]
+        Learn["learnings / skills<br/>bench / hooks"]
         Schema["schema<br/>CLAUDE.md loader"]
         Git["git (thin wrapper)"]
     end
     subgraph ports["Side ports"]
         Disk[("vault<br/>filesystem")]
         GitRepo[("git repo<br/><i>undo log</i>")]
-        Sqlite[("embeddings.sqlite")]
-        Prov["LlmProvider impls<br/>Claude / OpenAI / Ollama / Mock"]
+        Sqlite[("embeddings.sqlite<br/><i>vectors + FTS5</i>")]
+        Prov["LlmProvider impls<br/>Claude / OpenAI / Gemini / Ollama / Mock"]
+        Keychain[("macOS Keychain<br/><i>API keys</i>")]
+        Web[("HTTP<br/><i>URL fetch + Readability</i>")]
     end
     User --> CLI
     User --> MCP
@@ -382,7 +390,11 @@ flowchart TB
     Vault --> Disk
     Git --> GitRepo
     Embed --> Sqlite
+    Search --> Sqlite
     Llm --> Prov
+    Learn -.-> Disk
+    core -.-> Keychain
+    Ingest -.-> Web
 ```
 
 The shape is classic hexagonal / ports-and-adapters: the CLI and the MCP
@@ -417,9 +429,9 @@ you could — it has everything it needs from `scriptorium-core`.
 
 | Crate | Purpose |
 |---|---|
-| `scriptorium-core` | All the logic: vault, page model, wikilinks, link graph, VaultTx, schema loader, mechanical lint, LLM provider trait + 4 impls, embeddings store, ingest, query, watch, git helpers, config. |
-| `scriptorium-cli` | The `scriptorium` binary. Nine `clap` subcommands. Loads config, builds a provider, calls into core. Also hosts the MCP server via `serve`. |
-| `scriptorium-mcp` | JSON-RPC 2.0 loop over stdio plus eight tool handlers that wrap core operations. Hand-rolled — deliberately does not depend on `rmcp`. |
+| `scriptorium-core` | All the logic: vault, page model, wikilinks, link graph, VaultTx, schema loader, mechanical lint, LLM provider trait + 5 impls (Claude, OpenAI, Gemini, Ollama, Mock), hybrid search (vector + FTS5 + RRF fusion), embeddings store, ingest, query, watch, maintenance, learnings, skills, hooks, keychain, social import, URL fetch, doctor, benchmarks, bulk ingest, global config, git helpers. |
+| `scriptorium-cli` | The `scriptorium` binary. 20+ `clap` subcommands including `setup` wizard, `doctor`, `bench`, `learn`, `skill`, `social`, `vault` (multi-vault management). |
+| `scriptorium-mcp` | JSON-RPC 2.0 loop over stdio plus 16 tool handlers that wrap core operations. Hand-rolled — deliberately does not depend on `rmcp`. |
 
 ### 3.3 Data model
 
@@ -698,8 +710,9 @@ pub trait LlmProvider: Send + Sync {
 }
 ```
 
-Every downstream module (`ingest`, `query`, watch) takes `&dyn LlmProvider`,
-so you can swap providers at runtime via config.
+Every downstream module (`ingest`, `query`, `search`, `watch`, `maintain`,
+`bench`) takes `&dyn LlmProvider`, so you can swap providers at runtime via
+config.
 
 **The structured-output contract.** `CompletionRequest::response_schema`
 carries an optional JSON Schema. Providers with native strict-mode
@@ -912,8 +925,8 @@ against concurrent writes because writes are atomic at the file level
 
 [MCP (Model Context Protocol)][mcp] is a JSON-RPC 2.0 protocol for letting
 LLM clients like Claude Code call external tools. A scriptorium vault
-becomes a set of 8 tools the client can invoke to inspect, search, and
-mutate the vault.
+becomes a set of 16 tools the client can invoke to inspect, search,
+mutate, and learn from the vault.
 
 [mcp]: https://modelcontextprotocol.io
 
@@ -941,21 +954,29 @@ JSON-RPC `error` objects (for method-level failures) or as
 `result.content[0].isError = true` (for tool-level failures so the client
 can display them).
 
-**Tools.** All eight are declared in
+**Tools.** All 16 are declared in
 [`tools.rs`](../crates/scriptorium-mcp/src/tools.rs) via `all_tool_specs()`.
 Each tool has a JSON Schema for its input that the client can use to
 validate arguments before invoking.
 
 | Tool | What it wraps |
 |---|---|
-| `scriptorium_ingest` | `ingest::ingest(vault, provider, source_path)` |
-| `scriptorium_query` | `query::query(vault, store, provider, model, question, top_k)` |
+| `scriptorium_ingest` | `ingest::ingest` — accepts local path or URL (fetched via Readability) |
+| `scriptorium_query` | `query::query` — hybrid search + LLM with citation validation |
 | `scriptorium_lint` | `lint::run(vault)` |
 | `scriptorium_list_pages` | `Vault::scan`, return id + title + path + tags per page |
 | `scriptorium_read_page` | resolve vault-relative path + `std::fs::read_to_string` |
 | `scriptorium_write_page` | parse content as a `Page`, stage via `VaultTx::put_file`, commit |
-| `scriptorium_search` | `provider.embed([query])` + `EmbeddingsStore::search` |
+| `scriptorium_search` | Hybrid search: vector + FTS5 + RRF fusion |
 | `scriptorium_log_tail` | tail of `log.md`, N lines (default 20) |
+| `scriptorium_maintain` | `maintain::maintain` — lint, stale detection, embedding coverage, auto-fix |
+| `scriptorium_doctor` | `doctor::run_doctor` — 8-point health check, no LLM required |
+| `scriptorium_skill_list` | `skills::list_skills` — discover available workflow instructions |
+| `scriptorium_skill_read` | `skills::read_skill` — read a skill's full SKILL.md content |
+| `scriptorium_bench` | `bench::run_benchmarks` — precision@k, recall, MRR, NDCG, F1 |
+| `scriptorium_learn_capture` | `learnings::capture` — record a pattern, pitfall, or correction |
+| `scriptorium_learn_search` | `learnings::search` — keyword search over the learning journal |
+| `scriptorium_learn_retrieve` | `learnings::retrieve` — tag-based retrieval for prompt injection |
 
 **Path-traversal guards.** Every tool that takes a path calls
 `parse_vault_path`, which rejects absolute paths and paths containing a
@@ -977,23 +998,236 @@ From that point on, Claude Code's tool list will include
 it things like "ingest the paper at ~/Downloads/attention.pdf into my
 research vault" and it will issue the right tool calls.
 
+### 3.14 Hybrid search
+
+The query pipeline uses a multi-strategy retrieval system that fuses
+vector similarity, keyword matching, and optional LLM-based query
+expansion into a single ranked result set.
+
+```mermaid
+flowchart LR
+    Q([Query]) --> Expand["LLM query<br/>expansion<br/><i>optional</i>"]
+    Expand --> V1["Vector search<br/><i>variant 1</i>"]
+    Expand --> V2["Vector search<br/><i>variant 2</i>"]
+    Q --> KW["FTS5 keyword<br/>search"]
+    V1 --> RRF["Reciprocal<br/>Rank Fusion"]
+    V2 --> RRF
+    KW --> RRF
+    RRF --> Dedup["Dedup +<br/>diversify"]
+    Dedup --> Top["Top-k<br/>results"]
+```
+
+Implemented in [`search/`](../crates/scriptorium-core/src/search/):
+
+1. **Query expansion** (`search/expansion.rs`). The original query is
+   optionally rephrased into 2–3 alternative formulations by the LLM.
+   This is non-fatal — if the LLM call fails, the original query is used
+   alone.
+2. **Vector search.** Each query variant is embedded and searched against
+   the SQLite embeddings store. Results are scoped to a single
+   `(provider, model)` pair.
+3. **Keyword search.** The original query is run against a SQLite FTS5
+   full-text index over page content.
+4. **Reciprocal Rank Fusion** (`search/fusion.rs`). All result lists are
+   merged using RRF with a configurable `k` parameter (default 60). RRF
+   is rank-based, not score-based, so it handles the different score
+   distributions of vector and keyword search gracefully.
+5. **Dedup and diversification** (`search/dedup.rs`). Duplicate chunks
+   from the same page are collapsed; the result set is diversified to
+   avoid returning five chunks from a single dominant page.
+
+The `HybridSearchOpts` struct controls all parameters: `top_k`,
+`expansion` (on/off), `vector_limit`, `keyword_limit`, and `DedupConfig`.
+
+### 3.15 URL fetch and Readability extraction
+
+[`url_fetch`](../crates/scriptorium-core/src/url_fetch.rs) enables
+`scriptorium ingest --url <URL>`: fetch the page over HTTP, extract the
+main article content via Mozilla Readability (using the `dom_smoothie`
+crate), convert to markdown, and prepend a provenance block with the
+original URL and fetch timestamp. The result is written to a tempfile
+and fed to the standard ingest pipeline as if it were a local file.
+
+Limitations are documented, not silently swallowed: JS-rendered SPAs
+return skeleton HTML (error if near-empty), paywalled content returns
+the paywall body, and non-HTML responses (PDF, JSON) are rejected with
+a pointer to download the file directly.
+
+### 3.16 Maintenance and doctor
+
+**Doctor** ([`doctor.rs`](../crates/scriptorium-core/src/doctor.rs)) runs
+8 mechanical health checks that require no LLM: git repo integrity,
+schema presence, embeddings coverage, broken link count, orphan count,
+duplicate IDs, frontmatter validity, and git working tree status. Returns
+a structured `DoctorReport` with per-check `Ok`/`Warn`/`Fail` status.
+
+**Maintain** ([`maintain.rs`](../crates/scriptorium-core/src/maintain.rs))
+runs the full maintenance cycle in a single pass: lint, stale page
+detection, embedding coverage analysis. With `--fix`, it auto-fixes safe
+issues: re-embeds stale pages and corrects bad timestamps. Designed to
+be triggered by cron, Claude Code hooks, or the MCP tool.
+
+### 3.17 Bulk ingest
+
+[`bulk_ingest`](../crates/scriptorium-core/src/bulk_ingest.rs) processes
+an entire directory of source files with checkpoint resume. A checkpoint
+file tracks which files have been successfully ingested; interrupted
+imports pick up where they left off. Progress is reported via `indicatif`
+progress bars in the CLI.
+
+### 3.18 Social media import
+
+[`social/`](../crates/scriptorium-core/src/social/) handles platform-
+specific export formats. Currently implemented:
+
+- **Facebook** (`social/facebook.rs`): parses the JSON export format
+  (messages, posts, comments, friends, search history, events, groups),
+  converts to markdown source files, and feeds them through bulk ingest.
+  Accepts multiple export directories (Facebook splits large exports
+  across ZIPs).
+
+### 3.19 Multi-vault management
+
+[`global_config`](../crates/scriptorium-core/src/global_config.rs) stores
+a vault registry at `~/.config/scriptorium/config.toml`. Users can
+register multiple vaults under short names (`work`, `research`, `personal`)
+and set a default. When `-C` is not provided, the CLI resolves the default
+vault from the global registry. The `vault list|add|remove|default|show`
+subcommands manage the registry.
+
+### 3.20 Setup wizard and Keychain integration
+
+`scriptorium setup` is an interactive wizard that walks through provider
+selection, API key entry, and model configuration. API keys are stored in
+the macOS Keychain via the `security` CLI
+([`keychain.rs`](../crates/scriptorium-core/src/keychain.rs)), not in
+config files. Service names follow the pattern `scriptorium-<provider>`.
+Falls back gracefully on non-macOS platforms.
+
+### 3.21 Lifecycle hooks
+
+[`hooks`](../crates/scriptorium-core/src/hooks.rs) fires shell commands
+at key points in the pipeline. Configured in `.scriptorium/config.toml`:
+
+```toml
+[hooks]
+pre_ingest = "echo 'ingesting {source}'"
+post_ingest = "curl -X POST https://hooks.example.com -d '{summary}'"
+```
+
+Pre-hooks can abort operations by exiting non-zero. Post-hooks are fire-
+and-forget. Template variables (`{source}`, `{commit_id}`, `{summary}`)
+are expanded before execution. 30-second timeout per hook.
+
 ---
 
-## 4. Testing
+## 4. Self-improving agents
 
-113 tests across three layers, zero clippy warnings, zero fmt diffs.
+Scriptorium includes infrastructure for agents that compound knowledge
+across sessions and measurably improve over time.
 
-**Unit tests** (99 in `scriptorium-core`, 5 in `scriptorium-mcp`):
+### 4.1 Self-learning journal
+
+[`learnings`](../crates/scriptorium-core/src/learnings.rs) maintains an
+append-only JSONL file at `.scriptorium/learnings.jsonl`. Agents capture
+insights during operation:
+
+| Type | Purpose | Example |
+|------|---------|---------|
+| `pattern` | A successful approach | "Chunking at H2 boundaries gives better recall than paragraph-level" |
+| `pitfall` | A known failure mode | "Gemini JSON mode silently drops `oneOf` constraints" |
+| `correction` | User-corrected mistake | "Don't merge overlapping wiki pages — user wants separate entries" |
+| `preference` | User preference | "Always cite page stems, not full paths" |
+| `domain_knowledge` | Codebase-specific fact | "The `attention` page covers both self-attention and cross-attention" |
+
+Each learning has a **confidence score** (1–10) with time-based decay.
+High-confidence entries are injected into LLM prompts as context via
+`scriptorium_learn_retrieve`. The dedup-at-read-time design means agents
+can freely capture learnings without worrying about duplicates; stale
+entries decay naturally.
+
+The journal is gitignored — it's local to each machine, not vault
+content.
+
+### 4.2 Skills
+
+[`skills`](../crates/scriptorium-core/src/skills.rs) provides named
+markdown instruction sets (`skills/*/SKILL.md`) that teach agents how to
+perform specific workflows. A `manifest.json` registry lists available
+skills.
+
+```mermaid
+flowchart LR
+    Agent([Agent]) --> List["skill_list"]
+    List --> Pick["Choose skill"]
+    Pick --> Read["skill_read"]
+    Read --> Execute["Follow instructions"]
+    Execute --> Learn["learn_capture<br/><i>if non-trivial</i>"]
+```
+
+Ships with 5 built-in skills:
+
+| Skill | Workflow |
+|-------|---------|
+| `ingest` | Full ingest pipeline: read, prompt, create/update pages, commit |
+| `query` | Hybrid search with cited sources |
+| `maintain` | Dream cycle: lint, stale detection, embedding coverage, auto-fix |
+| `review` | Review recently ingested content for quality and completeness |
+| `learn` | Manage the self-learning journal |
+
+Vaults can add custom skills by creating `skills/<name>/SKILL.md` and
+registering them in `skills/manifest.json`.
+
+### 4.3 Retrieval benchmarks
+
+[`bench`](../crates/scriptorium-core/src/bench.rs) provides measurable
+retrieval quality. Define test cases in `.scriptorium/benchmarks.json`:
+
+```json
+{
+  "benchmarks": [
+    {
+      "query": "how does multi-head attention work?",
+      "expected": ["attention", "transformers"],
+      "k": 5,
+      "description": "Core attention mechanism retrieval"
+    }
+  ]
+}
+```
+
+The `bench` command runs hybrid search for each case and reports:
+
+| Metric | What it measures |
+|--------|-----------------|
+| Precision@k | Fraction of top-k results that are relevant |
+| Recall | Fraction of expected results that were retrieved |
+| F1 | Harmonic mean of precision and recall |
+| MRR | Reciprocal rank of the first relevant result |
+| NDCG@k | Rank-weighted relevance (rewards relevant docs higher) |
+| Composite | Weighted overall health score |
+
+Use benchmarks to catch retrieval regressions after schema changes,
+provider swaps, or embedding model upgrades.
+
+---
+
+## 5. Testing
+
+307 tests across three layers, zero clippy warnings, zero fmt diffs.
+
+**Unit tests** (~280 in `scriptorium-core`, ~15 in `scriptorium-mcp`):
 inline with each module under `#[cfg(test)] mod tests`. Every meaningful
 struct has at least one test; the wikilink parser, link graph, patch apply
-logic, and embeddings store each have ~10+.
+logic, embeddings store, hybrid search fusion, dedup, learnings, and hooks
+each have comprehensive coverage.
 
-**Property tests** (1, in `page.rs`): `proptest` generates random
+**Property tests** (in `page.rs`): `proptest` generates random
 `Frontmatter` / body pairs and asserts `Page::parse(page.to_markdown()) ==
 page` for any normalized page. This is the invariant that lets round-trips
 stay stable through gray_matter's whitespace handling.
 
-**End-to-end tests** (9, in
+**End-to-end tests** (in
 [`crates/scriptorium-core/tests/e2e.rs`](../crates/scriptorium-core/tests/e2e.rs)):
 run against a fixture vault at
 `crates/scriptorium-core/tests/fixtures/sample-vault/` containing 4 wiki
@@ -1011,18 +1245,21 @@ broken link (from `transformers` → `does-not-exist`), and one orphan page
   where the LLM hallucinates a citation and the pipeline strips it)
 - The mock provider's round-trip through a structured-response fixture
 
-**All tests use `MockProvider`.** No network, no API keys, no flakiness.
-`EmbeddingsStore::in_memory()` gives the mock-driven query test its own
-temporary SQLite DB. The real providers (Claude, OpenAI, Ollama) have no
-live-test coverage in v1 — the test suite validates the *shape* of their
-integration (request construction, response parsing, retry classification)
-through unit tests, but hitting the network is deferred to a nightly CI
-job that runs when API keys are available.
+**Live provider tests** (in `tests/live_claude.rs` and
+`tests/live_gemini.rs`): integration tests that hit real APIs. Gated behind
+API key environment variables — they run in CI when keys are available and
+are skipped locally otherwise.
+
+**All default tests use `MockProvider`.** No network, no API keys, no
+flakiness. `EmbeddingsStore::in_memory()` gives the mock-driven tests their
+own temporary SQLite DB. The mock provider replays canned fixtures, produces
+deterministic SHA-256-derived embedding vectors, and does not enforce
+response schemas — tests supply valid JSON fixtures directly.
 
 **Commands**:
 
 ```sh
-cargo test --workspace                                  # 113 tests, <1s
+cargo test --workspace                                  # 307 tests, <2s
 cargo clippy --workspace --all-targets -- -D warnings   # zero warnings
 cargo fmt --check                                       # zero diffs
 cargo doc --workspace --no-deps --document-private-items
@@ -1030,50 +1267,63 @@ cargo doc --workspace --no-deps --document-private-items
 
 ---
 
-## 5. Deferred to v2
+## 6. Roadmap
 
-Features we deliberately did not build. The docs do not portray any of these
-as working:
+### Shipped (formerly deferred)
 
-- **PDF / HTML source ingestion.** `ingest::ingest` reads via
-  `String::from_utf8`, so real PDFs and binary files will fail. The
-  watcher's `is_ingestable_source` filter only accepts `.md` / `.markdown`
-  / `.txt` / `.text`. Adding PDF support means wiring in a text extractor
+These were explicitly listed as "deferred" in v1 and are now implemented:
+
+- **Hybrid lexical + vector search** — `search/` module with FTS5 keyword
+  search, multi-query expansion, Reciprocal Rank Fusion, and dedup/
+  diversification. See [§3.14](#314-hybrid-search).
+- **URL ingest** — `scriptorium ingest --url` fetches pages, extracts
+  article content via Mozilla Readability, converts to markdown. See
+  [§3.15](#315-url-fetch-and-readability-extraction).
+- **Self-learning journal** — agents capture patterns, pitfalls, and
+  corrections that are injected into future prompts. See [§4.1](#41-self-learning-journal).
+- **Skills framework** — markdown instruction sets for agent workflows
+  with MCP discovery. See [§4.2](#42-skills).
+- **Retrieval benchmarks** — precision@k, recall, MRR, NDCG, F1,
+  composite score. See [§4.3](#43-retrieval-benchmarks).
+- **Doctor and maintenance** — mechanical health checks and auto-fix
+  maintenance cycles. See [§3.16](#316-maintenance-and-doctor).
+- **Bulk ingest** — directory-level batch processing with checkpoint
+  resume. See [§3.17](#317-bulk-ingest).
+- **Social media import** — Facebook data export parsing. See
+  [§3.18](#318-social-media-import).
+- **Multi-vault management** — global vault registry with named vaults.
+  See [§3.19](#319-multi-vault-management).
+- **Setup wizard + Keychain** — interactive provider/key configuration
+  with macOS Keychain storage. See [§3.20](#320-setup-wizard-and-keychain-integration).
+- **Lifecycle hooks** — configurable shell commands at pipeline events.
+  See [§3.21](#321-lifecycle-hooks).
+
+### Still deferred
+
+- **PDF source ingestion.** `ingest` reads via `String::from_utf8`, so
+  binary PDFs fail. Adding PDF support means wiring in a text extractor
   (and acknowledging that scanned PDFs will need OCR).
-- **Hybrid lexical + vector search.** `EmbeddingsStore::search` is pure
-  cosine top-k. No BM25, no title-match boost. Defer until vector-only
-  recall is proven insufficient on a real vault.
-- **HTTP / SSE MCP transport.** The server is stdio only. `claude mcp add
-  ... serve` works; remote access does not. Adding HTTP means bringing in
-  `axum` (already in workspace deps for exactly this future need) and
-  adding an auth token.
-- **LLM-assisted lint rules.** `stale` (pages whose claims are outdated
-  relative to newer sources) and `contradictions` (pages that disagree on
-  a fact) would both be LLM-powered rules following the same shape as the
-  mechanical rules. Not built in v1 to keep the prompt surface small and
-  the deterministic test path fast.
+- **HTTP / SSE MCP transport.** The server is stdio only. Remote access
+  would need `axum` + auth tokens.
+- **LLM-assisted lint rules.** `stale` (outdated claims) and
+  `contradictions` (pages that disagree) would be LLM-powered rules.
+  The plumbing exists; the prompt templates don't.
 - **Embedding refresh on `wiki/` edits.** The watcher observes `sources/`
-  only. Editing a page in `wiki/` directly (e.g. from Obsidian) will not
-  re-embed it until the next `scriptorium reindex`. Adding this needs
-  self-write suppression so an ingest's own `wiki/` writes don't trigger
-  the watcher.
-- **Section-level patches in production.** `vault::patch` is fully
-  implemented but no production caller emits patches. Ingest writes whole
-  pages. When the prompt templates move to patch-based updates, the
-  infrastructure is already there.
-- **Embedding with Claude.** Anthropic has no public embeddings API, so
-  `ClaudeProvider::embed` returns `LlmError::Unsupported`. Configure a
-  separate provider (OpenAI or Ollama) for embeddings in `config.toml`.
-- **`.scriptorium/version` migrations.** Slot reserved in the vault layout,
-  loader not implemented. When `SCHEMA_VERSION` ever goes from 1 to 2,
-  this is where the migration code will live.
-- **Remote git push/pull.** `git.rs` deliberately scopes to local commits.
-  Push/pull is a user concern — run `git push` yourself, scriptorium
-  won't.
+  only. Editing a page in Obsidian won't re-embed until `reindex`. Needs
+  self-write suppression.
+- **Section-level patches in production.** `vault::patch` is implemented
+  and tested but no production caller emits patches. Ingest writes whole
+  pages.
+- **Embedding with Claude.** Anthropic has no public embeddings API.
+  Configure a separate provider in `config.toml`.
+- **`.scriptorium/version` migrations.** Slot reserved, loader not
+  implemented.
+- **Remote git push/pull.** `git.rs` scopes to local commits. Push/pull
+  is a user concern.
 
 ---
 
-## 6. Glossary
+## 7. Glossary
 
 | Term | Definition |
 |---|---|
@@ -1082,20 +1332,26 @@ as working:
 | **wikilink** | Obsidian-style `[[stem]]` / `[[stem\|alias]]` / `[[stem#heading]]` / `[[#heading]]` cross-reference between pages. |
 | **LinkGraph** | In-memory forward + backlink graph over a set of pages. Rebuilt on every mutation. |
 | **VaultTx** | Staged, validated, atomic mutation pipeline. Every write to the vault goes through one. |
-| **Patch** | Section-level edit operation (replace / append / insert / set-frontmatter / delete) with stale-hash and conflict detection. Infrastructure for v2; not emitted by any v1 caller. |
+| **Patch** | Section-level edit operation (replace / append / insert / set-frontmatter / delete) with stale-hash and conflict detection. Infrastructure; not emitted by any production caller yet. |
 | **Schema** | The `CLAUDE.md` (or `AGENTS.md`) file at the vault root. Injected as the LLM's system prompt on every call, shrunk to fit the token budget. |
-| **LlmProvider** | The trait that abstracts over Claude / OpenAI / Ollama / Mock. Requires `complete`, `embed`, `name`, `context_window`, `embedding_dim`. |
-| **EmbeddingsStore** | SQLite-backed cache of `(page_id, content_hash, chunk_idx, provider, model) → Vec<f32>`. Supports cosine top-k search. |
+| **LlmProvider** | The trait that abstracts over Claude / OpenAI / Gemini / Ollama / Mock. Requires `complete`, `embed`, `name`, `context_window`, `embedding_dim`. |
+| **EmbeddingsStore** | SQLite-backed cache of `(page_id, content_hash, chunk_idx, provider, model) → Vec<f32>`. Supports cosine top-k search and FTS5 keyword search. |
 | **Chunk** | A heading-scoped sub-region of a page body, typically ~1000 tokens. The unit of embedding. |
 | **IngestPlan** | The structured JSON the ingest prompt asks the LLM to produce: summary, list of page actions, log entry. |
 | **QueryAnswer** | The structured JSON the query prompt asks the LLM to produce: answer text, citations as page stems, optional confidence. |
 | **MCP** | Model Context Protocol — a JSON-RPC 2.0 protocol for exposing tools to LLM clients like Claude Code. |
-| **Structured output** | Forcing the LLM to return JSON that matches a schema, via each provider's native mechanism (Claude tool-use, OpenAI `response_format: json_schema`, Ollama `format: "json"` hint). |
+| **Structured output** | Forcing the LLM to return JSON that matches a schema, via each provider's native mechanism (Claude tool-use, OpenAI `response_format: json_schema`, Gemini JSON mode, Ollama `format: "json"` hint). |
 | **Mechanical lint** | Rules that run without an LLM call: broken links, orphans, malformed frontmatter, duplicate IDs. |
+| **Hybrid search** | Multi-strategy retrieval combining vector similarity, FTS5 keyword matching, and Reciprocal Rank Fusion into a single ranked result set. |
+| **RRF** | Reciprocal Rank Fusion — a rank-based fusion algorithm that merges multiple result lists without needing normalized scores. |
+| **Learning** | A typed insight (pattern, pitfall, correction, preference, domain knowledge) captured in the self-learning journal with confidence scores and time-based decay. |
+| **Skill** | A named markdown instruction set (`SKILL.md`) that teaches an agent how to perform a specific scriptorium workflow. |
+| **Doctor** | 8-point mechanical health check that requires no LLM: git, schema, embeddings, links, frontmatter, working tree status. |
+| **Dream cycle** | The maintenance pass (lint + stale detection + embedding coverage + optional auto-fix) inspired by sleep-phase memory consolidation. |
 
 ---
 
-## 7. Reading the source
+## 8. Reading the source
 
 **Start here**:
 [`crates/scriptorium-core/src/lib.rs`](../crates/scriptorium-core/src/lib.rs).
@@ -1106,11 +1362,24 @@ Every `pub mod` corresponds to a section of this document:
 | `vault` | §2.2–§2.4, §3.4, §3.11, §3.12 | `mod.rs` → `page.rs` → `graph.rs` → `tx.rs` → `patch.rs` → `lock.rs` |
 | `schema` | §3.9 | `schema.rs` (single file) |
 | `lint` | §3.10 | `mod.rs` → `broken_links.rs` → `orphans.rs` → `frontmatter.rs` |
-| `llm` | §3.7 | `mod.rs` → `mock.rs` → `prompts.rs` → `claude.rs` → `openai.rs` → `ollama.rs` → `retry.rs` |
+| `llm` | §3.7 | `mod.rs` → `mock.rs` → `prompts.rs` → `claude.rs` → `openai.rs` → `gemini.rs` → `ollama.rs` → `retry.rs` |
 | `embed` | §3.8 | `chunk.rs` → `store.rs` → `index.rs` |
+| `search` | §3.14 | `mod.rs` → `fusion.rs` → `dedup.rs` → `expansion.rs` |
 | `ingest` | §3.5 | `ingest.rs` (single file, heavily commented) |
 | `query` | §3.6 | `query.rs` (single file, heavily commented) |
-| `watch` | §2.5, §5 | `watch.rs` (single file) |
+| `learnings` | §4.1 | `learnings.rs` (single file) |
+| `skills` | §4.2 | `skills.rs` (single file) |
+| `bench` | §4.3 | `bench.rs` (single file) |
+| `doctor` | §3.16 | `doctor.rs` (single file) |
+| `maintain` | §3.16 | `maintain.rs` (single file) |
+| `hooks` | §3.21 | `hooks.rs` (single file) |
+| `keychain` | §3.20 | `keychain.rs` (single file) |
+| `url_fetch` | §3.15 | `url_fetch.rs` (single file) |
+| `bulk_ingest` | §3.17 | `bulk_ingest.rs` (single file) |
+| `social` | §3.18 | `mod.rs` → `facebook.rs` |
+| `global_config` | §3.19 | `global_config.rs` (single file) |
+| `setup` | §3.20 | `setup.rs` (single file) |
+| `watch` | §2.5 | `watch.rs` (single file) |
 | `git` | §3.4 | `git.rs` (single file, thin wrapper) |
 
 **The CLI** lives in
@@ -1120,7 +1389,7 @@ one file, one `Command` enum, one function per subcommand.
 **The MCP server** lives in `crates/scriptorium-mcp/src/` across three files:
 [`lib.rs`](../crates/scriptorium-mcp/src/lib.rs) (public surface),
 [`server.rs`](../crates/scriptorium-mcp/src/server.rs) (JSON-RPC loop), and
-[`tools.rs`](../crates/scriptorium-mcp/src/tools.rs) (the 8 tool handlers).
+[`tools.rs`](../crates/scriptorium-mcp/src/tools.rs) (the 16 tool handlers).
 
 **Generated rustdoc** has more detail than this document for any individual
 type. Generate it with:
@@ -1144,9 +1413,9 @@ read in one sitting.
 
 ---
 
-## 8. Operating it: costs and troubleshooting
+## 9. Operating it: costs and troubleshooting
 
-### 8.1 What does it cost?
+### 9.1 What does it cost?
 
 Scriptorium writes one line per LLM call to `<vault>/.scriptorium/usage.jsonl`
 in this shape:
@@ -1198,7 +1467,7 @@ longer-running operations (`reindex`, `watch`), hit Ctrl-C — the worker
 drops mid-call, no partial commit gets left behind because all writes go
 through `VaultTx::commit`.
 
-### 8.2 Dry runs
+### 9.2 Dry runs
 
 Before running an ingest that might be expensive or that you don't fully
 trust, pass `--dry-run`:
@@ -1231,7 +1500,7 @@ ingest DRY RUN: would create 5 page(s), update 0 — nothing written.
   "don't commit" flag, not a "don't call the LLM" flag. The usage.jsonl
   line is still written.
 
-### 8.3 Troubleshooting
+### 9.3 Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -1247,7 +1516,7 @@ ingest DRY RUN: would create 5 page(s), update 0 — nothing written.
 | Claude commits unsigned when your other commits are gpg-signed | `git2` bypasses the `commit.gpgsign` hook. Scriptorium commits will land unsigned regardless of your global config. | Known limitation. On a repo with branch protection that requires signing, either disable scriptorium's `git.auto_commit` and run `git commit -S` manually, or wait for signing support (not on the v2 list). |
 | Ukrainian / CJK source filenames produce empty slugs | Older versions of scriptorium used ASCII-only slugify. Fixed — `is_alphanumeric` now preserves non-ASCII alphanumerics. | Upgrade and re-run. Old sources in `sources/articles/<hash>-.md` (empty-slug) can be renamed by hand; the hash prefix is still unique. |
 
-### 8.4 Recovering from a bad ingest
+### 9.4 Recovering from a bad ingest
 
 If an ingest commits pages you don't want:
 
@@ -1263,7 +1532,7 @@ plain git: `git revert <sha>`, or `git reset --hard <sha>` if you're sure.
 Scriptorium doesn't own your git history; it's just a careful writer into
 it.
 
-### 8.5 Regenerating the embeddings store
+### 9.5 Regenerating the embeddings store
 
 After schema changes, provider swaps, or if the store gets corrupted:
 
@@ -1276,7 +1545,7 @@ scriptorium -C ~/scriptorium-vault reindex
 `(provider, model, content_hash)` are skipped. On a fresh store, it embeds
 every page once.
 
-### 8.6 Reading the usage log
+### 9.6 Reading the usage log
 
 The log is newline-delimited JSON, append-only, and append-safe — you can
 `tail -f` it during a long-running operation and it won't interleave
