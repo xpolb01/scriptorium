@@ -9,10 +9,10 @@ timeout_secs = 120
 
 [embeddings]
 # Claude has no embeddings API. Use one of: "openai", "gemini", "ollama".
-# Gemini is the simplest option — one GOOGLE_API_KEY covers both chat
+# Gemini is the simplest option — one SCRIPTORIUM_GOOGLE_API_KEY covers both chat
 # (if you set [llm].provider = "gemini") and embeddings end-to-end.
 provider = "gemini"
-model    = "gemini-embedding-001"
+model    = "gemini-embedding-2-preview"
 
 [git]
 auto_commit = true

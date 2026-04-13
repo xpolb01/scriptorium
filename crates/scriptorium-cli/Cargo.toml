@@ -30,3 +30,4 @@ serde_json.workspace = true
 # only needs the helpers below to format paths and timestamps for output.
 camino.workspace = true
 chrono.workspace = true
+indicatif.workspace = true

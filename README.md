@@ -107,7 +107,7 @@ cargo test --workspace
 
 # 5. Use it for real: drop a source file, set up an API key, ingest.
 echo "# Attention is parallel" > /tmp/my-vault/sources/articles/notes.md
-export ANTHROPIC_API_KEY=sk-ant-...
+export SCRIPTORIUM_ANTHROPIC_API_KEY=sk-ant-...
 scriptorium -C /tmp/my-vault ingest /tmp/my-vault/sources/articles/notes.md
 scriptorium -C /tmp/my-vault query "how does attention work?"
 ```

@@ -32,6 +32,11 @@ pub use patch::{Patch, PatchError, PatchOp, PatchOutcome};
 pub use tx::{Action, ChangeSummary, VaultTx};
 pub use wikilink::Wikilink;
 
+/// Check whether a directory looks like a scriptorium vault (has `.scriptorium/`).
+pub fn is_vault(path: &std::path::Path) -> bool {
+    path.join(dirs::META).is_dir()
+}
+
 /// Default subdirectory names. Configurable later via [`crate::config::PathsConfig`].
 pub mod dirs {
     pub const WIKI: &str = "wiki";

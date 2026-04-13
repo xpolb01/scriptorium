@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
+use crate::hooks::HooksConfig;
 use crate::ingest;
 use crate::llm::LlmProvider;
 use crate::vault::Vault;
@@ -32,7 +33,11 @@ const DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Run the watcher until the returned task is dropped or the watch loop
 /// encounters a fatal error. Blocks the calling task.
-pub async fn watch(vault: Vault, provider: Arc<dyn LlmProvider>) -> Result<()> {
+pub async fn watch(
+    vault: Vault,
+    provider: Arc<dyn LlmProvider>,
+    hooks: Option<HooksConfig>,
+) -> Result<()> {
     let sources_dir: PathBuf = vault.sources_dir().into_std_path_buf();
     if !sources_dir.is_dir() {
         return Err(Error::VaultMissing(sources_dir));
@@ -78,6 +83,14 @@ pub async fn watch(vault: Vault, provider: Arc<dyn LlmProvider>) -> Result<()> {
             debug!(path = %path.display(), "watch: skip non-source file");
             continue;
         }
+        // Fire on_watch_trigger hook (can abort this file's ingest).
+        if let Some(ref h) = hooks {
+            if let Err(e) = crate::hooks::on_watch_trigger(h, &path).await {
+                warn!(path = %path.display(), error = %e, "watch: hook aborted ingest");
+                continue;
+            }
+        }
+
         info!(path = %path.display(), "watch: ingesting");
         match ingest::ingest(&vault, provider.as_ref(), &path).await {
             Ok(report) => info!(

@@ -5,11 +5,12 @@
 //! rendering uses `miette` so library `thiserror` errors pretty-print with
 //! source context.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use indicatif::{ProgressBar, ProgressStyle};
 use miette::{miette, IntoDiagnostic, Result};
 use scriptorium_core::config::Config;
 use scriptorium_core::embed::EmbeddingsStore;
@@ -38,6 +39,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Interactive setup wizard: configure providers, store API keys in
+    /// the macOS keychain, and write config.toml.
+    Setup,
+
     /// Scaffold a new vault from the bundled templates.
     Init {
         /// Target directory (defaults to the `-C` vault or current dir).
@@ -57,6 +62,9 @@ enum Command {
         /// Override the provider declared in config.
         #[arg(long, value_enum)]
         provider: Option<ProviderKind>,
+        /// Override the model declared in config (e.g. "claude-sonnet-4-6").
+        #[arg(long)]
+        model: Option<String>,
         /// Stage all writes, call the LLM, then print a preview of the
         /// change set and abort instead of committing. The source file is
         /// still interned into `sources/` but no wiki pages are written
@@ -127,6 +135,9 @@ enum Command {
         /// Override the provider declared in config.
         #[arg(long, value_enum)]
         provider: Option<ProviderKind>,
+        /// Override the model declared in config (e.g. "claude-sonnet-4-6").
+        #[arg(long)]
+        model: Option<String>,
         /// Start fresh, ignoring any existing checkpoint.
         #[arg(long)]
         fresh: bool,
@@ -137,6 +148,27 @@ enum Command {
 
     /// Show the resolved config for this vault.
     Config,
+
+    /// Manage skills: list, show, or scaffold defaults.
+    #[command(subcommand)]
+    Skill(SkillCommand),
+
+    /// Manage the self-learning journal.
+    #[command(subcommand)]
+    Learn(LearnCommand),
+
+    /// Run retrieval quality benchmarks (precision@k, recall, MRR).
+    Bench {
+        /// Output as JSON instead of a human-readable table.
+        #[arg(long)]
+        json: bool,
+        /// Scaffold an empty benchmarks.json if none exists.
+        #[arg(long)]
+        init: bool,
+        /// Override the provider declared in config.
+        #[arg(long, value_enum)]
+        provider: Option<ProviderKind>,
+    },
 
     /// Run the MCP server on stdio so Claude Code (and other MCP clients)
     /// can drive this vault as native tools.
@@ -151,6 +183,105 @@ enum Command {
         /// Override the provider declared in config.
         #[arg(long, value_enum)]
         provider: Option<ProviderKind>,
+    },
+
+    /// Import data from social media platforms.
+    #[command(subcommand)]
+    Social(SocialCommand),
+
+    /// Manage registered vaults: list, add, remove, set default.
+    #[command(name = "vault", subcommand)]
+    VaultMgmt(VaultCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum SocialCommand {
+    /// Import a Facebook data export: parse JSON, generate markdown sources,
+    /// and ingest them into the vault — all in one step.
+    ///
+    /// Accepts one or more export directories (Facebook splits large exports
+    /// across multiple ZIPs). The command auto-detects which directory
+    /// contains JSON data.
+    Facebook {
+        /// One or more Facebook export directories.
+        #[arg(required = true)]
+        export_dirs: Vec<PathBuf>,
+        /// Only process specific categories (comma-separated).
+        /// Options: messages, posts, comments, friends, search, events, groups
+        #[arg(long, value_delimiter = ',')]
+        categories: Option<Vec<String>>,
+        /// Override the LLM provider for ingestion.
+        #[arg(long, value_enum)]
+        provider: Option<ProviderKind>,
+        /// Override the LLM model for ingestion (e.g. "claude-haiku-4-5-20251001").
+        #[arg(long)]
+        model: Option<String>,
+        /// Preview what would be generated without writing or ingesting.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    /// List all registered skills.
+    List,
+    /// Show the full content of a skill.
+    Show {
+        /// Skill name (e.g. "ingest", "query", "maintain").
+        name: String,
+    },
+    /// Scaffold the default skills into <vault>/skills/.
+    Init,
+}
+
+#[derive(Debug, Subcommand)]
+enum LearnCommand {
+    /// List the N most recent learnings.
+    List {
+        /// How many entries to show.
+        #[arg(short, long, default_value_t = 20)]
+        n: usize,
+    },
+    /// Search learnings by keyword.
+    Search {
+        /// Search query.
+        query: String,
+    },
+    /// Add a learning from a JSON string.
+    Add {
+        /// JSON learning entry.
+        json: String,
+    },
+    /// Remove learnings whose confidence has decayed to 0.
+    Prune,
+}
+
+#[derive(Debug, Subcommand)]
+enum VaultCommand {
+    /// List all registered vaults; the default is marked with *.
+    List,
+    /// Register an existing vault directory under a name.
+    Add {
+        /// Short name for this vault (e.g. "main", "work").
+        name: String,
+        /// Path to the vault root directory.
+        path: PathBuf,
+    },
+    /// Unregister a vault (does NOT delete files on disk).
+    Remove {
+        /// Name of the vault to unregister.
+        name: String,
+    },
+    /// Set a vault as the default (used when -C is not provided).
+    Default {
+        /// Name of the vault to make default.
+        name: String,
+    },
+    /// Show details about a vault: path, page count, config.
+    Show {
+        /// Vault name (uses the default vault if omitted).
+        name: Option<String>,
     },
 }
 
@@ -184,25 +315,57 @@ async fn main() -> ExitCode {
 
 #[allow(clippy::too_many_lines)] // one arm per subcommand; flat is clearer
 async fn run(cli: Cli) -> Result<ExitCode> {
-    // Resolve the vault path once up front so match arms can destructure
-    // `cli.command` without borrow-checker conflicts.
-    let vault_path = cli.vault.clone().unwrap_or_else(|| PathBuf::from("."));
+    let explicit_vault = cli.vault.clone();
     match cli.command {
+        // --- commands that don't need vault resolution ---
+        Command::VaultMgmt(sub) => handle_vault_command(sub),
         Command::Init { path } => {
-            let target = path.unwrap_or(vault_path);
+            let target = path
+                .or(explicit_vault)
+                .unwrap_or_else(|| PathBuf::from("."));
             init_vault(&target)?;
+            // Also scaffold skills and benchmarks.
+            if let Ok(vault) = Vault::open(&target) {
+                let _ = scriptorium_core::skills::init_skills(&vault);
+                let _ = scriptorium_core::bench::save_suite(
+                    &vault,
+                    &scriptorium_core::bench::BenchmarkSuite {
+                        benchmarks: Vec::new(),
+                    },
+                );
+            }
+            auto_register_vault(&target);
             println!("scriptorium init: scaffolded vault at {}", target.display());
+            Ok(ExitCode::SUCCESS)
+        }
+        // --- all remaining commands need a resolved vault path ---
+        command => {
+            let vault_path = resolve_vault_path(explicit_vault)?;
+            match command {
+        Command::Setup => {
+            let vault = open_vault(&vault_path)?;
+            let stdin = std::io::stdin();
+            let mut input = stdin.lock();
+            let mut output = std::io::stderr();
+            scriptorium_core::setup::run_setup(&vault, &mut input, &mut output)
+                .into_diagnostic()?;
+            auto_register_vault(vault.root().as_std_path());
             Ok(ExitCode::SUCCESS)
         }
         Command::Ingest {
             source,
             url,
             provider,
+            model,
             dry_run,
         } => {
             let vault = open_vault(&vault_path)?;
             let cfg = load_config(&vault);
-            let provider = build_provider(provider.unwrap_or_else(|| provider_from(&cfg)))?;
+            let resolved_provider = provider.unwrap_or_else(|| provider_from(&cfg));
+            if let Some(ref m) = model {
+                set_model_env(provider_kind_name(resolved_provider), m);
+            }
+            let provider = build_provider(resolved_provider)?;
             // Resolve to a concrete file path. URL ingest fetches, runs
             // Readability, converts to markdown, writes a tempfile, and the
             // regular file-ingest path takes over. The returned struct holds
@@ -212,7 +375,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 &vault,
                 provider.as_ref(),
                 &resolved.path,
-                ingest::IngestOptions { dry_run },
+                ingest::IngestOptions {
+                    dry_run,
+                    hooks: Some(cfg.hooks.clone()),
+                },
             )
             .await
             .into_diagnostic()?;
@@ -420,14 +586,20 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::BulkIngest {
             dir,
             provider,
+            model,
             fresh,
             dry_run,
         } => {
             let vault = open_vault(&vault_path)?;
             let cfg = load_config(&vault);
-            let llm = build_provider(
-                provider.unwrap_or_else(|| provider_from(&cfg)),
-            )?;
+            let resolved_provider = provider.unwrap_or_else(|| provider_from(&cfg));
+            if let Some(ref m) = model {
+                // Use the resolved provider name (--provider flag or config
+                // default) so the right env var is set when --provider
+                // overrides the config.
+                set_model_env(provider_kind_name(resolved_provider), m);
+            }
+            let llm = build_provider(resolved_provider)?;
             if fresh {
                 let cp = vault.meta_dir().join("bulk-ingest-checkpoint.json");
                 let _ = std::fs::remove_file(cp.as_std_path());
@@ -461,6 +633,162 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 eprintln!("    {} — {}", err.path.display(), err.error);
             }
             println!("  Elapsed: {:.1}s", report.elapsed.as_secs_f64());
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Bench {
+            json,
+            init,
+            provider,
+        } => {
+            let vault = open_vault(&vault_path)?;
+            if init {
+                let suite = scriptorium_core::bench::load_suite(&vault)
+                    .into_diagnostic()?;
+                if suite.benchmarks.is_empty() {
+                    scriptorium_core::bench::save_suite(&vault, &suite)
+                        .into_diagnostic()?;
+                    println!(
+                        "Created empty benchmarks.json at {}",
+                        vault.meta_dir().join("benchmarks.json")
+                    );
+                } else {
+                    println!("benchmarks.json already exists with {} cases.", suite.benchmarks.len());
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            let cfg = load_config(&vault);
+            let store = open_store(&vault)?;
+            let llm = build_provider(
+                provider.unwrap_or_else(|| provider_from(&cfg)),
+            )?;
+            let embed = build_provider(embed_provider_from(&cfg))?;
+            let report = scriptorium_core::bench::run_benchmarks(
+                &vault,
+                &store,
+                embed.as_ref(),
+                llm.as_ref(),
+                &cfg.embeddings.model,
+            )
+            .await
+            .into_diagnostic()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .map_err(|e| miette!("json: {e}"))?
+                );
+            } else {
+                println!("Benchmark Report");
+                println!("================");
+                if report.results.is_empty() {
+                    println!("  No benchmark cases defined. Run `scriptorium bench --init` first.");
+                } else {
+                    for r in &report.results {
+                        println!(
+                            "  {}: P@{k}={p:.2} R={r:.2} F1={f:.2} MRR={m:.2} NDCG@{k}={n:.2}",
+                            r.query,
+                            k = r.k,
+                            p = r.precision,
+                            r = r.recall,
+                            f = r.f1,
+                            m = r.mrr,
+                            n = r.ndcg,
+                        );
+                    }
+                }
+                println!();
+                println!("  Mean precision: {:.2}", report.mean_precision);
+                println!("  Mean recall:    {:.2}", report.mean_recall);
+                println!("  Mean F1:        {:.2}", report.mean_f1);
+                println!("  Mean MRR:       {:.2}", report.mean_mrr);
+                println!("  Mean NDCG:      {:.2}", report.mean_ndcg);
+                println!("  Coverage:       {:.0}%", report.coverage * 100.0);
+                println!("  Stale ratio:    {:.0}%", report.stale_ratio * 100.0);
+                println!("  Health score:   {:.1}/10", report.health_score);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Learn(sub) => {
+            let vault = open_vault(&vault_path)?;
+            match sub {
+                LearnCommand::List { n } => {
+                    let entries = scriptorium_core::learnings::list_recent(&vault, n)
+                        .into_diagnostic()?;
+                    if entries.is_empty() {
+                        println!("No learnings yet.");
+                    } else {
+                        for l in &entries {
+                            println!(
+                                "  [{:?}] {} — {} (conf: {}, {})",
+                                l.learning_type,
+                                l.key,
+                                l.insight,
+                                l.confidence,
+                                l.ts.format("%Y-%m-%d")
+                            );
+                        }
+                    }
+                }
+                LearnCommand::Search { query } => {
+                    let entries = scriptorium_core::learnings::search(&vault, &query)
+                        .into_diagnostic()?;
+                    if entries.is_empty() {
+                        println!("No matches for '{query}'.");
+                    } else {
+                        for l in &entries {
+                            println!(
+                                "  [{:?}] {} — {}",
+                                l.learning_type, l.key, l.insight
+                            );
+                        }
+                    }
+                }
+                LearnCommand::Add { json } => {
+                    let learning: scriptorium_core::learnings::Learning =
+                        serde_json::from_str(&json)
+                            .map_err(|e| miette!("invalid JSON: {e}"))?;
+                    scriptorium_core::learnings::capture(&vault, &learning)
+                        .into_diagnostic()?;
+                    println!("Captured: [{:?}] {}", learning.learning_type, learning.key);
+                }
+                LearnCommand::Prune => {
+                    let pruned = scriptorium_core::learnings::prune_stale(&vault)
+                        .into_diagnostic()?;
+                    println!("Pruned {pruned} stale learning(s).");
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Skill(sub) => {
+            let vault = open_vault(&vault_path)?;
+            match sub {
+                SkillCommand::List => {
+                    let skills = scriptorium_core::skills::list_skills(&vault)
+                        .into_diagnostic()?;
+                    if skills.is_empty() {
+                        println!("No skills found. Run `scriptorium skill init` to scaffold defaults.");
+                    } else {
+                        for s in &skills {
+                            println!("  {} — {}", s.name, s.description);
+                        }
+                    }
+                }
+                SkillCommand::Show { name } => {
+                    let skill = scriptorium_core::skills::load_skill(&vault, &name)
+                        .into_diagnostic()?;
+                    println!("{}", skill.content);
+                }
+                SkillCommand::Init => {
+                    let written = scriptorium_core::skills::init_skills(&vault)
+                        .into_diagnostic()?;
+                    if written == 0 {
+                        println!("Skills already exist, nothing to do.");
+                    } else {
+                        println!("Scaffolded {written} skill files in {}/",
+                            scriptorium_core::skills::skills_dir(&vault));
+                    }
+                }
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Config => {
@@ -497,12 +825,234 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 "watch: watching {}/sources/ — drop new files there to auto-ingest",
                 vault.root()
             );
-            core::watch::watch(vault, provider)
+            let hooks = if cfg.hooks == scriptorium_core::hooks::HooksConfig::default() {
+                None
+            } else {
+                Some(cfg.hooks.clone())
+            };
+            core::watch::watch(vault, provider, hooks)
                 .await
                 .into_diagnostic()?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Social(sub) => {
+            let vault = open_vault(&vault_path)?;
+            match sub {
+                SocialCommand::Facebook {
+                    export_dirs,
+                    categories,
+                    provider,
+                    model,
+                    dry_run,
+                } => {
+                    handle_social_facebook(
+                        &vault, &vault_path, export_dirs, categories,
+                        provider, model, dry_run,
+                    ).await?;
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
+        }
+        // Already handled before vault resolution.
+        Command::VaultMgmt(_) | Command::Init { .. } => unreachable!(),
+        } // inner match
+        } // outer `command =>` arm
     }
+}
+
+// ---------- social facebook ----------
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_social_facebook(
+    vault: &Vault,
+    _vault_path: &Path,
+    export_dirs: Vec<PathBuf>,
+    categories: Option<Vec<String>>,
+    provider: Option<ProviderKind>,
+    model: Option<String>,
+    dry_run: bool,
+) -> Result<()> {
+    use scriptorium_core::social::facebook::{self, Category};
+
+    let cfg = load_config(vault);
+
+    // Parse categories
+    let cats = if let Some(cat_strs) = categories {
+        let mut cats = Vec::new();
+        for s in &cat_strs {
+            match Category::from_str(s) {
+                Some(c) => cats.push(c),
+                None => {
+                    return Err(miette!(
+                        "unknown category: '{s}'. Options: messages, posts, comments, friends, search, events, groups"
+                    ));
+                }
+            }
+        }
+        cats
+    } else {
+        vec![]
+    };
+
+    // ── Phase 1: Parse Facebook export ──────────────────────────────
+    let phase1 = ProgressBar::new_spinner();
+    phase1.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {prefix:.bold} {msg}")
+            .unwrap()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+    );
+    phase1.set_prefix("[1/3]");
+    phase1.set_message("Parsing Facebook export...");
+    phase1.enable_steady_tick(std::time::Duration::from_millis(80));
+
+    // Write to a persistent staging dir (inside vault's .scriptorium/)
+    // so bulk-ingest can intern them. Using tempdir would drop files
+    // before ingest finishes.
+    let staging_dir = vault.meta_dir().as_std_path().join("facebook-staging");
+    if staging_dir.exists() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    }
+    std::fs::create_dir_all(&staging_dir)
+        .map_err(|e| miette!("create staging dir: {e}"))?;
+
+    let export_options = facebook::FacebookImportOptions {
+        export_dirs,
+        output_dir: staging_dir.clone(),
+        categories: cats,
+        dry_run,
+    };
+
+    let export_report = facebook::import(&export_options, |cur, total, name| {
+        phase1.set_message(format!("[{cur}/{total}] {name}"));
+    })
+    .into_diagnostic()?;
+
+    phase1.finish_with_message(format!(
+        "Parsed {} categories, {} source files in {:.1}s",
+        export_report.categories.len(),
+        export_report.total_files_written,
+        export_report.elapsed.as_secs_f64(),
+    ));
+
+    // Print category breakdown
+    for cat in &export_report.categories {
+        eprintln!(
+            "       {} — {} file(s), {} item(s)",
+            cat.category, cat.files_written, cat.items_processed
+        );
+    }
+
+    if dry_run {
+        eprintln!("\n  (dry run — nothing ingested)");
+        return Ok(());
+    }
+
+    if export_report.total_files_written == 0 {
+        eprintln!("  Nothing to ingest.");
+        return Ok(());
+    }
+
+    // ── Phase 2: Ingest into vault ──────────────────────────────────
+    let resolved_provider = provider.unwrap_or_else(|| provider_from(&cfg));
+    if let Some(ref m) = model {
+        set_model_env(provider_kind_name(resolved_provider), m);
+    }
+    let llm = build_provider(resolved_provider)?;
+
+    let total_files = export_report.total_files_written as u64;
+    let phase2 = ProgressBar::new(total_files);
+    phase2.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.cyan} {prefix:.bold} [{bar:40.green/dim}] {pos}/{len} {msg} ({eta} remaining)"
+        )
+        .unwrap()
+        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+        .progress_chars("█▓▒░  "),
+    );
+    phase2.set_prefix("[2/3]");
+    phase2.set_message("Ingesting...");
+    phase2.enable_steady_tick(std::time::Duration::from_millis(80));
+
+    let ingest_options = scriptorium_core::bulk_ingest::BulkIngestOptions {
+        dry_run: false,
+        ..Default::default()
+    };
+
+    // Open embeddings store + provider for retrieval-augmented ingestion.
+    // Falls back gracefully if not available.
+    let store = open_store(vault).ok();
+    let embed_provider = build_provider(embed_provider_from(&cfg)).ok();
+
+    let ingest_report = scriptorium_core::bulk_ingest::bulk_ingest_with_retrieval(
+        vault,
+        llm.as_ref(),
+        &staging_dir,
+        &ingest_options,
+        |cur, _total, path| {
+            phase2.set_position(cur as u64);
+            let fname = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            phase2.set_message(fname.to_string());
+        },
+        store.as_ref(),
+        embed_provider.as_ref().map(|p| p.as_ref() as &dyn LlmProvider),
+        Some(&cfg.embeddings.model),
+    )
+    .await
+    .into_diagnostic()?;
+
+    phase2.finish_with_message(format!(
+        "Ingested {} files in {:.1}s",
+        ingest_report.ingested,
+        ingest_report.elapsed.as_secs_f64(),
+    ));
+
+    // ── Phase 3: Reindex embeddings ─────────────────────────────────
+    let phase3 = ProgressBar::new_spinner();
+    phase3.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {prefix:.bold} {msg}")
+            .unwrap()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+    );
+    phase3.set_prefix("[3/3]");
+    phase3.set_message("Reindexing embeddings...");
+    phase3.enable_steady_tick(std::time::Duration::from_millis(80));
+
+    let store = open_store(vault)?;
+    let embed_provider = build_provider(embed_provider_from(&cfg))?;
+    let embedded = scriptorium_core::embed::reindex(
+        vault,
+        &store,
+        embed_provider.as_ref(),
+        &cfg.embeddings.model,
+    )
+    .await
+    .into_diagnostic()?;
+
+    phase3.finish_with_message(format!("Embedded {embedded} new chunk(s)"));
+
+    // ── Summary ─────────────────────────────────────────────────────
+    eprintln!();
+    eprintln!("Facebook Import Complete");
+    eprintln!("========================");
+    eprintln!("  Sources generated: {}", export_report.total_files_written);
+    eprintln!("  Pages ingested:    {}", ingest_report.ingested);
+    eprintln!("  Pages skipped:     {}", ingest_report.skipped_already_interned);
+    eprintln!("  Failures:          {}", ingest_report.failed.len());
+    eprintln!("  Chunks embedded:   {embedded}");
+    if !ingest_report.failed.is_empty() {
+        eprintln!("  Failed files:");
+        for err in &ingest_report.failed {
+            eprintln!("    {} — {}", err.path.display(), err.error);
+        }
+    }
+
+    // Clean up staging dir
+    let _ = std::fs::remove_dir_all(&staging_dir);
+
+    Ok(())
 }
 
 // ---------- helpers ----------
@@ -558,6 +1108,159 @@ async fn resolve_ingest_source(
             "cannot provide both <source> path and --url"
         )),
     }
+}
+
+/// Resolve which vault to use:
+/// 1. Explicit `-C <path>` flag
+/// 2. Current directory, if it contains `.scriptorium/`
+/// 3. Default vault from global config
+/// 4. Error with guidance
+fn resolve_vault_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    let cwd = PathBuf::from(".");
+    if scriptorium_core::vault::is_vault(&cwd) {
+        return Ok(cwd);
+    }
+    let global = scriptorium_core::global_config::GlobalConfig::load().unwrap_or_default();
+    if let Some(entry) = global.default_vault() {
+        return Ok(entry.path.clone());
+    }
+    Err(miette!(
+        "No vault found. Either:\n\
+         - Run from inside a vault directory (has .scriptorium/)\n\
+         - Pass -C <path>\n\
+         - Register a default: scriptorium vault add <name> <path> && scriptorium vault default <name>"
+    ))
+}
+
+/// Auto-register a vault in the global config. Best-effort — never fails
+/// the calling command.
+fn auto_register_vault(path: &std::path::Path) {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let name = canonical
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unnamed")
+        .to_string();
+    if let Ok(mut global) = scriptorium_core::global_config::GlobalConfig::load() {
+        global.register(name.clone(), canonical);
+        if global.default.is_none() {
+            global.default = Some(name);
+        }
+        let _ = global.save();
+    }
+}
+
+fn handle_vault_command(sub: VaultCommand) -> Result<ExitCode> {
+    let mut global = scriptorium_core::global_config::GlobalConfig::load()
+        .into_diagnostic()?;
+
+    match sub {
+        VaultCommand::List => {
+            if global.vaults.is_empty() {
+                println!("No vaults registered. Use `scriptorium vault add <name> <path>` to register one.");
+            } else {
+                for entry in &global.vaults {
+                    let marker = if global.default.as_deref() == Some(&entry.name) {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    println!("{marker} {:<16} {}", entry.name, entry.path.display());
+                }
+            }
+        }
+        VaultCommand::Add { name, path } => {
+            let canonical = std::fs::canonicalize(&path)
+                .map_err(|e| miette!("cannot resolve path {}: {e}", path.display()))?;
+            if !scriptorium_core::vault::is_vault(&canonical) {
+                eprintln!(
+                    "warning: {} does not look like a scriptorium vault (no .scriptorium/)",
+                    canonical.display()
+                );
+            }
+            let updated = global.register(name.clone(), canonical.clone());
+            if global.default.is_none() {
+                global.default = Some(name.clone());
+            }
+            global.save().into_diagnostic()?;
+            if updated {
+                println!("Updated vault '{name}' → {}", canonical.display());
+            } else {
+                println!("Registered vault '{name}' → {}", canonical.display());
+            }
+        }
+        VaultCommand::Remove { name } => {
+            if global.unregister(&name).is_some() {
+                global.save().into_diagnostic()?;
+                println!("Unregistered vault '{name}' (files on disk are untouched).");
+            } else {
+                return Err(miette!("no vault named '{name}' is registered"));
+            }
+        }
+        VaultCommand::Default { name } => {
+            if global.find(&name).is_none() {
+                return Err(miette!(
+                    "no vault named '{name}' is registered. Use `scriptorium vault add` first."
+                ));
+            }
+            global.default = Some(name.clone());
+            global.save().into_diagnostic()?;
+            println!("Default vault set to '{name}'.");
+        }
+        VaultCommand::Show { name } => {
+            let entry = if let Some(n) = &name {
+                global.find(n).ok_or_else(|| miette!("no vault named '{n}'"))?
+            } else {
+                global
+                    .default_vault()
+                    .ok_or_else(|| miette!("no default vault set"))?
+            };
+            println!("Name:    {}", entry.name);
+            println!("Path:    {}", entry.path.display());
+            let is_default = global.default.as_deref() == Some(&entry.name);
+            println!("Default: {}", if is_default { "yes" } else { "no" });
+            if let Ok(vault) = Vault::open(&entry.path) {
+                let scan = vault.scan();
+                let page_count = scan.as_ref().map_or(0, |r| r.pages.len());
+                println!("Pages:   {page_count}");
+                let cfg_path = vault.meta_dir().join("config.toml");
+                if cfg_path.as_std_path().exists() {
+                    let cfg = load_config(&vault);
+                    println!("LLM:     {} / {}", cfg.llm.provider, cfg.llm.model);
+                    println!("Embed:   {} / {}", cfg.embeddings.provider, cfg.embeddings.model);
+                }
+            } else {
+                println!("Status:  NOT FOUND (directory missing or inaccessible)");
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Map a `ProviderKind` to the string name expected by `set_model_env`.
+fn provider_kind_name(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Claude => "claude",
+        ProviderKind::Openai => "openai",
+        ProviderKind::Gemini => "gemini",
+        ProviderKind::Ollama => "ollama",
+        ProviderKind::Mock => "mock",
+    }
+}
+
+/// Set the provider-specific model env var so `from_env()` picks it up.
+fn set_model_env(provider_name: &str, model: &str) {
+    let var = match provider_name {
+        "claude" => "ANTHROPIC_MODEL",
+        "openai" => "OPENAI_MODEL",
+        "gemini" | "google" => "GEMINI_MODEL",
+        "ollama" => "OLLAMA_MODEL",
+        _ => return,
+    };
+    std::env::set_var(var, model);
 }
 
 fn open_vault(root: &std::path::Path) -> Result<Vault> {

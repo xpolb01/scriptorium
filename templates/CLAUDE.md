@@ -54,13 +54,71 @@ This vault has three layers:
 - Never change a page's `id` or `created` date.
 - Never create a wikilink that targets a page the vault doesn't have.
 
+## Page structure
+
+Each wiki page has two sections separated by a horizontal rule (`---`):
+
+1. **Compiled truth** (above `---`): The current best understanding of the
+   topic. Rewritten when new evidence arrives. Always reads as a complete,
+   self-contained explanation.
+
+2. **Timeline** (below `---`): Append-only evidence trail. Each entry is
+   dated and cites the source that prompted it. Never edit existing entries;
+   only append new ones. Format:
+
+   ```
+   ---
+
+   ## Timeline
+
+   ### 2026-04-10 — source: `sources/articles/foo.md`
+   - Key claim or observation from this source
+   - Another claim
+   ```
+
+Pages created before this convention may lack the timeline section — add
+one on the next update.
+
 ## Tags
 
-Use a small, stable vocabulary. Current tags:
+Use a small, stable vocabulary. Current type tags (exactly one per page):
 
 - `concept` — an abstract idea (e.g. "attention")
 - `entity` — a named thing (person, paper, model, product)
 - `topic` — a broad area that groups many concepts
-- `draft` — page exists but needs more work
+- `pattern` — a recurring design pattern or practice
+- `playbook` — a step-by-step procedure
+- `reference` — API docs, configuration reference, etc.
+- `paper` — an academic paper summary
+- `talk` — conference talk or presentation
+- `note` — personal notes, observations
 
-Add new tags sparingly and document them here before using them.
+Status tags (exactly one per page):
+
+- `status/draft` — page exists but needs more work
+- `status/stable` — reviewed and reliable
+- `status/archived` — superseded or no longer relevant
+
+Domain tags (at least one per page, format `domain/<name>`):
+
+Add domain tags as needed (e.g. `domain/rust`, `domain/llm`,
+`domain/bhc`). Propose new ones in the log entry before first use.
+
+## Skills
+
+Agent skills live in `skills/` as markdown instruction sets. Run
+`scriptorium skill list` to discover available workflows. Each skill
+documents when to use it, the step-by-step workflow, quality rules, and
+which MCP tools to call. Read a skill before performing its workflow.
+
+## Self-learning
+
+The vault maintains a learning journal at `.scriptorium/learnings.jsonl`.
+After any non-trivial operation, consider whether you learned something
+that would save 5+ minutes in a future session. If so, capture it via
+`scriptorium_learn_capture`. Types: `pattern` (what works), `pitfall`
+(what to avoid), `preference` (user preference), `correction` (user
+corrected you), `domain_knowledge` (codebase-specific fact).
+
+Before ingesting or querying, check for relevant learnings via
+`scriptorium_learn_retrieve` with appropriate tags.

@@ -86,6 +86,23 @@ pub async fn bulk_ingest(
     options: &BulkIngestOptions,
     progress: impl Fn(usize, usize, &Path),
 ) -> Result<BulkIngestReport> {
+    bulk_ingest_with_retrieval(
+        vault, provider, dir, options, progress, None, None, None,
+    )
+    .await
+}
+
+/// Like [`bulk_ingest`] but with optional embeddings retrieval.
+pub async fn bulk_ingest_with_retrieval(
+    vault: &Vault,
+    provider: &dyn LlmProvider,
+    dir: &Path,
+    options: &BulkIngestOptions,
+    progress: impl Fn(usize, usize, &Path),
+    embed_store: Option<&crate::embed::EmbeddingsStore>,
+    embed_provider: Option<&dyn LlmProvider>,
+    embed_model: Option<&str>,
+) -> Result<BulkIngestReport> {
     let start = Instant::now();
 
     // 1. Discover eligible files.
@@ -117,6 +134,7 @@ pub async fn bulk_ingest(
 
     let ingest_opts = ingest::IngestOptions {
         dry_run: options.dry_run,
+        hooks: None, // bulk ingest doesn't fire per-file hooks
     };
 
     for (i, file_path) in files.iter().enumerate() {
@@ -140,7 +158,10 @@ pub async fn bulk_ingest(
         progress(i + 1, total_discovered, file_path);
 
         // Ingest with error isolation.
-        match ingest::ingest_with_options(vault, provider, file_path, ingest_opts.clone()).await {
+        match ingest::ingest_with_retrieval(
+            vault, provider, file_path, ingest_opts.clone(),
+            embed_store, embed_provider, embed_model,
+        ).await {
             Ok(report) => {
                 info!(
                     path = %file_path.display(),

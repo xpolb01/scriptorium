@@ -158,6 +158,10 @@ impl QueryAnswer {
 pub struct PromptContext<'a> {
     pub rendered_schema: &'a str,
     pub relevant_pages: &'a [&'a Page],
+    /// Complete list of page stems (filenames without extension) in the vault.
+    /// Injected into the prompt so the LLM knows exactly which `[[wikilinks]]`
+    /// are valid and doesn't hallucinate non-existent targets.
+    pub all_page_stems: &'a [String],
 }
 
 impl<'a> PromptContext<'a> {
@@ -165,6 +169,19 @@ impl<'a> PromptContext<'a> {
         Self {
             rendered_schema,
             relevant_pages,
+            all_page_stems: &[],
+        }
+    }
+
+    pub fn with_stems(
+        rendered_schema: &'a str,
+        relevant_pages: &'a [&'a Page],
+        all_page_stems: &'a [String],
+    ) -> Self {
+        Self {
+            rendered_schema,
+            relevant_pages,
+            all_page_stems,
         }
     }
 
@@ -180,6 +197,22 @@ impl<'a> PromptContext<'a> {
         }
         out
     }
+
+    fn render_valid_links(&self) -> String {
+        if self.all_page_stems.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "## Valid wikilink targets\n\n\
+             You may ONLY use `[[wikilinks]]` to pages in this list. \
+             Do NOT invent links to pages that don't exist.\n\n",
+        );
+        for stem in self.all_page_stems {
+            let _ = writeln!(out, "- `[[{stem}]]`");
+        }
+        out.push('\n');
+        out
+    }
 }
 
 /// Build an ingest prompt for a single source.
@@ -192,6 +225,18 @@ pub fn ingest_prompt(
     source_label: &str,
     source_text: &str,
 ) -> CompletionRequest {
+    ingest_prompt_with_learnings(ctx, source_label, source_text, "")
+}
+
+/// Build an ingest prompt with optional learnings injected into the system
+/// prompt. Use [`crate::learnings::format_for_prompt`] to produce the
+/// `learnings_section` string.
+pub fn ingest_prompt_with_learnings(
+    ctx: &PromptContext<'_>,
+    source_label: &str,
+    source_text: &str,
+    learnings_section: &str,
+) -> CompletionRequest {
     let system = format!(
         "You are Scriptorium's ingest operator. Given a raw source document, \
          you produce an `IngestPlan`: a list of wiki pages to create or update \
@@ -199,20 +244,23 @@ pub fn ingest_prompt(
          Follow the vault schema below exactly. Never fabricate facts — cite \
          only what is in the source. Prefer updating an existing page over \
          creating a duplicate.\n\n\
-         === vault schema ===\n{schema}\n=== end schema ===",
-        schema = ctx.rendered_schema
+         === vault schema ===\n{schema}\n=== end schema ==={learnings}",
+        schema = ctx.rendered_schema,
+        learnings = learnings_section,
     );
     let user = format!(
         "## Source: `{source_label}`\n\n\
          ```\n{source_text}\n```\n\n\
          ## Relevant existing pages\n\n{pages}\n\
+         {valid_links}\
          ## Task\n\n\
          Return an `IngestPlan` with (1) a one-line `summary`, (2) `pages` \
          describing create/update actions, (3) a one-line `log_entry` for \
          `log.md`. All three fields are REQUIRED — omitting any one will \
          cause the ingest to be rejected. Respond with JSON only: no prose, \
          no apology, no markdown fence.",
-        pages = ctx.render_pages()
+        pages = ctx.render_pages(),
+        valid_links = ctx.render_valid_links(),
     );
     CompletionRequest {
         system,
@@ -234,14 +282,24 @@ pub fn ingest_prompt(
 
 /// Build a query prompt.
 pub fn query_prompt(ctx: &PromptContext<'_>, question: &str) -> CompletionRequest {
+    query_prompt_with_learnings(ctx, question, "")
+}
+
+/// Build a query prompt with optional learnings.
+pub fn query_prompt_with_learnings(
+    ctx: &PromptContext<'_>,
+    question: &str,
+    learnings_section: &str,
+) -> CompletionRequest {
     let system = format!(
         "You are Scriptorium's query operator. Given a question and a set of \
          retrieved wiki pages, you return a cited answer in the structured \
          `QueryAnswer` format. You may only cite pages that were supplied — \
          never invent targets. If the retrieved context is insufficient, say \
          so plainly.\n\n\
-         === vault schema ===\n{schema}\n=== end schema ===",
-        schema = ctx.rendered_schema
+         === vault schema ===\n{schema}\n=== end schema ==={learnings}",
+        schema = ctx.rendered_schema,
+        learnings = learnings_section,
     );
     let user = format!(
         "## Question\n\n{question}\n\n\

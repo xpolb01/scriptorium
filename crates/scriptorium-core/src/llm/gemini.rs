@@ -2,10 +2,10 @@
 //!
 //! Implements [`LlmProvider`] against Google's Generative Language API:
 //! `generateContent` for chat, `batchEmbedContents` (model
-//! `text-embedding-004`, 768 dim) for embeddings. Gemini is the first
+//! `gemini-embedding-2-preview`, 3072 dim) for embeddings. Gemini is the first
 //! single-provider option for both chat and embeddings — Claude has no
 //! embeddings API at all, and `OpenAI` / Ollama work but require a separate
-//! API key. One `GOOGLE_API_KEY` covers both the ingest loop and the query
+//! API key. One `SCRIPTORIUM_GOOGLE_API_KEY` covers both the ingest loop and the query
 //! loop end to end.
 //!
 //! **Structured output**: Gemini supports `responseSchema` but only a
@@ -40,11 +40,12 @@ use super::{CompletionRequest, CompletionResponse, LlmError, LlmProvider, Role, 
 /// about reasoning than latency. Override via `GEMINI_MODEL` env var; for
 /// a cheaper/faster option try `gemini-2.5-flash` or `gemini-2.0-flash`.
 const DEFAULT_MODEL: &str = "gemini-2.5-pro";
-/// Default embedding model. `gemini-embedding-001` is the current Google
+/// Default embedding model. `gemini-embedding-2-preview` is the latest Google
 /// embedding model (Matryoshka-style: returns 3072 dimensions by default,
 /// can be truncated to 256/512/768/1024/1536 via `outputDimensionality` if
 /// smaller vectors are needed). We use the full 3072 for semantic quality.
-const DEFAULT_EMBED_MODEL: &str = "gemini-embedding-001";
+/// Requires a Tier 3 (paid) API key for adequate rate limits.
+const DEFAULT_EMBED_MODEL: &str = "gemini-embedding-2-preview";
 const DEFAULT_EMBED_DIM: usize = 3072;
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 // Gemini 2.5 Pro has a 1M-token context window.
@@ -63,17 +64,21 @@ pub struct GeminiConfig {
 }
 
 impl GeminiConfig {
-    /// Read config from environment variables. Accepts either
-    /// `GOOGLE_API_KEY` or `GEMINI_API_KEY`; the former is the name
-    /// Google's own SDKs use.
+    /// Read config from environment variables, falling back to the macOS
+    /// keychain. Checks `SCRIPTORIUM_GOOGLE_API_KEY`, then `SCRIPTORIUM_GEMINI_API_KEY` env vars,
+    /// then keychain service `scriptorium-google`.
     pub fn from_env() -> Result<Self, LlmError> {
-        let api_key = std::env::var("GOOGLE_API_KEY")
-            .or_else(|_| std::env::var("GEMINI_API_KEY"))
-            .map_err(|_| {
+        let api_key = std::env::var("SCRIPTORIUM_GOOGLE_API_KEY")
+            .or_else(|_| std::env::var("SCRIPTORIUM_GEMINI_API_KEY"))
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| crate::keychain::get_key(crate::keychain::services::GOOGLE))
+            .ok_or_else(|| {
                 LlmError::api(
                     "gemini",
                     0,
-                    "GOOGLE_API_KEY (or GEMINI_API_KEY) env var is not set",
+                    "SCRIPTORIUM_GOOGLE_API_KEY not found in env or keychain. \
+                     Run `scriptorium setup` to configure.",
                 )
             })?;
         Ok(Self {
@@ -315,6 +320,7 @@ struct Candidate {
 
 #[derive(Debug, Deserialize)]
 struct CandidateContent {
+    #[serde(default)]
     parts: Vec<Part>,
 }
 

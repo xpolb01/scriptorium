@@ -90,6 +90,12 @@ impl ToolRegistry {
             "scriptorium_log_tail" => log_tail_tool(args, ctx),
             "scriptorium_doctor" => doctor_tool(ctx),
             "scriptorium_maintain" => maintain_tool(args, ctx).await,
+            "scriptorium_skill_list" => skill_list_tool(ctx),
+            "scriptorium_skill_read" => skill_read_tool(args, ctx),
+            "scriptorium_learn_capture" => learn_capture_tool(args, ctx),
+            "scriptorium_learn_search" => learn_search_tool(args, ctx),
+            "scriptorium_learn_retrieve" => learn_retrieve_tool(args, ctx),
+            "scriptorium_bench" => bench_tool(ctx).await,
             other => Err(ToolError::NotFound(other.to_string())),
         }
     }
@@ -220,6 +226,84 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                 "properties": {}
             }),
         },
+        ToolSpec {
+            name: "scriptorium_skill_list",
+            description: "List all available skills with their names and descriptions. \
+                          Skills are markdown instruction sets that teach agents how \
+                          to use scriptorium workflows.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolSpec {
+            name: "scriptorium_skill_read",
+            description: "Read the full content of a named skill (e.g. 'ingest', \
+                          'query', 'maintain'). Returns the SKILL.md markdown.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Skill name (e.g. 'ingest', 'query', 'maintain')"
+                    }
+                },
+                "required": ["name"]
+            }),
+        },
+        ToolSpec {
+            name: "scriptorium_bench",
+            description: "Run retrieval quality benchmarks: precision@k, recall, MRR, \
+                          and a composite health score. Requires benchmark cases in \
+                          .scriptorium/benchmarks.json.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolSpec {
+            name: "scriptorium_learn_capture",
+            description: "Capture a learning (pattern, pitfall, correction, etc.) \
+                          into the self-learning journal. Use after observing \
+                          something that would save 5+ minutes in a future session.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "skill": { "type": "string", "description": "Which skill (ingest, query, maintain, etc.)" },
+                    "type": { "type": "string", "enum": ["pattern", "pitfall", "preference", "correction", "domain_knowledge"] },
+                    "key": { "type": "string", "description": "Short kebab-case key for dedup" },
+                    "insight": { "type": "string", "description": "What was learned" },
+                    "confidence": { "type": "integer", "minimum": 1, "maximum": 10, "default": 7 },
+                    "source": { "type": "string", "enum": ["observed", "user_stated", "inferred"], "default": "observed" },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "files": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["skill", "type", "key", "insight"]
+            }),
+        },
+        ToolSpec {
+            name: "scriptorium_learn_search",
+            description: "Search the learning journal by keyword. Returns matching \
+                          entries with their confidence scores.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search keyword (empty = list recent)" }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "scriptorium_learn_retrieve",
+            description: "Retrieve learnings relevant to specific tags, sorted by \
+                          effective confidence. Used to inject context into prompts.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Tags to match against" },
+                    "limit": { "type": "integer", "default": 5, "minimum": 1, "maximum": 20 }
+                }
+            }),
+        },
     ]
 }
 
@@ -272,6 +356,7 @@ async fn ingest_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolErr
         &source_path,
         ingest::IngestOptions {
             dry_run: args.dry_run,
+            hooks: None,
         },
     )
     .await
@@ -516,6 +601,116 @@ fn doctor_tool(ctx: &ServerContext) -> Result<String, ToolError> {
     let report =
         scriptorium_core::doctor::run_doctor(&ctx.vault, store.as_ref());
     serde_json::to_string_pretty(&report).map_err(|e| ToolError::Failed(format!("json: {e}")))
+}
+
+fn skill_list_tool(ctx: &ServerContext) -> Result<String, ToolError> {
+    let skills = scriptorium_core::skills::list_skills(&ctx.vault)
+        .map_err(|e| ToolError::Failed(format!("skills: {e}")))?;
+    serde_json::to_string_pretty(&skills).map_err(|e| ToolError::Failed(format!("json: {e}")))
+}
+
+async fn bench_tool(ctx: &ServerContext) -> Result<String, ToolError> {
+    let store = open_store(ctx)?;
+    let report = scriptorium_core::bench::run_benchmarks(
+        &ctx.vault,
+        &store,
+        ctx.embed_provider.as_ref(),
+        ctx.llm_provider.as_ref(),
+        &ctx.embeddings_model,
+    )
+    .await
+    .map_err(|e| ToolError::Failed(format!("bench: {e}")))?;
+    serde_json::to_string_pretty(&report)
+        .map_err(|e| ToolError::Failed(format!("json: {e}")))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn learn_capture_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError> {
+    use scriptorium_core::learnings::{Learning, LearningSource, LearningType};
+
+    let skill = args.get("skill").and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidArgs("missing 'skill'".into()))?
+        .to_string();
+    let learning_type: LearningType = args.get("type").and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidArgs("missing 'type'".into()))
+        .and_then(|s| serde_json::from_value(serde_json::Value::String(s.into()))
+            .map_err(|e| ToolError::InvalidArgs(format!("invalid type: {e}"))))?;
+    let key = args.get("key").and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidArgs("missing 'key'".into()))?
+        .to_string();
+    let insight = args.get("insight").and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidArgs("missing 'insight'".into()))?
+        .to_string();
+    #[allow(clippy::cast_possible_truncation)]
+    let confidence = args.get("confidence").and_then(Value::as_u64).unwrap_or(7) as u8;
+    let source: LearningSource = args.get("source").and_then(Value::as_str)
+        .map_or(LearningSource::Observed, |s| {
+            serde_json::from_value(Value::String(s.into())).unwrap_or(LearningSource::Observed)
+        });
+    let tags: Vec<String> = args.get("tags")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let files: Vec<String> = args.get("files")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    let learning = Learning {
+        ts: chrono::Utc::now(),
+        skill,
+        learning_type,
+        key,
+        insight,
+        confidence,
+        source,
+        tags,
+        files,
+    };
+    scriptorium_core::learnings::capture(&ctx.vault, &learning)
+        .map_err(|e| ToolError::Failed(format!("capture: {e}")))?;
+    Ok(format!("Captured: [{:?}] {}", learning.learning_type, learning.key))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn learn_search_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError> {
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let results = if query.is_empty() {
+        scriptorium_core::learnings::list_recent(&ctx.vault, 20)
+    } else {
+        scriptorium_core::learnings::search(&ctx.vault, query)
+    }
+    .map_err(|e| ToolError::Failed(format!("search: {e}")))?;
+    serde_json::to_string_pretty(&results).map_err(|e| ToolError::Failed(format!("json: {e}")))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn learn_retrieve_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError> {
+    let tags: Vec<String> = args
+        .get("tags")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    #[allow(clippy::cast_possible_truncation)]
+    let limit = args
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(5) as usize;
+    let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+    let results = scriptorium_core::learnings::retrieve(&ctx.vault, &tag_refs, limit)
+        .map_err(|e| ToolError::Failed(format!("retrieve: {e}")))?;
+    serde_json::to_string_pretty(&results).map_err(|e| ToolError::Failed(format!("json: {e}")))
+}
+
+#[allow(clippy::needless_pass_by_value)] // matches the convention of all other tool handlers
+fn skill_read_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError> {
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidArgs("missing 'name' field".into()))?;
+    let skill = scriptorium_core::skills::load_skill(&ctx.vault, name)
+        .map_err(|e| ToolError::Failed(format!("skill '{name}': {e}")))?;
+    Ok(skill.content)
 }
 
 // ---------- helpers ----------

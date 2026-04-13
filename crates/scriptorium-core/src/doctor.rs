@@ -96,6 +96,8 @@ pub fn run_doctor(vault: &Vault, store: Option<&EmbeddingsStore>) -> DoctorRepor
     }
     checks.push(check_broken_links(vault));
     checks.push(check_git_clean(vault));
+    checks.push(check_skills(vault));
+    checks.push(check_learnings(vault));
 
     let status = if checks.iter().any(|c| c.status == CheckStatus::Fail) {
         OverallStatus::Unhealthy
@@ -241,6 +243,38 @@ fn check_broken_links(vault: &Vault) -> DoctorCheck {
             }
         }
         Err(e) => DoctorCheck::warn("broken_links", format!("Lint failed: {e}")),
+    }
+}
+
+fn check_skills(vault: &Vault) -> DoctorCheck {
+    match crate::skills::load_manifest(vault) {
+        Ok(m) if m.skills.is_empty() => DoctorCheck::warn(
+            "skills",
+            "No skills found; run `scriptorium skill init` to scaffold defaults",
+        ),
+        Ok(m) => DoctorCheck::ok("skills", format!("{} skills registered", m.skills.len())),
+        Err(e) => DoctorCheck::warn("skills", format!("Could not load skills manifest: {e}")),
+    }
+}
+
+fn check_learnings(vault: &Vault) -> DoctorCheck {
+    match crate::learnings::list_recent(vault, 1000) {
+        Ok(entries) if entries.is_empty() => DoctorCheck::ok(
+            "learnings",
+            "No learnings yet (journal empty)",
+        ),
+        Ok(entries) => {
+            let now = chrono::Utc::now();
+            let active = entries
+                .iter()
+                .filter(|l| crate::learnings::effective_confidence_pub(l, now) > 0.0)
+                .count();
+            DoctorCheck::ok(
+                "learnings",
+                format!("{} learnings ({active} active, {} decayed)", entries.len(), entries.len() - active),
+            )
+        }
+        Err(e) => DoctorCheck::warn("learnings", format!("Could not load learnings: {e}")),
     }
 }
 

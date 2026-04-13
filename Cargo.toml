@@ -9,14 +9,14 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bogdanp/scriptorium"
 authors = ["Bogdan Polovko"]
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "signal"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "signal", "process"] }
 async-trait = "0.1"
 
 # Serde + formats
@@ -74,6 +74,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+indicatif = "0.17"
 
 # Internal crates
 scriptorium-core = { path = "crates/scriptorium-core", version = "0.1.0" }

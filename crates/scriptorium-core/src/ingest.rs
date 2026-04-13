@@ -97,16 +97,37 @@ pub struct IngestOptions {
     /// is still interned into `sources/` (that's not the risky part) but
     /// no pages are written to `wiki/` and no git commit is made.
     pub dry_run: bool,
+    /// Lifecycle hooks to fire at key points. `None` = no hooks.
+    pub hooks: Option<crate::hooks::HooksConfig>,
 }
 
 /// Run the ingest pipeline with configurable options. See [`ingest`] for the
 /// default path and [`IngestOptions`] for the knobs.
-#[allow(clippy::too_many_lines)] // one big linear pipeline reads better than helpers
+#[allow(clippy::too_many_lines)]
 pub async fn ingest_with_options(
     vault: &Vault,
     provider: &dyn LlmProvider,
     source_path: &Path,
     options: IngestOptions,
+) -> Result<IngestReport> {
+    ingest_with_retrieval(vault, provider, source_path, options, None, None, None).await
+}
+
+/// Like [`ingest_with_options`] but with optional embeddings-based retrieval.
+///
+/// When `embed_store`, `embed_provider`, and `embed_model` are all provided,
+/// the source text is embedded and the nearest wiki page chunks are used as
+/// context, much more effective than the default substring title matching,
+/// especially for non-English content.
+#[allow(clippy::too_many_lines)]
+pub async fn ingest_with_retrieval(
+    vault: &Vault,
+    provider: &dyn LlmProvider,
+    source_path: &Path,
+    options: IngestOptions,
+    embed_store: Option<&crate::embed::EmbeddingsStore>,
+    embed_provider: Option<&dyn LlmProvider>,
+    embed_model: Option<&str>,
 ) -> Result<IngestReport> {
     // 1. Read source text.
     let raw = fs::read(source_path).map_err(|e| Error::io(source_path.to_path_buf(), e))?;
@@ -116,19 +137,64 @@ pub async fn ingest_with_options(
     // 2. Intern into `sources/`.
     let interned = intern_source(vault, source_path, &raw)?;
 
-    // 3. Load + render schema. Budget ~1/4 of the provider's context window.
+    // 3. Load and render schema. Budget about 1/4 of the provider context.
     let schema = Schema::load(vault)?;
     let budget = provider.context_window() / 4;
     let rendered_schema = schema.render(budget);
 
-    // 4. Build the prompt. Retrieval picks existing pages whose title or
-    //    filename stem appears in the source text, capped at
-    //    MAX_RELEVANT_PAGES. This makes the LLM aware of what the vault
-    //    already contains so it can choose `update` over `create` for
-    //    related pages. Zero LLM cost; works for Claude-only users.
+    // 4. Build the prompt with retrieval. Two strategies:
+    //
+    //    a) Embeddings-based (preferred): embed source text, search the
+    //       vector store for nearest wiki chunks, resolve to pages.
+    //       Finds semantically related pages even across languages.
+    //
+    //    b) Substring title match (fallback): checks if any existing page
+    //       title appears as a substring of the source text.
+    //
+    //    We also pass the complete list of page stems so the LLM knows
+    //    exactly which wikilinks are valid.
     let prior_scan = vault.scan()?;
-    let relevant_pages = select_relevant_pages(&prior_scan.pages, &source_text, MAX_RELEVANT_PAGES);
-    let ctx = PromptContext::new(&rendered_schema, &relevant_pages);
+
+    // Try embeddings-based retrieval first
+    let embed_pages = retrieve_via_embeddings(
+        &prior_scan.pages,
+        &source_text,
+        embed_store,
+        embed_provider,
+        embed_model,
+    )
+    .await;
+
+    // Merge: embeddings results + substring fallback (deduped)
+    let substring_pages =
+        select_relevant_pages(&prior_scan.pages, &source_text, MAX_RELEVANT_PAGES);
+    let relevant_pages = if embed_pages.is_empty() {
+        substring_pages
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        let mut merged = Vec::new();
+        for p in embed_pages.iter().chain(substring_pages.iter()) {
+            if seen.insert(p.frontmatter.id) {
+                merged.push(*p);
+            }
+            if merged.len() >= MAX_RELEVANT_PAGES {
+                break;
+            }
+        }
+        merged
+    };
+
+    let all_stems: Vec<String> = prior_scan
+        .pages
+        .iter()
+        .map(|p| {
+            p.path
+                .file_stem()
+                .unwrap_or(p.path.as_str())
+                .to_string()
+        })
+        .collect();
+    let ctx = PromptContext::with_stems(&rendered_schema, &relevant_pages, &all_stems);
     let label = source_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -138,6 +204,11 @@ pub async fn ingest_with_options(
     // path if the parse fails. `CompletionRequest` is `Clone` and the clone
     // is cheap (one system string, one user string, a schema `Value`).
     let req_for_failure = req.clone();
+
+    // 4b. Run pre-ingest hook (can abort).
+    if let Some(hooks) = &options.hooks {
+        crate::hooks::pre_ingest(hooks, source_path).await?;
+    }
 
     // 5. Call the LLM and parse the structured response.
     let response = provider
@@ -172,6 +243,24 @@ pub async fn ingest_with_options(
                     "failed to persist ingest-failure record"
                 );
             }
+            // Auto-capture a learning about this failure.
+            let _ = crate::learnings::capture(
+                vault,
+                &crate::learnings::Learning {
+                    ts: Utc::now(),
+                    skill: "ingest".into(),
+                    learning_type: crate::learnings::LearningType::Pitfall,
+                    key: format!("parse-fail-{label}"),
+                    insight: format!(
+                        "Ingest parse failed on '{label}': {parse_err}"
+                    ),
+                    confidence: 6,
+                    source: crate::learnings::LearningSource::Observed,
+                    tags: vec!["ingest".into(), "parse-error".into()],
+                    files: vec![source_path.display().to_string()],
+                },
+            );
+
             return Err(Error::Other(anyhow::anyhow!(
                 "llm ingest returned invalid IngestPlan json: {parse_err}; \
                  raw response saved to <vault>/.ingest-failures/"
@@ -271,6 +360,19 @@ pub async fn ingest_with_options(
     let commit_message = format!("[ingest] {}", plan.summary);
     let commit_id = tx.commit(&commit_message)?;
 
+    // Post-ingest hook (fire-and-forget).
+    if let Some(hooks) = &options.hooks {
+        crate::hooks::post_ingest(
+            hooks,
+            source_path,
+            &commit_id,
+            &plan.summary,
+            created,
+            updated,
+        )
+        .await;
+    }
+
     Ok(IngestReport {
         source: interned,
         commit_id,
@@ -290,11 +392,67 @@ pub async fn ingest_with_options(
 /// are more specific), then by lexicographic path order (deterministic).
 ///
 /// This is deliberately simple. It costs nothing (no embeddings, no LLM
+/// Embed the source text and search the vector store for semantically
+/// related wiki pages. Returns an empty vec on any error (graceful fallback).
+async fn retrieve_via_embeddings<'a>(
+    pages: &'a [Page],
+    source_text: &str,
+    embed_store: Option<&crate::embed::EmbeddingsStore>,
+    embed_provider: Option<&dyn LlmProvider>,
+    embed_model: Option<&str>,
+) -> Vec<&'a Page> {
+    let (Some(store), Some(ep), Some(model)) = (embed_store, embed_provider, embed_model) else {
+        return vec![];
+    };
+
+    // Truncate to first ~2000 chars for embedding (sending 100KB of chat
+    // to the embedding API is wasteful and the first portion carries
+    // enough semantic signal for retrieval).
+    let cutoff = if source_text.len() > 2000 {
+        source_text.floor_char_boundary(2000)
+    } else {
+        source_text.len()
+    };
+    let embed_text = &source_text[..cutoff];
+
+    let vecs = match ep.embed(&[embed_text.to_string()]).await {
+        Ok(v) if !v.is_empty() => v,
+        Ok(_) => return vec![],
+        Err(e) => {
+            tracing::warn!("embed call failed, skipping vector retrieval: {e}");
+            return vec![];
+        }
+    };
+
+    let hits = match store.search(&vecs[0], ep.name(), model, MAX_RELEVANT_PAGES) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("vector search failed: {e}");
+            return vec![];
+        }
+    };
+
+    let hit_ids: std::collections::HashSet<_> = hits.iter().map(|h| h.page_id).collect();
+    let matched: Vec<&Page> = pages
+        .iter()
+        .filter(|p| hit_ids.contains(&p.frontmatter.id))
+        .collect();
+    tracing::debug!(
+        "embeddings retrieval: {} hits -> {} pages",
+        hits.len(),
+        matched.len()
+    );
+    matched
+}
+
+/// Substring title match: score pages by whether their title or filename
+/// stem appears as a case-insensitive substring of the source text.
+///
+/// This is deliberately simple. It costs nothing (no embeddings, no LLM
 /// call), works for Claude-only users who can't afford an embeddings
 /// provider, and meaningfully reduces the duplication rate on re-ingests
 /// of related material. It will miss semantic relationships ("attention"
-/// vs "self-attention") — that's what embeddings-based retrieval is for,
-/// once a working embed provider is wired in.
+/// vs "self-attention") — that's what embeddings-based retrieval is for.
 fn select_relevant_pages<'a>(pages: &'a [Page], source_text: &str, top_n: usize) -> Vec<&'a Page> {
     if pages.is_empty() || top_n == 0 {
         return Vec::new();

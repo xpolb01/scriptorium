@@ -1,0 +1,64 @@
+{
+  "benchmarks": [
+    {
+      "query": "What is the transformer architecture?",
+      "expected": ["transformers"],
+      "k": 5,
+      "description": "Direct concept lookup — exact topic match"
+    },
+    {
+      "query": "How does attention work in neural networks?",
+      "expected": ["attention", "transformers"],
+      "k": 5,
+      "description": "Multi-page retrieval — attention is the primary target, transformers is related"
+    },
+    {
+      "query": "What is BERT and how does it relate to transformers?",
+      "expected": ["bert", "transformers"],
+      "k": 5,
+      "description": "Cross-reference retrieval — BERT links to transformers"
+    },
+    {
+      "query": "self-attention mechanism parallel processing sequences",
+      "expected": ["attention", "transformers"],
+      "k": 5,
+      "description": "Keyword-heavy query — tests FTS5 keyword matching"
+    },
+    {
+      "query": "Vaswani et al 2017 paper",
+      "expected": ["transformers"],
+      "k": 5,
+      "description": "Citation/source retrieval — finds page by source reference"
+    },
+    {
+      "query": "bidirectional encoder masked language modeling",
+      "expected": ["bert"],
+      "k": 5,
+      "description": "Technical terminology — tests vocabulary matching"
+    },
+    {
+      "query": "scaled dot-product attention",
+      "expected": ["attention"],
+      "k": 3,
+      "description": "Alias retrieval — 'scaled-dot-product attention' is an alias on the attention page"
+    },
+    {
+      "query": "sequence processing without recurrence",
+      "expected": ["transformers", "attention"],
+      "k": 5,
+      "description": "Paraphrased query — concept described indirectly via its advantage over RNNs"
+    },
+    {
+      "query": "pre-trained language model",
+      "expected": ["bert"],
+      "k": 5,
+      "description": "Broader concept query — should find BERT as the pre-trained model in the vault"
+    },
+    {
+      "query": "neural network architectures overview",
+      "expected": ["transformers", "bert", "attention"],
+      "k": 5,
+      "description": "Broad retrieval — tests whether multiple related pages surface for a general query"
+    }
+  ]
+}

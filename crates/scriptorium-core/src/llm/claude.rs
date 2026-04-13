@@ -41,11 +41,22 @@ pub struct ClaudeConfig {
 }
 
 impl ClaudeConfig {
-    /// Read config from environment variables. `ANTHROPIC_API_KEY` is
-    /// required; everything else has a default.
+    /// Read config from environment variables, falling back to the macOS
+    /// keychain for the API key. `SCRIPTORIUM_ANTHROPIC_API_KEY` env var takes
+    /// priority; if absent, checks keychain service `scriptorium-anthropic`.
     pub fn from_env() -> Result<Self, LlmError> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .map_err(|_| LlmError::api("claude", 0, "ANTHROPIC_API_KEY env var is not set"))?;
+        let api_key = crate::keychain::resolve_key(
+            "SCRIPTORIUM_ANTHROPIC_API_KEY",
+            crate::keychain::services::ANTHROPIC,
+        )
+        .ok_or_else(|| {
+            LlmError::api(
+                "claude",
+                0,
+                "SCRIPTORIUM_ANTHROPIC_API_KEY not found in env or keychain. \
+                 Run `scriptorium setup` to configure.",
+            )
+        })?;
         Ok(Self {
             api_key,
             model: std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
@@ -98,10 +109,21 @@ impl LlmProvider for ClaudeProvider {
         // and returns HTTP 400 ("Thinking may not be enabled when tool_choice
         // forces tool use"). If a future change adds thinking, switch
         // `tool_choice` to `"any"` instead of forcing a named tool.
+        //
+        // System prompt is sent as a structured array with `cache_control`
+        // on the text block. This enables Anthropic's prompt caching so
+        // repeated calls (e.g. bulk-ingest) pay the 0.1x cache-read rate
+        // for the system prompt instead of the full input rate every time.
+        // The system prompt typically contains the full vault schema (~14KB)
+        // which is identical across all calls in a batch.
         let mut body = json!({
             "model": self.config.model,
             "max_tokens": req.max_tokens,
-            "system": req.system,
+            "system": [{
+                "type": "text",
+                "text": req.system,
+                "cache_control": { "type": "ephemeral" },
+            }],
             "messages": messages,
         });
         if let Some(temp) = req.temperature {

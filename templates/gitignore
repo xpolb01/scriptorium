@@ -7,6 +7,8 @@
 .scriptorium/graph.json
 .scriptorium/lint-state.json
 .scriptorium/usage.jsonl
+.scriptorium/learnings.jsonl
+.scriptorium/bulk-ingest-checkpoint.json
 
 # Persisted LLM failure records from `scriptorium ingest` parse errors.
 # These are local debugging artefacts, never part of vault history.

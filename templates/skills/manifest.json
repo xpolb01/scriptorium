@@ -1,0 +1,31 @@
+{
+  "name": "scriptorium",
+  "version": "0.1.0",
+  "skills": [
+    {
+      "name": "ingest",
+      "path": "ingest/SKILL.md",
+      "description": "Ingest source files into the vault: read, prompt the LLM, create/update wiki pages, commit."
+    },
+    {
+      "name": "query",
+      "path": "query/SKILL.md",
+      "description": "Answer questions using hybrid search (vector + keyword + RRF fusion) with cited sources."
+    },
+    {
+      "name": "maintain",
+      "path": "maintain/SKILL.md",
+      "description": "Dream cycle: lint, stale detection, embedding coverage, and auto-fix."
+    },
+    {
+      "name": "review",
+      "path": "review/SKILL.md",
+      "description": "Review recently ingested content for quality, accuracy, and completeness."
+    },
+    {
+      "name": "learn",
+      "path": "learn/SKILL.md",
+      "description": "View, search, and manage the self-learning journal."
+    }
+  ]
+}

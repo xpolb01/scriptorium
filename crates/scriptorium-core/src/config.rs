@@ -5,6 +5,8 @@
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
+use crate::hooks::HooksConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
@@ -15,6 +17,8 @@ pub struct Config {
     pub git: GitConfig,
     #[serde(default)]
     pub paths: PathsConfig,
+    #[serde(default)]
+    pub hooks: HooksConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
