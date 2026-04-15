@@ -5,6 +5,9 @@
 //! rendering uses `miette` so library `thiserror` errors pretty-print with
 //! source context.
 
+#[cfg(feature = "dashboard")]
+mod dashboard;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -192,6 +195,126 @@ enum Command {
     /// Manage registered vaults: list, add, remove, set default.
     #[command(name = "vault", subcommand)]
     VaultMgmt(VaultCommand),
+
+    /// Claude Code hook event ingestion into `SQLite`.
+    #[command(subcommand)]
+    Hooks(HooksCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum HooksCommand {
+    /// Read a JSON hook event from stdin and write it to the hooks `SQLite` database.
+    ///
+    /// Designed for Claude Code hooks to pipe events directly into `SQLite`,
+    /// bypassing the JSONL intermediate format. Always exits 0 — hook
+    /// reliability invariant means we never break the caller.
+    Log {
+        /// Path to the hooks `SQLite` database.
+        /// Defaults to `~/.scriptorium/hooks.sqlite`.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Validate the event but don't write to the database.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// One-time full backfill: import all events from a JSONL file into
+    /// the hooks `SQLite` database. Idempotent — safe to re-run; duplicates
+    /// are silently skipped via content hash.
+    Migrate {
+        /// Path to the JSONL file.
+        /// Defaults to `~/.claude/artifacts/scriptorium-classifier.jsonl`.
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
+        /// Path to the hooks `SQLite` database.
+        /// Defaults to `~/.scriptorium/hooks.sqlite`.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Parse and validate only — don't write to the database.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Incremental import: import new events from a JSONL file into the
+    /// hooks `SQLite` database. Semantically identical to `migrate` (both
+    /// are idempotent), but signals intent for ongoing use.
+    Import {
+        /// Path to the JSONL file.
+        /// Defaults to `~/.claude/artifacts/scriptorium-classifier.jsonl`.
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
+        /// Path to the hooks `SQLite` database.
+        /// Defaults to `~/.scriptorium/hooks.sqlite`.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Parse and validate only — don't write to the database.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Run health checks on Claude Code hook registrations.
+    ///
+    /// By default runs static checks only (registration, permissions,
+    /// timeouts, guard patterns, freshness). Use `--test` to also
+    /// execute hooks with synthetic payloads and `SCRIPTORIUM_DRY_RUN=1`.
+    Check {
+        /// Also run dynamic validation: execute each hook with a
+        /// synthetic payload and `SCRIPTORIUM_DRY_RUN=1`.
+        #[arg(long)]
+        test: bool,
+        /// Output as JSON instead of a human-readable table.
+        #[arg(long)]
+        json: bool,
+        /// Lightweight subset: static session-hook checks only
+        /// (skip vault checks, dynamic checks, even if `--test`).
+        #[arg(long)]
+        quick: bool,
+        /// Path to Claude Code `settings.json`.
+        /// Defaults to `~/.claude/settings.json`.
+        #[arg(long)]
+        settings: Option<PathBuf>,
+        /// Path to the hooks directory containing `scriptorium-*.sh` scripts.
+        /// Defaults to `~/dotfiles/claude/hooks/`.
+        #[arg(long)]
+        hooks_dir: Option<PathBuf>,
+        /// Path to the scriptorium vault root (for vault-level checks).
+        #[arg(long)]
+        vault: Option<PathBuf>,
+    },
+
+    /// List all registered and on-disk hooks in a table.
+    List {
+        /// Path to Claude Code `settings.json`.
+        /// Defaults to `~/.claude/settings.json`.
+        #[arg(long)]
+        settings: Option<PathBuf>,
+        /// Path to the hooks directory containing `scriptorium-*.sh` scripts.
+        /// Defaults to `~/dotfiles/claude/hooks/`.
+        #[arg(long)]
+        hooks_dir: Option<PathBuf>,
+    },
+
+    /// Launch the hooks health dashboard web UI.
+    ///
+    /// Starts a localhost-only axum server serving the telemetry dashboard.
+    /// Optionally imports events from a JSONL file before starting.
+    /// Runs in the foreground until Ctrl-C.
+    #[cfg(feature = "dashboard")]
+    Dashboard {
+        /// Port to listen on.
+        #[arg(long, default_value = "3457")]
+        port: u16,
+        /// Don't auto-open the browser.
+        #[arg(long)]
+        no_browser: bool,
+        /// Path to the hooks `SQLite` database.
+        /// Defaults to `~/.scriptorium/hooks.sqlite`.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Path to JSONL file to import before starting.
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -319,6 +442,20 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         // --- commands that don't need vault resolution ---
         Command::VaultMgmt(sub) => handle_vault_command(sub),
+        Command::Hooks(sub) => {
+            #[cfg(feature = "dashboard")]
+            if let HooksCommand::Dashboard { port, no_browser, db, jsonl } = sub {
+                let db_path = db.unwrap_or_else(default_hooks_db_path);
+                if !no_browser {
+                    let _ = std::process::Command::new("open")
+                        .arg(format!("http://127.0.0.1:{port}"))
+                        .spawn();
+                }
+                dashboard::start_dashboard(port, db_path, jsonl).await?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            handle_hooks_command(sub)
+        }
         Command::Init { path } => {
             let target = path
                 .or(explicit_vault)
@@ -854,7 +991,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         // Already handled before vault resolution.
-        Command::VaultMgmt(_) | Command::Init { .. } => unreachable!(),
+        Command::VaultMgmt(_) | Command::Init { .. } | Command::Hooks(_) => unreachable!(),
         } // inner match
         } // outer `command =>` arm
     }
@@ -1238,6 +1375,346 @@ fn handle_vault_command(sub: VaultCommand) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+// ---------- hooks ----------
+
+#[allow(clippy::unnecessary_wraps)]
+fn handle_hooks_command(sub: HooksCommand) -> Result<ExitCode> {
+    match sub {
+        HooksCommand::Log { db, dry_run } => {
+            if let Err(e) = hooks_log_inner(db, dry_run) {
+                eprintln!("scriptorium hooks log: {e}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        HooksCommand::Migrate { jsonl, db, dry_run }
+        | HooksCommand::Import { jsonl, db, dry_run } => {
+            hooks_import_inner(jsonl, db, dry_run)
+        }
+        HooksCommand::Check { test, json, quick, settings, hooks_dir, vault } => {
+            hooks_check_inner(test, json, quick, settings, hooks_dir, vault)
+        }
+        HooksCommand::List { settings, hooks_dir } => {
+            hooks_list_inner(settings, hooks_dir)
+        }
+        #[cfg(feature = "dashboard")]
+        HooksCommand::Dashboard { .. } => unreachable!("handled in run()"),
+    }
+}
+
+fn hooks_check_inner(
+    test: bool,
+    json: bool,
+    quick: bool,
+    settings: Option<PathBuf>,
+    hooks_dir: Option<PathBuf>,
+    vault: Option<PathBuf>,
+) -> Result<ExitCode> {
+    let settings_path = settings.unwrap_or_else(default_settings_path);
+    let hooks_path = hooks_dir.unwrap_or_else(default_hooks_dir);
+
+    let mut report =
+        scriptorium_core::hooks_check::check_session_hooks(&settings_path, &hooks_path);
+
+    if !quick {
+        if let Some(vault_path) = vault {
+            let vault_report = scriptorium_core::hooks_check::check_vault_hooks(&vault_path);
+            report.items.extend(vault_report.items);
+        }
+
+        if test {
+            let dynamic_report =
+                scriptorium_core::hooks_check::check_dynamic(&settings_path, &hooks_path);
+            report.items.extend(dynamic_report.items);
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| miette!("json: {e}"))?
+        );
+    } else {
+        print_hooks_check_report(&report);
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    Ok(ExitCode::from(report.exit_code() as u8))
+}
+
+fn hooks_list_inner(
+    settings: Option<PathBuf>,
+    hooks_dir: Option<PathBuf>,
+) -> Result<ExitCode> {
+    let settings_path = settings.unwrap_or_else(default_settings_path);
+    let hooks_path = hooks_dir.unwrap_or_else(default_hooks_dir);
+
+    let entries = scriptorium_core::hooks_check::list_hooks(&settings_path, &hooks_path);
+
+    if entries.is_empty() {
+        println!("No hooks found.");
+    } else {
+        println!(
+            "{:<35} {:<18} {:>4} {:>7} {:>5} {:>7}",
+            "NAME", "EVENT TYPE", "REG", "ON-DISK", "EXEC", "TIMEOUT"
+        );
+        println!("{}", "\u{2500}".repeat(82));
+        for e in &entries {
+            println!(
+                "{:<35} {:<18} {:>4} {:>7} {:>5} {:>7}",
+                e.name,
+                e.event_type,
+                if e.registered { "\u{2713}" } else { "\u{2717}" },
+                if e.on_disk { "\u{2713}" } else { "\u{2717}" },
+                if e.executable { "\u{2713}" } else { "\u{2717}" },
+                e.timeout
+                    .map(|t| format!("{t}s"))
+                    .unwrap_or_else(|| "\u{2014}".to_string()),
+            );
+        }
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+fn hooks_import_inner(
+    jsonl_path: Option<PathBuf>,
+    db_path: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<ExitCode> {
+    let jsonl = jsonl_path.unwrap_or_else(default_hooks_jsonl_path);
+    let db = db_path.unwrap_or_else(default_hooks_db_path);
+
+    if !jsonl.exists() {
+        return Err(miette!(
+            "JSONL file not found: {}\n\
+             Use --jsonl <path> to specify a different file.",
+            jsonl.display()
+        ));
+    }
+
+    if let Some(parent) = db.parent() {
+        std::fs::create_dir_all(parent).into_diagnostic()?;
+    }
+
+    eprintln!("source: {}", jsonl.display());
+    eprintln!("target: {}", db.display());
+    if dry_run {
+        eprintln!("mode:   dry-run (validate only)");
+    }
+
+    let store = scriptorium_core::hooks_store::HooksStore::open(&db)
+        .map_err(|e| miette!("open hooks db: {e}"))?;
+
+    let report = store
+        .import_jsonl(&jsonl, dry_run)
+        .map_err(|e| miette!("import: {e}"))?;
+
+    eprintln!();
+    println!(
+        "Total: {} | Imported: {} | Duplicates: {} | Malformed: {} | Privacy: {}",
+        report.total_lines,
+        report.imported,
+        report.skipped_duplicate,
+        report.skipped_malformed,
+        report.privacy_flagged,
+    );
+
+    if !report.errors.is_empty() {
+        eprintln!();
+        for err in &report.errors {
+            eprintln!("  error: {err}");
+        }
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+fn hooks_log_inner(
+    db_path: Option<PathBuf>,
+    dry_run_flag: bool,
+) -> std::result::Result<(), String> {
+    let raw = std::io::read_to_string(std::io::stdin())
+        .map_err(|e| format!("read stdin: {e}"))?;
+
+    if raw.trim().is_empty() {
+        return Ok(());
+    }
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse JSON: {e}"))?;
+
+    let event = map_raw_to_hook_event(&parsed, &raw)?;
+
+    let is_dry_run =
+        dry_run_flag || std::env::var("SCRIPTORIUM_DRY_RUN").is_ok_and(|v| v == "1");
+    if is_dry_run {
+        return Ok(());
+    }
+
+    let path = db_path.unwrap_or_else(default_hooks_db_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create dir {}: {e}", parent.display()))?;
+    }
+
+    let store = scriptorium_core::hooks_store::HooksStore::open(&path)
+        .map_err(|e| format!("open hooks db: {e}"))?;
+
+    store
+        .insert_event_idempotent(&event)
+        .map_err(|e| format!("insert event: {e}"))?;
+
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn map_raw_to_hook_event(
+    v: &serde_json::Value,
+    raw: &str,
+) -> std::result::Result<scriptorium_core::hooks_store::HookEvent, String> {
+    use scriptorium_core::hooks_store::{HookEvent, HooksStore};
+
+    let str_field = |key: &str| -> Option<String> {
+        v.get(key).and_then(|val| val.as_str()).map(String::from)
+    };
+    let int_field = |key: &str| -> Option<i32> {
+        v.get(key)
+            .and_then(serde_json::Value::as_i64)
+            .map(|n| n as i32)
+    };
+
+    let scored = v.get("scored");
+
+    let score = scored
+        .and_then(|s| s.get("score"))
+        .and_then(serde_json::Value::as_i64)
+        .map(|n| n as i32)
+        .or_else(|| int_field("score"));
+
+    let signals = scored
+        .and_then(|s| s.get("signals"))
+        .or_else(|| v.get("signals"))
+        .map(|val| {
+            if val.is_string() {
+                val.as_str().unwrap_or_default().to_string()
+            } else {
+                serde_json::to_string(val).unwrap_or_default()
+            }
+        });
+
+    let metrics = scored
+        .and_then(|s| s.get("metrics"))
+        .or_else(|| v.get("metrics"))
+        .map(|val| {
+            if val.is_string() {
+                val.as_str().unwrap_or_default().to_string()
+            } else {
+                serde_json::to_string(val).unwrap_or_default()
+            }
+        });
+
+    let hook_type = str_field("hook_type").unwrap_or_else(|| {
+        infer_hook_type(
+            &str_field("source").unwrap_or_default(),
+            &str_field("action").unwrap_or_default(),
+        )
+    });
+
+    let session_id =
+        str_field("session_id").ok_or_else(|| "missing required field: session_id".to_string())?;
+
+    let ts = str_field("ts")
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+    Ok(HookEvent {
+        id: None,
+        ts,
+        session_id,
+        parent_session_id: str_field("parent_session_id"),
+        hook_type,
+        source: str_field("source"),
+        cwd: str_field("cwd"),
+        score,
+        threshold: int_field("threshold"),
+        signals,
+        metrics,
+        agent_type: str_field("agent_type"),
+        privacy_veto: str_field("privacy_veto"),
+        decision: str_field("decision"),
+        peak_turn_score: int_field("peak_turn_score"),
+        session_aggregate_score: int_field("session_aggregate_score"),
+        final_score: int_field("final_score"),
+        turn_count: int_field("turn_count"),
+        subagent_count: int_field("subagent_count"),
+        raw_json: Some(raw.to_string()),
+        raw_json_hash: HooksStore::hash_raw(raw),
+    })
+}
+
+fn infer_hook_type(source: &str, action: &str) -> String {
+    let s = source.to_lowercase();
+    let a = action.to_lowercase();
+    if s.contains("subagent") || a.contains("subagent") {
+        "subagent_stop".to_string()
+    } else if s.contains("session") && (s.contains("end") || s.contains("stop")) {
+        "session_end".to_string()
+    } else {
+        "stop".to_string()
+    }
+}
+
+fn default_hooks_db_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join(".scriptorium")
+        .join("hooks.sqlite")
+}
+
+fn default_hooks_jsonl_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join(".claude")
+        .join("artifacts")
+        .join("scriptorium-classifier.jsonl")
+}
+
+fn default_settings_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join(".claude")
+        .join("settings.json")
+}
+
+fn default_hooks_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join("dotfiles")
+        .join("claude")
+        .join("hooks")
+}
+
+fn print_hooks_check_report(report: &scriptorium_core::hooks_check::HooksCheckReport) {
+    use scriptorium_core::hooks_check::CheckStatus;
+    println!("Hooks Health Check");
+    println!("==================");
+    for item in &report.items {
+        let tag = match item.status {
+            CheckStatus::Pass => "  [PASS]",
+            CheckStatus::Warn => "  [WARN]",
+            CheckStatus::Fail => "  [FAIL]",
+            CheckStatus::Info => "  [INFO]",
+        };
+        println!("{tag} [{}] {}", item.name, item.message);
+    }
+    if report.has_failures() {
+        println!("\nResult: FAILURES detected (exit 2)");
+    } else if report.has_warnings() {
+        println!("\nResult: Warnings found (exit 1)");
+    } else {
+        println!("\nResult: All checks passed (exit 0)");
+    }
 }
 
 /// Map a `ProviderKind` to the string name expected by `set_model_env`.
