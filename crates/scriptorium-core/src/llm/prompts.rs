@@ -203,12 +203,14 @@ impl<'a> PromptContext<'a> {
             return String::new();
         }
         let mut out = String::from(
-            "## Valid wikilink targets\n\n\
-             You may ONLY use `[[wikilinks]]` to pages in this list. \
-             Do NOT invent links to pages that don't exist.\n\n",
+            "## Exact page paths\n\n\
+             These are existing pages in the vault. To link to or update one, use its exact \
+             vault-relative path including the .md extension. You may ONLY use `[[wikilinks]]` \
+             to pages in this list. Do NOT invent links to pages that don't exist.\n\n",
         );
         for stem in self.all_page_stems {
-            let _ = writeln!(out, "- `[[{stem}]]`");
+            let normalized = stem.replace('\\', "/");
+            let _ = writeln!(out, "- `[[{normalized}]]`");
         }
         out.push('\n');
         out
