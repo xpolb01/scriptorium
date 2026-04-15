@@ -90,4 +90,44 @@ mod tests {
             "deep"
         );
     }
+
+    #[test]
+    fn empty_path() {
+        // Edge case: empty string produces empty stem
+        assert_eq!(normalize_stem(Utf8Path::new("")), "");
+    }
+
+    #[test]
+    fn dotfile_no_extension() {
+        // A dotfile like `.hidden` has no stem in the usual sense
+        assert_eq!(normalize_stem(Utf8Path::new("wiki/.hidden")), ".hidden");
+    }
+
+    #[test]
+    fn double_extension() {
+        // `foo.bar.md` — file_stem is `foo.bar`
+        assert_eq!(
+            normalize_stem(Utf8Path::new("wiki/concepts/foo.bar.md")),
+            "foo.bar"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_index() {
+        // index.md several levels deep should use immediate parent
+        assert_eq!(
+            normalize_stem(Utf8Path::new("wiki/topics/a/b/c/index.md")),
+            "c"
+        );
+    }
+
+    #[test]
+    fn mixed_case_extension() {
+        // `.MD` is not `.md` — camino is case-sensitive on extension
+        // so this should be treated as a non-md file
+        assert_eq!(
+            normalize_stem(Utf8Path::new("wiki/concepts/Foo.MD")),
+            "foo.md"
+        );
+    }
 }

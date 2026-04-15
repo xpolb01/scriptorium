@@ -999,7 +999,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
 
 // ---------- social facebook ----------
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_social_facebook(
     vault: &Vault,
     _vault_path: &Path,
@@ -1439,10 +1439,11 @@ fn hooks_check_inner(
         print_hooks_check_report(&report);
     }
 
-    #[allow(clippy::cast_sign_loss)]
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     Ok(ExitCode::from(report.exit_code() as u8))
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn hooks_list_inner(
     settings: Option<PathBuf>,
     hooks_dir: Option<PathBuf>,
@@ -1469,8 +1470,7 @@ fn hooks_list_inner(
                 if e.on_disk { "\u{2713}" } else { "\u{2717}" },
                 if e.executable { "\u{2713}" } else { "\u{2717}" },
                 e.timeout
-                    .map(|t| format!("{t}s"))
-                    .unwrap_or_else(|| "\u{2014}".to_string()),
+                    .map_or_else(|| "\u{2014}".to_string(), |t| format!("{t}s")),
             );
         }
     }
