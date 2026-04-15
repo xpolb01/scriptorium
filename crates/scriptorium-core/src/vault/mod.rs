@@ -17,6 +17,7 @@ pub mod graph;
 pub mod lock;
 pub mod page;
 pub mod patch;
+pub mod stem;
 pub mod tx;
 pub mod wikilink;
 
@@ -29,6 +30,7 @@ use crate::error::{Error, Result};
 pub use graph::{LinkGraph, LinkRef, PageInfo, Resolution};
 pub use page::{Frontmatter, Page, PageId, SCHEMA_VERSION};
 pub use patch::{Patch, PatchError, PatchOp, PatchOutcome};
+pub use stem::normalize_stem;
 pub use tx::{Action, ChangeSummary, VaultTx};
 pub use wikilink::Wikilink;
 

@@ -2,13 +2,16 @@
 //! struct guarantees every required field is present, but it cannot enforce
 //! things like "title is non-empty" or "`schema_version` is supported".
 
+use std::collections::HashMap;
+
 use super::{LintIssue, Severity};
-use crate::vault::{Page, SCHEMA_VERSION};
+use crate::vault::{stem::normalize_stem, Page, SCHEMA_VERSION};
 
 pub const EMPTY_TITLE: &str = "frontmatter.empty_title";
 pub const BAD_TIMESTAMPS: &str = "frontmatter.bad_timestamps";
 pub const UNKNOWN_SCHEMA_VERSION: &str = "frontmatter.unknown_schema_version";
 pub const DUPLICATE_ID: &str = "frontmatter.duplicate_id";
+pub const DUPLICATE_STEM: &str = "frontmatter.duplicate_stem";
 
 pub fn check(pages: &[Page]) -> Vec<LintIssue> {
     let mut issues = Vec::new();
@@ -79,6 +82,40 @@ pub fn check(pages: &[Page]) -> Vec<LintIssue> {
                 .at(dup.frontmatter.id, dup.path.clone()),
             );
         }
+    }
+    issues
+}
+
+pub fn check_duplicate_stems(pages: &[Page]) -> Vec<LintIssue> {
+    let mut stems: HashMap<String, Vec<&Page>> = HashMap::new();
+
+    for page in pages {
+        if !page.path.as_str().starts_with("wiki/") {
+            continue;
+        }
+        let stem = normalize_stem(&page.path);
+        stems.entry(stem).or_default().push(page);
+    }
+
+    let mut issues = Vec::new();
+    for (stem, group) in &stems {
+        if group.len() <= 1 {
+            continue;
+        }
+        let mut paths: Vec<&str> = group.iter().map(|p| p.path.as_str()).collect();
+        paths.sort();
+        let path_list = paths.join(", ");
+        let first = group[0];
+        issues.push(
+            LintIssue {
+                severity: Severity::Error,
+                rule: DUPLICATE_STEM.into(),
+                page: None,
+                path: None,
+                message: format!("duplicate stem '{stem}': {path_list}"),
+            }
+            .at(first.frontmatter.id, first.path.clone()),
+        );
     }
     issues
 }

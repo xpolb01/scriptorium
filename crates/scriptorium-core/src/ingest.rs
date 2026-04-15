@@ -184,16 +184,46 @@ pub async fn ingest_with_retrieval(
         merged
     };
 
-    let all_stems: Vec<String> = prior_scan
+    // Collect full vault-relative paths for wiki/ pages only, sorted for determinism.
+    // These paths are passed to the LLM so it knows exactly which [[wikilinks]] are valid.
+    let mut all_stems: Vec<String> = prior_scan
         .pages
         .iter()
-        .map(|p| {
-            p.path
-                .file_stem()
-                .unwrap_or(p.path.as_str())
-                .to_string()
-        })
+        .filter(|p| p.path.starts_with("wiki/"))
+        .map(|p| p.path.to_string().replace('\\', "/"))
         .collect();
+    all_stems.sort();
+
+    // Build stem_to_path mapping for deduplication guard (Task 4).
+    // Maps normalized stems (lowercase) to their full vault-relative paths.
+    #[allow(unused_variables)]
+    let stem_to_path: std::collections::HashMap<String, Vec<std::path::PathBuf>> = {
+        let mut map: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
+            std::collections::HashMap::new();
+        for page in prior_scan
+            .pages
+            .iter()
+            .filter(|p| p.path.starts_with("wiki/"))
+        {
+            // TODO: replace with vault::stem::normalize_stem once available (Task 1)
+            let normalized = page
+                .path
+                .file_stem()
+                .map(|s| s.to_string().to_lowercase())
+                .unwrap_or_default();
+            if !normalized.is_empty() {
+                map.entry(normalized)
+                    .or_insert_with(Vec::new)
+                    .push(page.path.clone().into_std_path_buf());
+            }
+        }
+        // Sort path vectors for deterministic output
+        for paths in map.values_mut() {
+            paths.sort();
+        }
+        map
+    };
+
     let ctx = PromptContext::with_stems(&rendered_schema, &relevant_pages, &all_stems);
     let label = source_path
         .file_name()

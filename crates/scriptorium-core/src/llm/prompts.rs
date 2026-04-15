@@ -158,7 +158,7 @@ impl QueryAnswer {
 pub struct PromptContext<'a> {
     pub rendered_schema: &'a str,
     pub relevant_pages: &'a [&'a Page],
-    /// Complete list of page stems (filenames without extension) in the vault.
+    /// Complete list of full vault-relative page paths in the wiki/ directory.
     /// Injected into the prompt so the LLM knows exactly which `[[wikilinks]]`
     /// are valid and doesn't hallucinate non-existent targets.
     pub all_page_stems: &'a [String],
