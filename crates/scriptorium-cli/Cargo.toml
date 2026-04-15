@@ -11,6 +11,9 @@ description = "Scriptorium CLI binary"
 [lints]
 workspace = true
 
+[features]
+dashboard = ["dep:axum", "dep:tower", "dep:tower-http"]
+
 [[bin]]
 name = "scriptorium"
 path = "src/main.rs"
@@ -24,6 +27,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 miette.workspace = true
 toml.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 # URL ingest pipeline lives in `scriptorium-core::url_fetch` now; the CLI
@@ -31,3 +35,8 @@ serde_json.workspace = true
 camino.workspace = true
 chrono.workspace = true
 indicatif.workspace = true
+
+# Dashboard (feature-gated)
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }

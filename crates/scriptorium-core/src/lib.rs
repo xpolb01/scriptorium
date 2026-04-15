@@ -24,6 +24,8 @@ pub mod error;
 pub mod git;
 pub mod global_config;
 pub mod hooks;
+pub mod hooks_check;
+pub mod hooks_store;
 pub mod index;
 pub mod ingest;
 pub mod keychain;
