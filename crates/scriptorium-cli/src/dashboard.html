@@ -300,6 +300,17 @@
             color: var(--text-muted);
         }
 
+        /* Per-tab inline error banner */
+        .tab-error {
+            border: 1px solid var(--red);
+            color: var(--red);
+            padding: 0.75rem 1rem;
+            margin-bottom: 1rem;
+            border-radius: 6px;
+            display: none;
+        }
+        .tab-error.visible { display: block; }
+
         /* Utilities */
         .lag-indicator {
             display: inline-flex;
@@ -322,7 +333,6 @@
             position: fixed;
             top: 0; right: 0; bottom: 0; left: 0;
             background: rgba(13, 17, 23, 0.7);
-            display: flex;
             justify-content: center;
             align-items: center;
             z-index: 100;
@@ -383,15 +393,16 @@
 
     <!-- Overview Tab -->
     <main id="overview" class="content active">
+        <div class="tab-error" id="error-overview"></div>
         <div class="summary-grid">
             <div class="card">
                 <div class="card-title">Total Events</div>
                 <div class="card-value" id="stat-total-events">-</div>
             </div>
-            <div class="card">
-                <div class="card-title">Ingests Today</div>
-                <div class="card-value" id="stat-ingests">-</div>
-            </div>
+             <div class="card">
+                 <div class="card-title" id="stat-ingests-label">Ingests Today</div>
+                 <div class="card-value" id="stat-ingests">-</div>
+             </div>
             <div class="card">
                 <div class="card-title">Skipped</div>
                 <div class="card-value" id="stat-skipped">-</div>
@@ -413,7 +424,7 @@
         <div style="margin-bottom: 2rem; display: flex; justify-content: space-between; align-items: center;">
             <div class="lag-indicator" id="lagIndicator">
                 <div class="dot"></div>
-                <span id="lagText">SQLite Lag: Unknown</span>
+                <span id="walCheckpointText">WAL checkpoint: unknown</span>
             </div>
             <div style="font-size: 0.875rem; color: var(--text-muted);">
                 Last Ingest: <span id="lastIngestTs" class="mono">-</span>
@@ -446,6 +457,7 @@
 
     <!-- Events Tab -->
     <main id="events" class="content">
+        <div class="tab-error" id="error-events"></div>
         <div style="margin-bottom: 1rem; display: flex; justify-content: flex-end;">
             <select id="eventsLimit">
                 <option value="50" selected>50 events</option>
@@ -475,6 +487,7 @@
 
     <!-- Health Tab -->
     <main id="health" class="content">
+        <div class="tab-error" id="error-health"></div>
         <div class="health-grid" id="healthGrid">
             <!-- Populated by JS -->
         </div>
@@ -532,7 +545,7 @@
         function startAutoRefresh() {
             if (refreshInterval) clearInterval(refreshInterval);
             refreshInterval = setInterval(() => {
-                if (!isRefreshing) fetchData();
+                if (!isRefreshing) fetchData({ silent: true });
             }, 10000);
         }
 
@@ -543,9 +556,14 @@
             }
         }
 
-        async function fetchData() {
+        async function fetchData(options = { silent: false }) {
             isRefreshing = true;
             refreshBtn.textContent = 'Refreshing...';
+            
+            if (!options.silent) {
+                const el = document.getElementById('loadingOverlay');
+                if (el) el.style.display = 'flex';
+            }
             
             try {
                 if (currentTab === 'overview') {
@@ -564,6 +582,11 @@
             } finally {
                 isRefreshing = false;
                 refreshBtn.textContent = 'Refresh Now';
+                
+                if (!options.silent) {
+                    const el = document.getElementById('loadingOverlay');
+                    if (el) el.style.display = 'none';
+                }
             }
         }
 
@@ -575,13 +598,29 @@
             return await res.json();
         }
 
+        function showTabError(tab, message) {
+            const el = document.getElementById(`error-${tab}`);
+            if (!el) return;
+            el.textContent = message;
+            el.classList.add('visible');
+        }
+
+        function clearTabError(tab) {
+            const el = document.getElementById(`error-${tab}`);
+            if (!el) return;
+            el.textContent = '';
+            el.classList.remove('visible');
+        }
+
         async function fetchOverview() {
             const windowMs = timeWindowSelect.value;
             try {
                 const data = await fetchAPI(`/api/summary?window=${windowMs}`);
                 renderOverview(data);
+                clearTabError('overview');
             } catch (e) {
                 console.warn('Failed to fetch real summary, using fallback UI state');
+                showTabError('overview', 'Failed to load: ' + e.message);
                 // Could render empty state here, but we'll just log
             }
         }
@@ -591,26 +630,37 @@
             try {
                 const data = await fetchAPI(`/api/events?limit=${limit}`);
                 renderEvents(data);
+                clearTabError('events');
             } catch (e) {
                 console.warn('Failed to fetch real events');
+                showTabError('events', 'Failed to load: ' + e.message);
             }
         }
 
         async function fetchHealth() {
-            try {
-                const data = await fetchAPI(`/api/health`);
-                renderHealth(data);
-            } catch (e) {
-                console.warn('Failed to fetch real health');
-            }
-        }
+             try {
+                 const data = await fetchAPI(`/api/health`);
+                 renderHealth(data);
+                 clearTabError('health');
+             } catch (e) {
+                 console.warn('Failed to fetch real health');
+                 showTabError('health', 'Failed to load: ' + e.message);
+             }
+         }
+
+         function formatAge(seconds) {
+             if (seconds < 60) return `${Math.floor(seconds)}s`;
+             if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+             if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+             return `${Math.floor(seconds / 86400)}d`;
+         }
 
         function renderOverview(data) {
-            // Stats
-            document.getElementById('stat-total-events').textContent = data.total_events || 0;
-            document.getElementById('stat-ingests').textContent = data.total_ingests || 0;
-            document.getElementById('stat-skipped').textContent = data.total_skips || 0;
-            document.getElementById('stat-vetoed').textContent = data.total_vetoes || 0;
+             // Stats
+             document.getElementById('stat-total-events').textContent = data.total_events || 0;
+             document.getElementById('stat-ingests').textContent = data.ingests_today ?? 0;
+             document.getElementById('stat-skipped').textContent = data.total_skips || 0;
+             document.getElementById('stat-vetoed').textContent = data.total_vetoes || 0;
             
             const avg = data.avg_score || 0;
             document.getElementById('stat-avg-score').textContent = typeof avg === 'number' ? avg.toFixed(1) : avg;
@@ -624,19 +674,23 @@
                 document.getElementById('lastIngestTs').textContent = 'Never';
             }
 
-            const lagInd = document.getElementById('lagIndicator');
-            const lagTxt = document.getElementById('lagText');
-            // Assuming we calculate lag in frontend if we have last_event_ts and last_ingest_ts
-            // or maybe the API gives us a lag status
-            lagInd.className = 'lag-indicator';
-            lagTxt.textContent = 'SQLite Lag: Syncing';
+            const walInd = document.getElementById('lagIndicator');
+            const walText = document.getElementById('walCheckpointText');
+            walInd.className = 'lag-indicator';
+            if (data.wal_checkpoint_age_seconds == null) {
+                walText.textContent = 'WAL checkpoint: unknown';
+            } else {
+                walText.textContent = `WAL last checkpoint: ${formatAge(data.wal_checkpoint_age_seconds)} ago`;
+                if (data.wal_checkpoint_age_seconds > 3600) walInd.classList.add('lag-warning');
+                if (data.wal_checkpoint_age_seconds > 86400) walInd.classList.add('lag-error');
+            }
 
             // Score Distribution
             renderBarChart('chart-scores', data.score_distribution || {}, 'var(--accent)');
             
             // Signal Frequency
             renderBarChart('chart-signals', data.signal_frequency || {}, 'var(--accent)');
-            
+
             // Hook Types (with colors)
             const hooksContainer = document.getElementById('chart-hooks');
             hooksContainer.innerHTML = '';
@@ -760,8 +814,9 @@
             });
         }
 
-        // Boot
-        document.addEventListener('DOMContentLoaded', init);
-    </script>
-</body>
+         // Boot
+         document.addEventListener('DOMContentLoaded', init);
+     </script>
+     <div class="loading-overlay" id="loadingOverlay"><div class="spinner"></div></div>
+ </body>
 </html>
