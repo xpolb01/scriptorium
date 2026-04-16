@@ -42,6 +42,7 @@ use crate::llm::{
     ingest_prompt, record_usage, IngestAction, IngestPlan, LlmProvider, PromptContext,
 };
 use crate::schema::Schema;
+use crate::vault::stem::normalize_stem;
 use crate::vault::{Frontmatter, Page, Vault};
 
 /// Maximum number of existing pages to inject into the ingest prompt as
@@ -184,16 +185,48 @@ pub async fn ingest_with_retrieval(
         merged
     };
 
-    let all_stems: Vec<String> = prior_scan
+    // Collect full vault-relative paths for wiki/ pages only, sorted for determinism.
+    // These paths are passed to the LLM so it knows exactly which [[wikilinks]] are valid.
+    let mut all_stems: Vec<String> = prior_scan
         .pages
         .iter()
-        .map(|p| {
-            p.path
-                .file_stem()
-                .unwrap_or(p.path.as_str())
-                .to_string()
-        })
+        .filter(|p| p.path.starts_with("wiki/"))
+        .map(|p| p.path.to_string().replace('\\', "/"))
         .collect();
+    all_stems.sort();
+
+    // Build stem_to_path mapping for deduplication guard.
+    // Maps normalized stems (lowercase) to their full vault-relative paths.
+    let stem_to_path: std::collections::HashMap<String, Vec<Utf8PathBuf>> = {
+        let mut map: std::collections::HashMap<String, Vec<Utf8PathBuf>> =
+            std::collections::HashMap::new();
+        for page in prior_scan
+            .pages
+            .iter()
+            .filter(|p| p.path.starts_with("wiki/"))
+        {
+            let normalized = normalize_stem(&page.path);
+            if !normalized.is_empty() {
+                map.entry(normalized)
+                    .or_default()
+                    .push(page.path.clone());
+            }
+        }
+        // Sort path vectors for deterministic output
+        for paths in map.values_mut() {
+            paths.sort();
+        }
+        map
+    };
+
+    // Build set of existing wiki page paths for the collision guard.
+    let existing_paths: std::collections::HashSet<String> = prior_scan
+        .pages
+        .iter()
+        .filter(|p| p.path.starts_with("wiki/"))
+        .map(|p| p.path.to_string().replace('\\', "/"))
+        .collect();
+
     let ctx = PromptContext::with_stems(&rendered_schema, &relevant_pages, &all_stems);
     let label = source_path
         .file_name()
@@ -223,7 +256,7 @@ pub async fn ingest_with_retrieval(
         &response.model,
         &response.usage,
     );
-    let plan: IngestPlan = match serde_json::from_str::<IngestPlan>(&response.text) {
+    let mut plan: IngestPlan = match serde_json::from_str::<IngestPlan>(&response.text) {
         Ok(plan) => plan,
         Err(parse_err) => {
             // Persist the full context so the bug is debuggable after the
@@ -267,6 +300,9 @@ pub async fn ingest_with_retrieval(
             )));
         }
     };
+
+    // 5b. Guard against stem collisions before processing.
+    guard_stem_collisions(&mut plan, &stem_to_path, &existing_paths)?;
 
     // 6. Translate the plan into a VaultTx. Reuse the scan we did for
     //    retrieval — the vault state hasn't changed since step 4.
@@ -381,6 +417,105 @@ pub async fn ingest_with_retrieval(
         summary: plan.summary,
         dry_run_diff: Vec::new(),
     })
+}
+
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn guard_stem_collisions(
+    plan: &mut IngestPlan,
+    stem_to_path: &std::collections::HashMap<String, Vec<Utf8PathBuf>>,
+    existing_paths: &std::collections::HashSet<String>,
+) -> Result<()> {
+    for action in &mut plan.pages {
+        action.path = action.path.replace('\\', "/");
+
+        if !action.path.starts_with("wiki/") || !action.path.ends_with(".md") {
+            return Err(Error::Other(anyhow::anyhow!(
+                "Invalid page path '{}': must start with 'wiki/' and end with '.md'",
+                action.path
+            )));
+        }
+        if action.path.split('/').any(|seg| seg == "..") {
+            return Err(Error::Other(anyhow::anyhow!(
+                "Invalid page path '{}': must not contain '..' components",
+                action.path
+            )));
+        }
+
+        match action.action {
+            IngestAction::Create => {
+                let stem = normalize_stem(Utf8Path::new(&action.path));
+                if let Some(existing) = stem_to_path.get(&stem) {
+                    match existing.len() {
+                        1 => {
+                            let existing_path = existing[0].to_string().replace('\\', "/");
+                            tracing::warn!(
+                                "Stem collision: LLM proposed Create at '{}' but existing page at '{}'. Auto-converting to Update.",
+                                action.path,
+                                existing_path
+                            );
+                            action.action = IngestAction::Update;
+                            action.path = existing_path;
+                        }
+                        n if n >= 2 => {
+                            let paths_list: Vec<String> =
+                                existing.iter().map(std::string::ToString::to_string).collect();
+                            return Err(Error::Other(anyhow::anyhow!(
+                                "Ambiguous stem collision: stem '{}' matches {} existing pages: {}. Clean up duplicates before ingesting.",
+                                stem, n, paths_list.join(", ")
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            IngestAction::Update => {
+                if !existing_paths.contains(&action.path) {
+                    let stem = normalize_stem(Utf8Path::new(&action.path));
+                    match stem_to_path.get(&stem) {
+                        Some(existing) if existing.len() == 1 => {
+                            let existing_path = existing[0].to_string().replace('\\', "/");
+                            tracing::warn!(
+                                "Update target '{}' not found. Retargeting to existing page '{}' via stem '{}'.",
+                                action.path, existing_path, stem
+                            );
+                            action.path = existing_path;
+                        }
+                        Some(existing) if existing.len() >= 2 => {
+                            let paths_list: Vec<String> =
+                                existing.iter().map(std::string::ToString::to_string).collect();
+                            return Err(Error::Other(anyhow::anyhow!(
+                                "Ambiguous stem collision: stem '{}' matches {} existing pages: {}. Clean up duplicates before ingesting.",
+                                stem, existing.len(), paths_list.join(", ")
+                            )));
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "Update target '{}' does not exist and stem '{}' has no matches. Allowing as new page.",
+                                action.path, stem
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut seen_stems: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for action in &plan.pages {
+        let stem = normalize_stem(Utf8Path::new(&action.path));
+        if let Some(first_path) = seen_stems.get(&stem) {
+            return Err(Error::Other(anyhow::anyhow!(
+                "Plan contains duplicate writes to stem '{}': {} and {}",
+                stem,
+                first_path,
+                action.path
+            )));
+        }
+        seen_stems.insert(stem, action.path.clone());
+    }
+
+    Ok(())
 }
 
 /// Pick the `N` existing pages most likely to be relevant to a source text,
@@ -774,5 +909,160 @@ mod tests {
         assert_eq!(category_for_ext("pdf"), "pdfs");
         assert_eq!(category_for_ext("html"), "web");
         assert_eq!(category_for_ext("zip"), "data");
+    }
+
+    use crate::llm::prompts::{IngestAction, IngestPageAction, IngestPlan};
+
+    fn make_plan(pages: Vec<IngestPageAction>) -> IngestPlan {
+        IngestPlan {
+            summary: "test plan".into(),
+            pages,
+            log_entry: "test log".into(),
+        }
+    }
+
+    fn make_action(action: IngestAction, path: &str) -> IngestPageAction {
+        IngestPageAction {
+            action,
+            path: path.into(),
+            title: "Test".into(),
+            tags: vec![],
+            body: "body".into(),
+        }
+    }
+
+    fn empty_stem_map() -> std::collections::HashMap<String, Vec<Utf8PathBuf>> {
+        std::collections::HashMap::new()
+    }
+
+    fn empty_existing() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
+    #[test]
+    fn guard_no_collisions_passes_through() {
+        let mut plan = make_plan(vec![
+            make_action(IngestAction::Create, "wiki/concepts/new-page.md"),
+        ]);
+        let result = guard_stem_collisions(&mut plan, &empty_stem_map(), &empty_existing());
+        assert!(result.is_ok());
+        assert_eq!(plan.pages[0].path, "wiki/concepts/new-page.md");
+        assert_eq!(plan.pages[0].action, IngestAction::Create);
+    }
+
+    #[test]
+    fn guard_create_single_match_converts_to_update() {
+        let mut plan = make_plan(vec![
+            make_action(IngestAction::Create, "wiki/concepts/Attention.md"),
+        ]);
+        let mut stem_map = empty_stem_map();
+        stem_map.insert(
+            "attention".into(),
+            vec![Utf8PathBuf::from("wiki/concepts/attention.md")],
+        );
+        let result = guard_stem_collisions(&mut plan, &stem_map, &empty_existing());
+        assert!(result.is_ok());
+        assert_eq!(plan.pages[0].action, IngestAction::Update);
+        assert_eq!(plan.pages[0].path, "wiki/concepts/attention.md");
+    }
+
+    #[test]
+    fn guard_create_two_matches_errors() {
+        let mut plan = make_plan(vec![
+            make_action(IngestAction::Create, "wiki/concepts/Foo.md"),
+        ]);
+        let mut stem_map = empty_stem_map();
+        stem_map.insert(
+            "foo".into(),
+            vec![
+                Utf8PathBuf::from("wiki/concepts/Foo.md"),
+                Utf8PathBuf::from("wiki/topics/foo.md"),
+            ],
+        );
+        let result = guard_stem_collisions(&mut plan, &stem_map, &empty_existing());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Ambiguous stem collision"));
+        assert!(err.contains("2 existing pages"));
+    }
+
+    #[test]
+    fn guard_update_existing_path_passes_through() {
+        let mut plan = make_plan(vec![
+            make_action(IngestAction::Update, "wiki/concepts/attention.md"),
+        ]);
+        let mut existing = empty_existing();
+        existing.insert("wiki/concepts/attention.md".into());
+        let result = guard_stem_collisions(&mut plan, &empty_stem_map(), &existing);
+        assert!(result.is_ok());
+        assert_eq!(plan.pages[0].path, "wiki/concepts/attention.md");
+    }
+
+    #[test]
+    fn guard_update_nonexistent_single_match_retargets() {
+        let mut plan = make_plan(vec![
+            make_action(IngestAction::Update, "wiki/concepts/Attention.md"),
+        ]);
+        let mut stem_map = empty_stem_map();
+        stem_map.insert(
+            "attention".into(),
+            vec![Utf8PathBuf::from("wiki/topics/attention.md")],
+        );
+        let result = guard_stem_collisions(&mut plan, &stem_map, &empty_existing());
+        assert!(result.is_ok());
+        assert_eq!(plan.pages[0].path, "wiki/topics/attention.md");
+    }
+
+    #[test]
+    fn guard_update_nonexistent_two_matches_errors() {
+        let mut plan = make_plan(vec![
+            make_action(IngestAction::Update, "wiki/concepts/Foo.md"),
+        ]);
+        let mut stem_map = empty_stem_map();
+        stem_map.insert(
+            "foo".into(),
+            vec![
+                Utf8PathBuf::from("wiki/concepts/foo.md"),
+                Utf8PathBuf::from("wiki/topics/foo.md"),
+            ],
+        );
+        let result = guard_stem_collisions(&mut plan, &stem_map, &empty_existing());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Ambiguous stem collision"));
+    }
+
+    #[test]
+    fn guard_within_plan_duplicate_stems_errors() {
+        let mut plan = make_plan(vec![
+            make_action(IngestAction::Create, "wiki/concepts/foo.md"),
+            make_action(IngestAction::Create, "wiki/topics/Foo.md"),
+        ]);
+        let result = guard_stem_collisions(&mut plan, &empty_stem_map(), &empty_existing());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("duplicate writes to stem"));
+    }
+
+    #[test]
+    fn guard_invalid_path_no_wiki_prefix_errors() {
+        let mut plan = make_plan(vec![
+            make_action(IngestAction::Create, "pages/concepts/foo.md"),
+        ]);
+        let result = guard_stem_collisions(&mut plan, &empty_stem_map(), &empty_existing());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("must start with 'wiki/'"));
+    }
+
+    #[test]
+    fn guard_path_traversal_errors() {
+        let mut plan = make_plan(vec![
+            make_action(IngestAction::Create, "wiki/../etc/passwd.md"),
+        ]);
+        let result = guard_stem_collisions(&mut plan, &empty_stem_map(), &empty_existing());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("must not contain '..'"));
     }
 }

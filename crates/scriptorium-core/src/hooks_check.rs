@@ -21,6 +21,7 @@ use crate::config::Config;
 
 /// Status of a single check item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// Contract: dashboard.html:renderHealth expects lowercase status strings. Do not change without updating the frontend.
 #[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
     Pass,
@@ -1128,8 +1129,7 @@ pub fn list_hooks(settings_path: &Path, hooks_dir: &Path) -> Vec<HookListEntry> 
                     .unwrap_or(false);
             let name = resolved
                 .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| hook.command.clone());
+                .map_or_else(|| hook.command.clone(), |n| n.to_string_lossy().to_string());
 
             seen_paths.insert(resolved.canonicalize().unwrap_or_else(|_| resolved.clone()));
 
@@ -1149,7 +1149,11 @@ pub fn list_hooks(settings_path: &Path, hooks_dir: &Path) -> Vec<HookListEntry> 
         for entry in dir_entries.flatten() {
             let file_name = entry.file_name();
             let name_str = file_name.to_string_lossy().to_string();
-            if name_str.starts_with("scriptorium-") && name_str.ends_with(".sh") {
+            if name_str.starts_with("scriptorium-")
+                && std::path::Path::new(&name_str)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
+            {
                 let abs = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
                 if !seen_paths.contains(&abs) {
                     let executable = fs::metadata(&abs)
@@ -1533,6 +1537,25 @@ mod tests {
         assert!(parse_ts("2025-06-15T10:30:00.123456").is_some());
         assert!(parse_ts("2025-06-15T10:30:00").is_some());
         assert!(parse_ts("not-a-date").is_none());
+    }
+
+    // ── CheckStatus serde contract tests ─────────────────────────────
+
+    #[test]
+    fn check_status_serde_lowercase() {
+        let variants = vec![
+            (CheckStatus::Pass, "pass"),
+            (CheckStatus::Warn, "warn"),
+            (CheckStatus::Fail, "fail"),
+            (CheckStatus::Info, "info"),
+        ];
+        for (variant, expected_json_str) in variants {
+            let serialized = serde_json::to_string(&variant).unwrap();
+            assert_eq!(serialized, format!(r#""{}""#, expected_json_str));
+
+            let deserialized: CheckStatus = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(deserialized, variant);
+        }
     }
 
     // ── Settings parse test ──────────────────────────────────────────

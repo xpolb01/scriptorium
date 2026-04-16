@@ -158,7 +158,7 @@ impl QueryAnswer {
 pub struct PromptContext<'a> {
     pub rendered_schema: &'a str,
     pub relevant_pages: &'a [&'a Page],
-    /// Complete list of page stems (filenames without extension) in the vault.
+    /// Complete list of full vault-relative page paths in the wiki/ directory.
     /// Injected into the prompt so the LLM knows exactly which `[[wikilinks]]`
     /// are valid and doesn't hallucinate non-existent targets.
     pub all_page_stems: &'a [String],
@@ -203,12 +203,14 @@ impl<'a> PromptContext<'a> {
             return String::new();
         }
         let mut out = String::from(
-            "## Valid wikilink targets\n\n\
-             You may ONLY use `[[wikilinks]]` to pages in this list. \
-             Do NOT invent links to pages that don't exist.\n\n",
+            "## Exact page paths\n\n\
+             These are existing pages in the vault. To link to or update one, use its exact \
+             vault-relative path including the .md extension. You may ONLY use `[[wikilinks]]` \
+             to pages in this list. Do NOT invent links to pages that don't exist.\n\n",
         );
         for stem in self.all_page_stems {
-            let _ = writeln!(out, "- `[[{stem}]]`");
+            let normalized = stem.replace('\\', "/");
+            let _ = writeln!(out, "- `[[{normalized}]]`");
         }
         out.push('\n');
         out
@@ -530,5 +532,74 @@ mod tests {
         assert!(req.messages[0].content.contains("how does attention work"));
         assert!(req.messages[0].content.contains("Attention"));
         assert!(req.response_schema.is_some());
+    }
+
+    #[test]
+    fn render_valid_links_empty_stems_returns_empty() {
+        let ctx = PromptContext::with_stems("schema", &[], &[]);
+        let rendered = ctx.render_valid_links();
+        assert!(rendered.is_empty());
+    }
+
+    #[test]
+    fn render_valid_links_contains_full_paths() {
+        let stems = vec![
+            "wiki/concepts/attention.md".to_string(),
+            "wiki/topics/transformers.md".to_string(),
+        ];
+        let ctx = PromptContext::with_stems("schema", &[], &stems);
+        let rendered = ctx.render_valid_links();
+        assert!(rendered.contains("wiki/concepts/attention.md"));
+        assert!(rendered.contains("wiki/topics/transformers.md"));
+        assert!(rendered.contains("Exact page paths"));
+    }
+
+    #[test]
+    fn render_valid_links_each_path_on_own_line() {
+        let stems = vec![
+            "wiki/concepts/a.md".to_string(),
+            "wiki/concepts/b.md".to_string(),
+            "wiki/topics/c.md".to_string(),
+        ];
+        let ctx = PromptContext::with_stems("schema", &[], &stems);
+        let rendered = ctx.render_valid_links();
+        assert!(rendered.contains("- `[[wiki/concepts/a.md]]`\n"));
+        assert!(rendered.contains("- `[[wiki/concepts/b.md]]`\n"));
+        assert!(rendered.contains("- `[[wiki/topics/c.md]]`\n"));
+    }
+
+    #[test]
+    fn render_valid_links_normalizes_backslashes() {
+        let stems = vec!["wiki\\concepts\\attention.md".to_string()];
+        let ctx = PromptContext::with_stems("schema", &[], &stems);
+        let rendered = ctx.render_valid_links();
+        assert!(rendered.contains("wiki/concepts/attention.md"));
+        assert!(!rendered.contains('\\'));
+    }
+
+    #[test]
+    fn ingest_prompt_includes_valid_links_section_when_stems_provided() {
+        let page = sample_page();
+        let pages = [&page];
+        let stems = vec![
+            "wiki/concepts/attention.md".to_string(),
+            "wiki/topics/transformers.md".to_string(),
+        ];
+        let ctx = PromptContext::with_stems("# Rules\n", &pages, &stems);
+        let req = ingest_prompt(&ctx, "test.md", "source text");
+        let user_msg = &req.messages[0].content;
+        assert!(user_msg.contains("Exact page paths"));
+        assert!(user_msg.contains("wiki/concepts/attention.md"));
+        assert!(user_msg.contains("wiki/topics/transformers.md"));
+    }
+
+    #[test]
+    fn ingest_prompt_omits_valid_links_when_no_stems() {
+        let page = sample_page();
+        let pages = [&page];
+        let ctx = PromptContext::new("# Rules\n", &pages);
+        let req = ingest_prompt(&ctx, "test.md", "source text");
+        let user_msg = &req.messages[0].content;
+        assert!(!user_msg.contains("Exact page paths"));
     }
 }

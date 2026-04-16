@@ -93,6 +93,7 @@ pub async fn bulk_ingest(
 }
 
 /// Like [`bulk_ingest`] but with optional embeddings retrieval.
+#[allow(clippy::too_many_arguments)]
 pub async fn bulk_ingest_with_retrieval(
     vault: &Vault,
     provider: &dyn LlmProvider,
@@ -183,7 +184,7 @@ pub async fn bulk_ingest_with_retrieval(
         }
 
         // Save checkpoint periodically.
-        if (ingested + failed.len()) % options.checkpoint_interval == 0 {
+        if (ingested + failed.len()).is_multiple_of(options.checkpoint_interval) {
             save_checkpoint(
                 checkpoint_path.as_std_path(),
                 &dir_canonical,

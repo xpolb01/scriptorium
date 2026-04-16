@@ -123,6 +123,7 @@ pub fn run(vault: &Vault) -> Result<LintReport> {
         });
     }
     issues.extend(frontmatter::check(&scan.pages));
+    issues.extend(frontmatter::check_duplicate_stems(&scan.pages));
     issues.extend(broken_links::check(&graph));
     issues.extend(orphans::check(&graph));
     issues.extend(stale::check(vault, &scan.pages));

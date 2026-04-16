@@ -38,3 +38,12 @@ service-account*.json
 .idea/
 .vscode/
 *.swp
+
+# Sisyphus local plans/notepads/evidence
+.sisyphus/
+
+# Playwright dashboard QA harness
+node_modules/
+test-results/
+playwright-report/
+playwright/.cache/
