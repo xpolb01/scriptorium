@@ -314,6 +314,18 @@ enum HooksCommand {
         /// Path to JSONL file to import before starting.
         #[arg(long)]
         jsonl: Option<PathBuf>,
+        /// Path to Claude Code `settings.json`.
+        /// Defaults to `~/.claude/settings.json`.
+        #[arg(long)]
+        settings: Option<PathBuf>,
+        /// Path to the hooks directory containing `scriptorium-*.sh` scripts.
+        /// Defaults to `~/dotfiles/claude/hooks/`.
+        #[arg(long)]
+        hooks_dir: Option<PathBuf>,
+        /// Path to the scriptorium vault root (for vault-level info).
+        /// Defaults to the default vault from global config, if set.
+        #[arg(long)]
+        vault: Option<PathBuf>,
     },
 }
 
@@ -444,14 +456,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::VaultMgmt(sub) => handle_vault_command(sub),
         Command::Hooks(sub) => {
             #[cfg(feature = "dashboard")]
-            if let HooksCommand::Dashboard { port, no_browser, db, jsonl } = sub {
+            if let HooksCommand::Dashboard { port, no_browser, db, jsonl, settings, hooks_dir, vault } = sub {
                 let db_path = db.unwrap_or_else(default_hooks_db_path);
+                let settings_path = settings.unwrap_or_else(default_settings_path);
+                let hooks_dir_path = hooks_dir.unwrap_or_else(default_hooks_dir);
+                let vault_path = vault.or_else(|| {
+                    scriptorium_core::global_config::GlobalConfig::load()
+                        .ok()
+                        .and_then(|cfg| cfg.default_vault().map(|v| v.path.clone()))
+                });
                 if !no_browser {
                     let _ = std::process::Command::new("open")
                         .arg(format!("http://127.0.0.1:{port}"))
                         .spawn();
                 }
-                dashboard::start_dashboard(port, db_path, jsonl).await?;
+                dashboard::start_dashboard(port, db_path, jsonl, settings_path, hooks_dir_path, vault_path).await?;
                 return Ok(ExitCode::SUCCESS);
             }
             handle_hooks_command(sub)

@@ -38,3 +38,9 @@ service-account*.json
 .idea/
 .vscode/
 *.swp
+
+# Playwright dashboard QA harness
+node_modules/
+test-results/
+playwright-report/
+playwright/.cache/

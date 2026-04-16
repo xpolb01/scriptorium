@@ -16,7 +16,7 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::get;
 use axum::Router;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use scriptorium_core::hooks_store::HooksStore;
@@ -32,6 +32,9 @@ use scriptorium_core::hooks_store::HooksStore;
 #[derive(Clone)]
 struct AppState {
     db_path: PathBuf,
+    settings_path: PathBuf,
+    hooks_dir: PathBuf,
+    vault_path: Option<PathBuf>,
 }
 
 // ── Query parameter structs ──────────────────────────────────────────────
@@ -54,15 +57,6 @@ struct EventsParams {
 struct ErrorsParams {
     /// Maximum number of error events to return (default: 50).
     limit: Option<usize>,
-}
-
-// ── Health response ──────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct HealthResponse {
-    status: &'static str,
-    db_path: String,
-    db_accessible: bool,
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────
@@ -141,22 +135,46 @@ async fn errors_handler(
     Ok(Json(errors))
 }
 
-/// GET /api/health
-///
-/// Returns a health check report including DB accessibility.
+/// GET /api/health — Returns Vec<CheckItem> (session + vault merged).
 async fn health_handler(
     State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    let db_path = state.db_path.clone();
-    let db_accessible = tokio::task::spawn_blocking(move || HooksStore::open(&db_path).is_ok())
-        .await
-        .unwrap_or(false);
+) -> Result<Json<Vec<scriptorium_core::hooks_check::CheckItem>>, (StatusCode, Json<serde_json::Value>)>
+{
+    let settings_path = state.settings_path.clone();
+    let hooks_dir = state.hooks_dir.clone();
+    let vault_path = state.vault_path.clone();
 
-    Json(HealthResponse {
-        status: if db_accessible { "ok" } else { "degraded" },
-        db_path: state.db_path.display().to_string(),
-        db_accessible,
+    let items = tokio::task::spawn_blocking(move || {
+        use scriptorium_core::hooks_check::{
+            check_session_hooks, check_vault_hooks, CheckItem, CheckStatus,
+        };
+
+        let mut report = check_session_hooks(&settings_path, &hooks_dir);
+        if let Some(ref vp) = vault_path {
+            let vault = check_vault_hooks(vp);
+            report.items.extend(vault.items);
+        } else {
+            report.items.push(CheckItem {
+                name: "vault_check".to_string(),
+                status: CheckStatus::Info,
+                message: "no vault configured; pass --vault <PATH> or register a default vault"
+                    .to_string(),
+            });
+        }
+        report.items
     })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "internal",
+                "detail": "health check task panicked",
+            })),
+        )
+    })?;
+
+    Ok(Json(items))
 }
 
 /// GET /
@@ -179,6 +197,9 @@ pub async fn start_dashboard(
     port: u16,
     db_path: PathBuf,
     jsonl_path: Option<PathBuf>,
+    settings_path: PathBuf,
+    hooks_dir: PathBuf,
+    vault_path: Option<PathBuf>,
 ) -> miette::Result<()> {
     use miette::{miette, IntoDiagnostic};
 
@@ -210,7 +231,12 @@ pub async fn start_dashboard(
         .map_err(|e| miette!("cannot open hooks database: {e}"))?;
     drop(_verify);
 
-    let state = Arc::new(AppState { db_path });
+    let state = Arc::new(AppState {
+        db_path,
+        settings_path,
+        hooks_dir,
+        vault_path,
+    });
 
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
@@ -254,4 +280,120 @@ async fn shutdown_signal() {
         .await
         .expect("failed to install CTRL+C signal handler");
     eprintln!("\nShutting down dashboard…");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use scriptorium_core::hooks_check::{CheckItem, CheckStatus};
+    use tower::ServiceExt;
+
+    #[test]
+    fn app_state_carries_new_paths() {
+        let db_path = PathBuf::from("/tmp/hooks.sqlite");
+        let settings_path = PathBuf::from("/tmp/settings.json");
+        let hooks_dir = PathBuf::from("/tmp/hooks");
+        let vault_path = Some(PathBuf::from("/tmp/vault"));
+
+        let state = AppState {
+            db_path: db_path.clone(),
+            settings_path: settings_path.clone(),
+            hooks_dir: hooks_dir.clone(),
+            vault_path: vault_path.clone(),
+        };
+
+        assert_eq!(state.db_path, db_path);
+        assert_eq!(state.settings_path, settings_path);
+        assert_eq!(state.hooks_dir, hooks_dir);
+        assert_eq!(state.vault_path, vault_path);
+    }
+
+    fn build_test_router(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/api/health", get(health_handler))
+            .with_state(state)
+    }
+
+    async fn oneshot_health(state: Arc<AppState>) -> (StatusCode, Vec<u8>) {
+        let app = build_test_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, bytes)
+    }
+
+    #[tokio::test]
+    async fn health_handler_returns_checkitem_array() {
+        let state = Arc::new(AppState {
+            db_path: PathBuf::from("/tmp/health-t1.sqlite"),
+            settings_path: PathBuf::from("/nonexistent/settings.json"),
+            hooks_dir: PathBuf::from("/nonexistent/hooks"),
+            vault_path: None,
+        });
+
+        let (status, body) = oneshot_health(state).await;
+        assert_eq!(status, StatusCode::OK);
+        let items: Vec<CheckItem> = serde_json::from_slice(&body)
+            .unwrap_or_else(|e| panic!("response body must parse as Vec<CheckItem>: {e}"));
+        assert!(
+            !items.is_empty(),
+            "health endpoint must return at least one CheckItem"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_handler_missing_settings_surfaces_fail_item() {
+        let state = Arc::new(AppState {
+            db_path: PathBuf::from("/tmp/health-t2.sqlite"),
+            settings_path: PathBuf::from("/nonexistent/settings.json"),
+            hooks_dir: PathBuf::from("/nonexistent/hooks"),
+            vault_path: None,
+        });
+
+        let (status, body) = oneshot_health(state).await;
+        assert_eq!(status, StatusCode::OK);
+        let items: Vec<CheckItem> = serde_json::from_slice(&body).unwrap();
+        assert!(
+            items.iter().any(|i| i.status == CheckStatus::Fail),
+            "missing settings.json must produce at least one Fail item: {items:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_handler_no_vault_surfaces_info_item() {
+        let state = Arc::new(AppState {
+            db_path: PathBuf::from("/tmp/health-t3.sqlite"),
+            settings_path: PathBuf::from("/nonexistent/settings.json"),
+            hooks_dir: PathBuf::from("/nonexistent/hooks"),
+            vault_path: None,
+        });
+
+        let (status, body) = oneshot_health(state).await;
+        assert_eq!(status, StatusCode::OK);
+        let items: Vec<CheckItem> = serde_json::from_slice(&body).unwrap();
+        let vault_check = items
+            .iter()
+            .find(|i| i.name == "vault_check")
+            .expect("no vault → must include a vault_check item");
+        assert_eq!(vault_check.status, CheckStatus::Info);
+        assert!(
+            vault_check.message.contains("no vault configured"),
+            "vault_check message must explain absent vault: {}",
+            vault_check.message
+        );
+    }
+
 }

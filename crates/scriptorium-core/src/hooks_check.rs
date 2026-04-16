@@ -21,6 +21,7 @@ use crate::config::Config;
 
 /// Status of a single check item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// Contract: dashboard.html:renderHealth expects lowercase status strings. Do not change without updating the frontend.
 #[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
     Pass,
@@ -1536,6 +1537,25 @@ mod tests {
         assert!(parse_ts("2025-06-15T10:30:00.123456").is_some());
         assert!(parse_ts("2025-06-15T10:30:00").is_some());
         assert!(parse_ts("not-a-date").is_none());
+    }
+
+    // ── CheckStatus serde contract tests ─────────────────────────────
+
+    #[test]
+    fn check_status_serde_lowercase() {
+        let variants = vec![
+            (CheckStatus::Pass, "pass"),
+            (CheckStatus::Warn, "warn"),
+            (CheckStatus::Fail, "fail"),
+            (CheckStatus::Info, "info"),
+        ];
+        for (variant, expected_json_str) in variants {
+            let serialized = serde_json::to_string(&variant).unwrap();
+            assert_eq!(serialized, format!(r#""{}""#, expected_json_str));
+
+            let deserialized: CheckStatus = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(deserialized, variant);
+        }
     }
 
     // ── Settings parse test ──────────────────────────────────────────

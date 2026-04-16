@@ -42,7 +42,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -156,6 +156,14 @@ pub struct HooksSummary {
     pub last_ingest_ts: Option<String>,
     /// ISO-8601 timestamp of the last event overall.
     pub last_event_ts: Option<String>,
+    /// Count of `decision = 'ingest'` events since the start of the
+    /// current UTC day (midnight UTC). Independent of the `window`
+    /// parameter — always reflects today's activity.
+    pub ingests_today: u64,
+    /// Seconds since the last WAL checkpoint, computed from the mtime
+    /// of the `<db>-wal` file. `None` for in-memory stores or when the
+    /// `-wal` file is absent (e.g. immediately after a checkpoint).
+    pub wal_checkpoint_age_seconds: Option<u64>,
 }
 
 // ── JSONL Import ─────────────────────────────────────────────────────────
@@ -324,6 +332,7 @@ const BUSY_BACKOFF: Duration = Duration::from_millis(100);
 /// SQLite-backed hook event store.
 pub struct HooksStore {
     conn: Connection,
+    db_path: Option<PathBuf>,
 }
 
 impl HooksStore {
@@ -332,17 +341,17 @@ impl HooksStore {
     /// Sets WAL mode and busy timeout, then runs migrations.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).map_err(wrap_sql)?;
-        Self::init(conn)
+        Self::init(conn, Some(path.to_path_buf()))
     }
 
     /// In-memory store for tests.
     #[cfg(test)]
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().map_err(wrap_sql)?;
-        Self::init(conn)
+        Self::init(conn, None)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(conn: Connection, db_path: Option<PathBuf>) -> Result<Self> {
         conn.execute_batch(
             r"
             PRAGMA journal_mode = WAL;
@@ -384,7 +393,19 @@ impl HooksStore {
         )
         .map_err(wrap_sql)?;
 
-        Ok(Self { conn })
+        Ok(Self { conn, db_path })
+    }
+
+    fn wal_age_seconds(&self) -> Option<u64> {
+        let db_path = self.db_path.as_ref()?;
+        let mut wal = db_path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let wal_path = PathBuf::from(wal);
+        std::fs::metadata(&wal_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|mt| mt.elapsed().ok())
+            .map(|d| d.as_secs())
     }
 
     /// Compute the SHA-256 hex digest of raw JSON bytes.
@@ -690,6 +711,19 @@ impl HooksStore {
             .optional()
             .map_err(wrap_sql)?;
 
+        let ingests_today: u64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM hook_events \
+                 WHERE decision = 'ingest' \
+                 AND ts >= strftime('%Y-%m-%dT00:00:00Z', 'now')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(wrap_sql)?;
+
+        let wal_checkpoint_age_seconds = self.wal_age_seconds();
+
         Ok(HooksSummary {
             total_events,
             total_ingests,
@@ -704,6 +738,8 @@ impl HooksStore {
             privacy_vetoes,
             last_ingest_ts,
             last_event_ts,
+            ingests_today,
+            wal_checkpoint_age_seconds,
         })
     }
 
@@ -1428,6 +1464,66 @@ mod tests {
             total_expected as usize,
             "Expected {total_expected} events from {num_threads} threads × {events_per_thread} each, got {}",
             all_events.len()
+        );
+    }
+
+    #[test]
+    fn summary_has_ingests_today_for_today_only() {
+        let store = HooksStore::in_memory().unwrap();
+
+        let today_ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let yesterday_ts = (Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+
+        for i in 0..3 {
+            let mut e = test_event(&format!("today-{i}"), "ingest", 7);
+            e.ts = today_ts.clone();
+            e.raw_json_hash = HooksStore::hash_raw(&format!("today-ingest-{i}"));
+            store.insert_event(&e).unwrap();
+        }
+
+        for i in 0..2 {
+            let mut e = test_event(&format!("yest-{i}"), "ingest", 7);
+            e.ts = yesterday_ts.clone();
+            e.raw_json_hash = HooksStore::hash_raw(&format!("yesterday-ingest-{i}"));
+            store.insert_event(&e).unwrap();
+        }
+
+        let summary = store
+            .query_summary(Duration::from_secs(86_400 * 7))
+            .unwrap();
+        assert_eq!(
+            summary.ingests_today, 3,
+            "expected 3 ingests dated today; yesterday's 2 must not count"
+        );
+    }
+
+    #[test]
+    fn summary_wal_age_present_on_recent_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wal_age_test.sqlite");
+        let store = HooksStore::open(&db_path).unwrap();
+
+        let mut event = test_event("wal-age-sess", "ingest", 5);
+        event.ts = Utc::now().to_rfc3339();
+        event.raw_json_hash = HooksStore::hash_raw("wal-age-unique");
+        store.insert_event(&event).unwrap();
+
+        let summary = store.query_summary(Duration::from_secs(3600)).unwrap();
+        let age = summary
+            .wal_checkpoint_age_seconds
+            .expect("-wal file should exist after a write in WAL mode");
+        assert!(age < 60, "WAL age should be recent (< 60s), got {age}s");
+    }
+
+    #[test]
+    fn summary_wal_age_none_for_in_memory() {
+        let store = HooksStore::in_memory().unwrap();
+        let summary = store.query_summary(Duration::from_secs(3600)).unwrap();
+        assert!(
+            summary.wal_checkpoint_age_seconds.is_none(),
+            "in-memory store has no -wal file"
         );
     }
 
