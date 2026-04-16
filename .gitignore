@@ -39,6 +39,9 @@ service-account*.json
 .vscode/
 *.swp
 
+# Sisyphus local plans/notepads/evidence
+.sisyphus/
+
 # Playwright dashboard QA harness
 node_modules/
 test-results/
