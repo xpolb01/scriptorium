@@ -27,7 +27,7 @@ use scriptorium_core::hooks_store::HooksStore;
 ///
 /// Holds the DB path so each request opens its own [`HooksStore`] connection
 /// inside a blocking task. This sidesteps the `!Sync` constraint on
-/// `rusqlite::Connection` while letting WAL-mode SQLite serve concurrent
+/// `rusqlite::Connection` while letting WAL-mode `SQLite` serve concurrent
 /// readers without contention.
 #[derive(Clone)]
 struct AppState {
@@ -264,7 +264,6 @@ pub async fn start_dashboard(
 
     let _verify = HooksStore::open(&db_path)
         .map_err(|e| miette!("cannot open hooks database: {e}"))?;
-    drop(_verify);
 
     let state = Arc::new(AppState {
         db_path,
@@ -521,8 +520,7 @@ mod tests {
             error_json
                 .get("detail")
                 .and_then(|v| v.as_str())
-                .map(|s| s.contains("RFC3339"))
-                .unwrap_or(false),
+                .is_some_and(|s| s.contains("RFC3339")),
             "error response detail must mention RFC3339: {error_json:?}"
         );
     }

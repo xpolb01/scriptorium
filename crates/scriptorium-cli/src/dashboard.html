@@ -655,6 +655,43 @@
              return `${Math.floor(seconds / 86400)}d`;
          }
 
+         function appendBarRow(container, label, value, maxValue, fillClassName) {
+            const pct = (value / maxValue) * 100;
+
+            const row = document.createElement('div');
+            row.className = 'bar-row';
+
+            const labelCell = document.createElement('div');
+            labelCell.className = 'bar-label';
+            labelCell.title = label;
+            labelCell.textContent = label;
+
+            const track = document.createElement('div');
+            track.className = 'bar-track';
+
+            const fill = document.createElement('div');
+            fill.className = 'bar-fill';
+            if (fillClassName) fill.classList.add(fillClassName);
+            fill.style.width = pct + '%';
+            track.appendChild(fill);
+
+            const valueCell = document.createElement('div');
+            valueCell.className = 'bar-value';
+            valueCell.textContent = value;
+
+            row.appendChild(labelCell);
+            row.appendChild(track);
+            row.appendChild(valueCell);
+            container.appendChild(row);
+        }
+
+        function hookTypeClass(type) {
+            if (type === 'stop') return 'type-stop';
+            if (type === 'subagent-stop') return 'type-subagent-stop';
+            if (type === 'session-end') return 'type-session-end';
+            return '';
+        }
+
         function renderOverview(data) {
              // Stats
              document.getElementById('stat-total-events').textContent = data.total_events || 0;
@@ -686,131 +723,164 @@
             }
 
             // Score Distribution
-            renderBarChart('chart-scores', data.score_distribution || {}, 'var(--accent)');
-            
+            renderBarChart('chart-scores', data.score_distribution || {});
+
             // Signal Frequency
-            renderBarChart('chart-signals', data.signal_frequency || {}, 'var(--accent)');
+            renderBarChart('chart-signals', data.signal_frequency || {});
 
             // Hook Types (with colors)
             const hooksContainer = document.getElementById('chart-hooks');
-            hooksContainer.innerHTML = '';
-            
+            hooksContainer.replaceChildren();
+
             const hooks = data.by_hook_type || {};
             const maxHook = Math.max(...Object.values(hooks), 1);
-            
+
             Object.entries(hooks)
-                .sort((a,b) => b[1] - a[1])
+                .sort((a, b) => b[1] - a[1])
                 .forEach(([type, count]) => {
-                    const pct = (count / maxHook) * 100;
-                    const typeClass = type === 'stop' ? 'type-stop' : 
-                                      type === 'subagent-stop' ? 'type-subagent-stop' : 
-                                      type === 'session-end' ? 'type-session-end' : '';
-                                      
-                    hooksContainer.innerHTML += `
-                        <div class="bar-row">
-                            <div class="bar-label" title="${type}">${type}</div>
-                            <div class="bar-track">
-                                <div class="bar-fill ${typeClass}" style="width: ${pct}%"></div>
-                            </div>
-                            <div class="bar-value">${count}</div>
-                        </div>
-                    `;
+                    appendBarRow(hooksContainer, type, count, maxHook, hookTypeClass(type));
                 });
         }
 
-        function renderBarChart(containerId, dataObj, color) {
+        function renderBarChart(containerId, dataObj) {
             const container = document.getElementById(containerId);
-            container.innerHTML = '';
-            
-            const entries = Object.entries(dataObj).sort((a,b) => b[1] - a[1]).slice(0, 10);
+            container.replaceChildren();
+
+            const entries = Object.entries(dataObj).sort((a, b) => b[1] - a[1]).slice(0, 10);
             if (entries.length === 0) {
-                container.innerHTML = '<div style="color: var(--text-muted); font-size: 0.875rem;">No data</div>';
+                const placeholder = document.createElement('div');
+                placeholder.style.color = 'var(--text-muted)';
+                placeholder.style.fontSize = '0.875rem';
+                placeholder.textContent = 'No data';
+                container.appendChild(placeholder);
                 return;
             }
-            
+
             const maxVal = Math.max(...entries.map(e => e[1]), 1);
-            
+
             entries.forEach(([label, value]) => {
-                const pct = (value / maxVal) * 100;
-                container.innerHTML += `
-                    <div class="bar-row">
-                        <div class="bar-label" title="${label}">${label}</div>
-                        <div class="bar-track">
-                            <div class="bar-fill" style="width: ${pct}%; background-color: ${color}"></div>
-                        </div>
-                        <div class="bar-value">${value}</div>
-                    </div>
-                `;
+                appendBarRow(container, label, value, maxVal);
             });
         }
 
         function renderEvents(data) {
             const tbody = document.getElementById('eventsTableBody');
-            tbody.innerHTML = '';
-            
+            tbody.replaceChildren();
+
             if (!data || !data.length) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted);">No events found</td></tr>';
+                const emptyRow = document.createElement('tr');
+                const emptyCell = document.createElement('td');
+                emptyCell.colSpan = 6;
+                emptyCell.style.textAlign = 'center';
+                emptyCell.style.color = 'var(--text-muted)';
+                emptyCell.textContent = 'No events found';
+                emptyRow.appendChild(emptyCell);
+                tbody.appendChild(emptyRow);
                 return;
             }
-            
+
             data.forEach(evt => {
                 const d = new Date(evt.ts);
                 const timeStr = d.toLocaleString();
-                
+
                 // Truncate session ID
-                const sessId = (evt.session_id || '').substring(0, 12) + ((evt.session_id || '').length > 12 ? '...' : '');
-                
+                const fullSessId = evt.session_id || '';
+                const sessId = fullSessId.substring(0, 12) + (fullSessId.length > 12 ? '...' : '');
+
                 // Truncate signals
                 let signalsText = '';
+                let signalsTitle = '';
                 if (Array.isArray(evt.signals)) {
                     signalsText = evt.signals.slice(0, 3).join(', ');
                     if (evt.signals.length > 3) signalsText += ` (+${evt.signals.length - 3} more)`;
+                    signalsTitle = evt.signals.join(',');
                 } else if (typeof evt.signals === 'string') {
                     signalsText = evt.signals.substring(0, 50) + (evt.signals.length > 50 ? '...' : '');
+                    signalsTitle = evt.signals;
                 }
-                
+
                 const decision = (evt.decision || 'skip').toLowerCase();
-                const rowClass = `row-${decision}`;
-                const decClass = `decision-${decision}`;
-                
-                tbody.innerHTML += `
-                    <tr class="${rowClass}">
-                        <td class="mono">${timeStr}</td>
-                        <td class="mono" title="${evt.session_id}">${sessId}</td>
-                        <td>${evt.hook_type || '-'}</td>
-                        <td class="mono">${evt.score !== undefined ? evt.score : '-'}</td>
-                        <td title="${evt.signals}">${signalsText}</td>
-                        <td class="${decClass}">${decision.toUpperCase()}</td>
-                    </tr>
-                `;
+
+                const row = document.createElement('tr');
+                row.className = 'row-' + decision;
+
+                const timeCell = document.createElement('td');
+                timeCell.className = 'mono';
+                timeCell.textContent = timeStr;
+
+                const sessCell = document.createElement('td');
+                sessCell.className = 'mono';
+                sessCell.title = fullSessId;
+                sessCell.textContent = sessId;
+
+                const hookCell = document.createElement('td');
+                hookCell.textContent = evt.hook_type || '-';
+
+                const scoreCell = document.createElement('td');
+                scoreCell.className = 'mono';
+                scoreCell.textContent = evt.score !== undefined ? evt.score : '-';
+
+                const signalsCell = document.createElement('td');
+                signalsCell.title = signalsTitle;
+                signalsCell.textContent = signalsText;
+
+                const decisionCell = document.createElement('td');
+                decisionCell.className = 'decision-' + decision;
+                decisionCell.textContent = decision.toUpperCase();
+
+                row.appendChild(timeCell);
+                row.appendChild(sessCell);
+                row.appendChild(hookCell);
+                row.appendChild(scoreCell);
+                row.appendChild(signalsCell);
+                row.appendChild(decisionCell);
+                tbody.appendChild(row);
             });
         }
 
         function renderHealth(data) {
             const grid = document.getElementById('healthGrid');
-            grid.innerHTML = '';
-            
+            grid.replaceChildren();
+
             // data should be array of CheckItem: { name, status (Pass|Warn|Fail), message }
             const checks = Array.isArray(data) ? data : data.checks || [];
-            
+
             if (checks.length === 0) {
-                grid.innerHTML = '<div style="color: var(--text-muted); padding: 1rem;">No health checks reported.</div>';
+                const placeholder = document.createElement('div');
+                placeholder.style.color = 'var(--text-muted)';
+                placeholder.style.padding = '1rem';
+                placeholder.textContent = 'No health checks reported.';
+                grid.appendChild(placeholder);
                 return;
             }
-            
+
             checks.forEach(chk => {
                 const status = (chk.status || 'unknown').toLowerCase();
-                const statusClass = `status-${status}`;
-                
-                grid.innerHTML += `
-                    <div class="health-item">
-                        <div class="health-status ${statusClass}">${status}</div>
-                        <div class="health-details">
-                            <div class="health-name">${chk.name || chk.id || 'Unknown Check'}</div>
-                            <div class="health-msg">${chk.message || chk.msg || ''}</div>
-                        </div>
-                    </div>
-                `;
+
+                const item = document.createElement('div');
+                item.className = 'health-item';
+
+                const statusBadge = document.createElement('div');
+                statusBadge.className = 'health-status status-' + status;
+                statusBadge.textContent = status;
+
+                const details = document.createElement('div');
+                details.className = 'health-details';
+
+                const nameEl = document.createElement('div');
+                nameEl.className = 'health-name';
+                nameEl.textContent = chk.name || chk.id || 'Unknown Check';
+
+                const msgEl = document.createElement('div');
+                msgEl.className = 'health-msg';
+                msgEl.textContent = chk.message || chk.msg || '';
+
+                details.appendChild(nameEl);
+                details.appendChild(msgEl);
+
+                item.appendChild(statusBadge);
+                item.appendChild(details);
+                grid.appendChild(item);
             });
         }
 
