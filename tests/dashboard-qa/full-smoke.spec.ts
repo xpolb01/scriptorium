@@ -7,7 +7,7 @@ test('navigates all 3 tabs with content visible', async ({ page }) => {
   // Overview
   await expect(page.locator('#overview')).toBeVisible();
   await expect(page.locator('#stat-ingests')).toBeVisible();
-  await expect(page.locator('#walCheckpointText')).toBeVisible();
+  await expect(page.locator('#lagText')).toBeVisible();
 
   // Events tab
   await page.click('[data-target="events"]');
@@ -32,8 +32,8 @@ test('window switch preserves Ingests Today', async ({ page }) => {
 
 test('WAL checkpoint label matches expected format', async ({ page }) => {
   await page.goto('/');
-  await page.waitForSelector('#walCheckpointText');
-  const txt = await page.locator('#walCheckpointText').textContent() ?? '';
+  await page.waitForSelector('#lagText');
+  const txt = await page.locator('#lagText').textContent() ?? '';
   expect(txt).not.toContain('Syncing');
   expect(txt).toMatch(/(WAL checkpoint: unknown)|(WAL last checkpoint: \d+[smhd] ago)/);
 });

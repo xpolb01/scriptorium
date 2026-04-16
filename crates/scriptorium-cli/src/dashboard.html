@@ -424,7 +424,7 @@
         <div style="margin-bottom: 2rem; display: flex; justify-content: space-between; align-items: center;">
             <div class="lag-indicator" id="lagIndicator">
                 <div class="dot"></div>
-                <span id="walCheckpointText">WAL checkpoint: unknown</span>
+                <span id="lagText">WAL checkpoint: unknown</span>
             </div>
             <div style="font-size: 0.875rem; color: var(--text-muted);">
                 Last Ingest: <span id="lastIngestTs" class="mono">-</span>
@@ -703,16 +703,16 @@
             document.getElementById('stat-avg-score').textContent = typeof avg === 'number' ? avg.toFixed(1) : avg;
             document.getElementById('stat-peak-score').textContent = data.peak_score || 0;
 
-            // Lag Indicator & Timestamps
-            if (data.last_ingest_ts) {
-                const d = new Date(data.last_ingest_ts);
-                document.getElementById('lastIngestTs').textContent = d.toLocaleString();
-            } else {
-                document.getElementById('lastIngestTs').textContent = 'Never';
-            }
+             // Lag Indicator & Timestamps
+             if (data.last_ingest_ts) {
+                 const d = new Date(data.last_ingest_ts);
+                 document.getElementById('lastIngestTs').textContent = d.toLocaleString();
+             } else {
+                 document.getElementById('lastIngestTs').textContent = 'Never';
+             }
 
-            const walInd = document.getElementById('lagIndicator');
-            const walText = document.getElementById('walCheckpointText');
+             const walInd = document.getElementById('lagIndicator');
+             const walText = document.getElementById('lagText');
             walInd.className = 'lag-indicator';
             if (data.wal_checkpoint_age_seconds == null) {
                 walText.textContent = 'WAL checkpoint: unknown';

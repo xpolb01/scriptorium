@@ -2,9 +2,9 @@ import { expect, test } from '@playwright/test';
 
 test('WAL checkpoint age renders with concrete number', async ({ page }) => {
   await page.goto('/');
-  await page.waitForSelector('#walCheckpointText');
+  await page.waitForSelector('#lagText');
   
-  const walText = await page.locator('#walCheckpointText').textContent();
+  const walText = await page.locator('#lagText').textContent();
   expect(walText).toMatch(/WAL last checkpoint: \d+[smhd] ago/);
   expect(walText).not.toContain('Syncing');
 });
