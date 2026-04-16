@@ -26,10 +26,11 @@ test('Health tab renders CheckItems from /api/health', async ({ page }) => {
   }
 });
 
-test('Missing hooks_dir surfaces a fail item', async ({ page }) => {
-  const response = await page.evaluate(() => fetch('/api/health').then(r => r.json()));
-  
-  const hasFail = response.some((item: any) => item.status === 'fail');
+test('Missing hooks_dir surfaces a fail item', async ({ request }) => {
+  const response = await request.get('/api/health');
+  expect(response.status()).toBe(200);
+  const body = await response.json();
+  const hasFail = body.some((item: { status: string }) => item.status === 'fail');
   expect(hasFail).toBe(true);
 });
 
