@@ -754,7 +754,7 @@
             }
             
             data.forEach(evt => {
-                const d = new Date(evt.timestamp || evt.ts);
+                const d = new Date(evt.ts);
                 const timeStr = d.toLocaleString();
                 
                 // Truncate session ID

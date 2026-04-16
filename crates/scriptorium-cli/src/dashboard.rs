@@ -92,13 +92,21 @@ async fn summary_handler(
 async fn events_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<EventsParams>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let limit = params.limit.unwrap_or(50);
-    let since = params.since.and_then(|s| {
-        chrono::DateTime::parse_from_rfc3339(&s)
-            .ok()
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-    });
+    
+    let since = if let Some(s) = params.since {
+        match chrono::DateTime::parse_from_rfc3339(&s) {
+            Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
+            Err(e) => return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "invalid_since",
+                "detail": format!("`since` must be RFC3339: {e}")
+            })))),
+        }
+    } else {
+        None
+    };
+    
     let db_path = state.db_path.clone();
 
     let events = tokio::task::spawn_blocking(move || {
@@ -108,9 +116,36 @@ async fn events_handler(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "internal",
+                "detail": "events query task panicked",
+            })),
+        )
+    })?
+    .map_err(|status_code| {
+        (
+            status_code,
+            Json(serde_json::json!({
+                "error": "internal",
+                "detail": "failed to query events",
+            })),
+        )
+    })?;
 
-    Ok(Json(events))
+    let events_value = serde_json::to_value(events).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "internal",
+                "detail": "failed to serialize events",
+            })),
+        )
+    })?;
+
+    Ok(Json(events_value))
 }
 
 /// GET /api/errors?limit=N
@@ -396,4 +431,99 @@ mod tests {
         );
     }
 
+    fn build_events_router(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/api/events", get(events_handler))
+            .with_state(state)
+    }
+
+    async fn oneshot_events(state: Arc<AppState>, uri: &str) -> (StatusCode, Vec<u8>) {
+        let app = build_events_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, bytes)
+    }
+
+    #[tokio::test]
+    async fn events_handler_missing_since_works() {
+        let state = Arc::new(AppState {
+            db_path: PathBuf::from("/tmp/events-t1.sqlite"),
+            settings_path: PathBuf::from("/nonexistent/settings.json"),
+            hooks_dir: PathBuf::from("/nonexistent/hooks"),
+            vault_path: None,
+        });
+
+        let (status, _body) = oneshot_events(state, "/api/events").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "missing since parameter must return 200 OK"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_handler_valid_since_parses() {
+        let state = Arc::new(AppState {
+            db_path: PathBuf::from("/tmp/events-t2.sqlite"),
+            settings_path: PathBuf::from("/nonexistent/settings.json"),
+            hooks_dir: PathBuf::from("/nonexistent/hooks"),
+            vault_path: None,
+        });
+
+        let (status, _body) =
+            oneshot_events(state, "/api/events?since=2026-04-16T08:00:00Z").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "valid RFC3339 since parameter must return 200 OK"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_handler_invalid_since_400() {
+        let state = Arc::new(AppState {
+            db_path: PathBuf::from("/tmp/events-t3.sqlite"),
+            settings_path: PathBuf::from("/nonexistent/settings.json"),
+            hooks_dir: PathBuf::from("/nonexistent/hooks"),
+            vault_path: None,
+        });
+
+        let (status, body) = oneshot_events(state, "/api/events?since=not-a-date").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "invalid RFC3339 since parameter must return 400 BAD_REQUEST"
+        );
+
+        let error_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("response body must be valid JSON");
+        assert_eq!(
+            error_json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "invalid_since",
+            "error response must contain error field with value 'invalid_since'"
+        );
+        assert!(
+            error_json
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("RFC3339"))
+                .unwrap_or(false),
+            "error response detail must mention RFC3339: {error_json:?}"
+        );
+    }
 }
