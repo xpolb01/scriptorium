@@ -211,8 +211,7 @@ fn e2e_cross_process_trace() {
         .env("SCRIPTORIUM_TRACEPARENT", &traceparent)
         .args([
             "trace",
-            "span",
-            "start",
+            "span-start",
             "--name",
             "child.work",
             "--source",
@@ -227,7 +226,7 @@ fn e2e_cross_process_trace() {
     assert_eq!(child_trace_id, parent_trace_id);
 
     scriptorium_cmd(home.path())
-        .args(["trace", "span", "end", "--span-id", &child_span_id])
+        .args(["trace", "span-end", "--span-id", &child_span_id])
         .assert()
         .success();
 
@@ -337,8 +336,7 @@ fn e2e_dangling_span() {
     let span_start = scriptorium_cmd(home.path())
         .args([
             "trace",
-            "span",
-            "start",
+            "span-start",
             "--name",
             "dangling.op",
             "--source",
@@ -456,61 +454,45 @@ fn e2e_payload_cap() {
 
 #[test]
 fn e2e_dropped_marker() {
-    // We exercise this in-process: hold an immediate writer transaction
-    // on the same SQLite file and drive insert_log. With a tight busy
-    // timeout the second writer is forced to drop, which both increments
-    // GLOBAL_STATS.dropped_count and writes a `telemetry.dropped` marker
-    // (via record_dropped_event).
-    let (_home, db) = fresh_home();
-    {
-        let _bootstrap = open_store(&db);
-    }
-
-    // Hold an exclusive write lock from a separate connection.
-    let blocker = rusqlite::Connection::open(&db).unwrap();
-    blocker
-        .execute_batch("BEGIN IMMEDIATE; INSERT INTO resources(attributes, attributes_hash) VALUES ('{}', 'lock-holder');")
-        .unwrap();
-
-    // Reduce the contender's busy_timeout so Dropped fires deterministically.
-    let store = open_store(&db);
-    {
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.busy_timeout(Duration::from_millis(50)).unwrap();
-    }
+    // Open the store, then remove its parent directory so subsequent
+    // Connection::open calls inside insert_log fail with an I/O error.
+    // This deterministically triggers record_dropped_event, which
+    // increments GLOBAL_STATS.dropped_count. Mirrors the
+    // `drop_marker_on_exhaustion` unit test in telemetry/store.rs.
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("subdir");
+    std::fs::create_dir_all(&parent).unwrap();
+    let db = parent.join("hooks.sqlite");
+    let store = TelemetryStore::open(&db).expect("open store");
 
     let before = GLOBAL_STATS
         .dropped_count
         .load(std::sync::atomic::Ordering::Relaxed);
 
-    // Try a series of inserts; some should be dropped while the blocker
-    // holds the writer lock.
-    for i in 0..20u32 {
-        let mut log =
-            LogRecord::with_severity(format!("contender-{i}"), SeverityNumber::INFO, Source::Cli);
-        let resource = Resource::detect(Source::Cli, None);
-        let _ = store.insert_resource(&resource);
-        log.resource_id = store
-            .get_resource_id_by_hash(&resource.attributes_hash)
-            .unwrap_or(1);
-        log.attributes = Attributes::new();
-        let _ = store.insert_log(&log);
-    }
+    std::fs::remove_dir_all(&parent).unwrap();
 
-    // Release the lock.
-    blocker.execute_batch("ROLLBACK;").unwrap();
-    drop(blocker);
+    let mut log = LogRecord::with_severity("dropped-e2e", SeverityNumber::INFO, Source::Cli);
+    let resource = Resource::detect(Source::Cli, None);
+    let _ = store.insert_resource(&resource);
+    log.resource_id = store
+        .get_resource_id_by_hash(&resource.attributes_hash)
+        .unwrap_or(1);
+    log.attributes = Attributes::new();
+    let outcome = store.insert_log(&log);
+    assert!(
+        matches!(
+            outcome,
+            scriptorium_core::telemetry::InsertOutcome::Dropped(_)
+        ),
+        "insert_log should return Dropped, got {outcome:?}"
+    );
 
     let after = GLOBAL_STATS
         .dropped_count
         .load(std::sync::atomic::Ordering::Relaxed);
-
-    // EITHER global stats incremented OR a dropped marker landed in store.
-    let (rows, _) = store.query_logs(LogFilters::default(), None, 1000).unwrap();
-    let marker_present = rows.iter().any(|r| r.body == "telemetry.dropped");
     assert!(
-        after > before || marker_present,
-        "expected dropped_count to increment or telemetry.dropped marker present (before={before}, after={after}, marker_present={marker_present})"
+        after > before,
+        "dropped_count should increment (before={before}, after={after})"
     );
 }
 

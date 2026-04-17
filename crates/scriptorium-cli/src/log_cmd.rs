@@ -16,9 +16,10 @@ use std::time::Duration;
 use clap::{Args, Subcommand};
 use miette::{miette, Result};
 use scriptorium_core::telemetry::envelope::SpanId;
+use scriptorium_core::telemetry::payload::{add_truncation_attrs, cap_attributes, cap_body};
 use scriptorium_core::telemetry::{
-    Attributes, InsertOutcome, LogFilters, LogRecord, LogRow, Resource, SeverityNumber, Source,
-    TelemetryStore, TraceContext, TraceId,
+    payload_cap_from_env, Attributes, InsertOutcome, LogFilters, LogRecord, LogRow, Resource,
+    SeverityNumber, Source, TelemetryStore, TraceContext, TraceId,
 };
 use serde_json::Value;
 
@@ -213,8 +214,21 @@ fn emit(db_path: &PathBuf) {
         .get_resource_id_by_hash(&resource.attributes_hash)
         .unwrap_or(1);
 
-    let mut log = LogRecord::with_severity(body, severity, source);
-    log.attributes = attributes;
+    // Apply payload caps consistently with the tracing Layer path so a
+    // 32 KiB body emitted via the CLI is truncated to ≤ max_body_bytes
+    // and decorated with telemetry.truncated{,_fields} attributes.
+    let cap = payload_cap_from_env();
+    let (capped_body, body_meta) = cap_body(&body, &cap);
+    let (mut capped_attrs, mut attr_metas) = cap_attributes(attributes, &cap);
+    if let Some(m) = body_meta {
+        attr_metas.insert(0, m);
+    }
+    if !attr_metas.is_empty() {
+        add_truncation_attrs(&mut capped_attrs, &attr_metas);
+    }
+
+    let mut log = LogRecord::with_severity(capped_body, severity, source);
+    log.attributes = capped_attrs;
     log.trace_id = trace_id;
     log.span_id = span_id;
     log.resource_id = resource_id;
