@@ -19,8 +19,11 @@
 //! the types defined here.
 
 pub mod envelope;
+pub mod resource;
+pub mod schema;
 
 pub use envelope::{
     payload_cap_from_env, Attributes, LogRecord, PayloadCap, SeverityNumber, Source, Span,
     SpanEvent, SpanId, SpanKind, Status, TraceId, DEFAULT_PAYLOAD_CAP,
 };
+pub use resource::Resource;
