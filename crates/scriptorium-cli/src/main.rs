@@ -252,6 +252,19 @@ enum HooksCommand {
         dry_run: bool,
     },
 
+    /// Backfill existing `hook_events` rows into the new OTel-shaped
+    /// `logs`/`spans` tables. Idempotent and safe to re-run.
+    MigrateBackfill {
+        /// Path to the hooks `SQLite` database.
+        /// Defaults to `~/.scriptorium/hooks.sqlite`.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Walk the data and report what would be inserted, but do not
+        /// write.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Run health checks on Claude Code hook registrations.
     ///
     /// By default runs static checks only (registration, permissions,
@@ -1435,6 +1448,7 @@ fn handle_hooks_command(sub: HooksCommand) -> Result<ExitCode> {
         }
         HooksCommand::Migrate { jsonl, db, dry_run }
         | HooksCommand::Import { jsonl, db, dry_run } => hooks_import_inner(jsonl, db, dry_run),
+        HooksCommand::MigrateBackfill { db, dry_run } => hooks_migrate_backfill_inner(db, dry_run),
         HooksCommand::Check {
             test,
             json,
@@ -1574,6 +1588,29 @@ fn hooks_import_inner(
         }
     }
 
+    Ok(ExitCode::SUCCESS)
+}
+
+fn hooks_migrate_backfill_inner(db_path: Option<PathBuf>, dry_run: bool) -> Result<ExitCode> {
+    let db = db_path.unwrap_or_else(default_hooks_db_path);
+    if let Some(parent) = db.parent() {
+        std::fs::create_dir_all(parent).into_diagnostic()?;
+    }
+    eprintln!("target: {}", db.display());
+    if dry_run {
+        eprintln!("mode:   dry-run (no writes)");
+    }
+
+    let store = scriptorium_core::telemetry::TelemetryStore::open(&db)
+        .map_err(|e| miette!("open telemetry store: {e}"))?;
+
+    let report = scriptorium_core::telemetry::backfill_hook_events(&store, dry_run)
+        .map_err(|e| miette!("backfill: {e}"))?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|e| miette!("json: {e}"))?
+    );
     Ok(ExitCode::SUCCESS)
 }
 
