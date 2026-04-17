@@ -24,7 +24,12 @@ use scriptorium_core::llm::{
     ClaudeConfig, ClaudeProvider, GeminiConfig, GeminiProvider, LlmProvider, MockProvider,
     OllamaConfig, OllamaProvider, OpenAiConfig, OpenAiProvider,
 };
+use scriptorium_core::telemetry::store::GLOBAL_STATS;
+use scriptorium_core::telemetry::{
+    cap_body, install_global, Source, TelemetryStore, DEFAULT_PAYLOAD_CAP,
+};
 use scriptorium_core::{self as core, ingest, query, Vault};
+use tracing::Instrument;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -452,21 +457,139 @@ enum ProviderKind {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
+    // Global fmt subscriber as a fallback. `install_global` below uses a
+    // thread-local scoped default which supersedes this for the duration
+    // of `main`; the global remains as a safety net if telemetry init
+    // fails.
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "scriptorium=info".into()),
         )
-        .init();
+        .try_init();
 
     let cli = Cli::parse();
-    match run(cli).await {
+
+    if std::env::var_os("RUST_LOG").is_none() {
+        std::env::set_var("RUST_LOG", "scriptorium=info");
+    }
+
+    // ── Install the telemetry tracing::Layer once per CLI invocation.
+    // Best-effort: on failure we stderr + bump GLOBAL_STATS.dropped_count
+    // and continue without telemetry. CLI never fails due to telemetry. ──
+    let telemetry_source = select_source(&cli.command);
+    let _telemetry_guard = install_telemetry_layer(telemetry_source);
+
+    // ── Wrap every subcommand dispatch in a `cli.command` span. ──
+    let cmd_name = command_name_for_span(&cli.command);
+    let is_setup = matches!(cli.command, Command::Setup);
+    let span = tracing::info_span!("cli.command", command = cmd_name, otel.kind = "server");
+
+    let result = async move {
+        // Setup subcommand omits args structurally (plan T12 guardrail
+        // carve-out): the wizard takes API keys on stdin, so the span
+        // records only command + duration + exit_code. This is NOT
+        // content-based redaction.
+        if is_setup {
+            tracing::info!("cli.command.start");
+        } else {
+            let args = format_args_for_telemetry(&cli.command);
+            tracing::info!(command_args = %args, "cli.command.start");
+        }
+        let res = run(cli).await;
+        match &res {
+            Ok(_) => tracing::info!(otel.status = "ok", "cli.command.end"),
+            Err(e) => {
+                tracing::error!(otel.status = "error", error = %e, "cli.command.end");
+            }
+        }
+        res
+    }
+    .instrument(span)
+    .await;
+
+    match result {
         Ok(code) => code,
         Err(err) => {
             eprintln!("{err:?}");
             ExitCode::from(2)
         }
     }
+}
+
+/// Subcommand-aware source selection (plan T12).
+///
+/// - `Serve`          → [`Source::Mcp`] (this process is the MCP stdio server)
+/// - `Hooks::Log`     → [`Source::Hook`]
+/// - everything else  → [`Source::Cli`]
+///
+/// The `Log(emit)` subcommand reads its logical source from the stdin
+/// JSON payload (T17), so the layer default stays `Cli` for that case.
+fn select_source(cmd: &Command) -> Source {
+    match cmd {
+        Command::Serve { .. } => Source::Mcp,
+        Command::Hooks(HooksCommand::Log { .. }) => Source::Hook,
+        _ => Source::Cli,
+    }
+}
+
+/// Install the SQLite-backed tracing layer. Returns `None` on failure
+/// (store open error); in that case the CLI continues without
+/// telemetry and `GLOBAL_STATS.dropped_count` is incremented. This is
+/// the best-effort contract: telemetry must never fail the CLI.
+fn install_telemetry_layer(source: Source) -> Option<tracing::dispatcher::DefaultGuard> {
+    let db_path = default_hooks_db_path();
+    if let Some(parent) = db_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match TelemetryStore::open(&db_path) {
+        Ok(store) => Some(install_global(Arc::new(store), source, None)),
+        Err(e) => {
+            eprintln!("telemetry: store open failed, running without telemetry: {e}");
+            GLOBAL_STATS
+                .dropped_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// Map every `Command` variant to a short static subcommand name used
+/// as the `command` attribute on the `cli.command` span.
+fn command_name_for_span(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::Setup => "setup",
+        Command::Init { .. } => "init",
+        Command::Ingest { .. } => "ingest",
+        Command::Query { .. } => "query",
+        Command::Reindex { .. } => "reindex",
+        Command::Lint { .. } => "lint",
+        Command::Undo => "undo",
+        Command::Doctor { .. } => "doctor",
+        Command::Maintain { .. } => "maintain",
+        Command::BulkIngest { .. } => "bulk-ingest",
+        Command::Config => "config",
+        Command::Skill(_) => "skill",
+        Command::Learn(_) => "learn",
+        Command::Bench { .. } => "bench",
+        Command::Serve { .. } => "serve",
+        Command::Watch { .. } => "watch",
+        Command::Social(_) => "social",
+        Command::VaultMgmt(_) => "vault",
+        Command::Hooks(_) => "hooks",
+        Command::Log(_) => "log",
+        Command::Trace(_) => "trace",
+    }
+}
+
+/// Render the parsed command as the `command_args` attribute on the
+/// `cli.command.start` event. Size-capped via T8's `cap_body`; no
+/// content-based redaction. The Setup variant is excluded by the
+/// caller (structural carve-out).
+fn format_args_for_telemetry(cmd: &Command) -> String {
+    let debug = format!("{cmd:?}");
+    let (capped, _meta) = cap_body(&debug, &DEFAULT_PAYLOAD_CAP);
+    capped
 }
 
 #[allow(clippy::too_many_lines)] // one arm per subcommand; flat is clearer
