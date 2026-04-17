@@ -16,7 +16,7 @@ use scriptorium_core::Vault;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 use crate::tools::{ToolError, ToolRegistry};
 
@@ -198,33 +198,83 @@ async fn tools_call(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let result = registry.invoke(&name, arguments, context).await;
-    match result {
-        Ok(text) => Ok(json!({
-            "content": [{"type": "text", "text": text}],
-            "isError": false,
-        })),
-        Err(ToolError::NotFound(name)) => Err(JsonRpcError {
-            code: error_codes::METHOD_NOT_FOUND,
-            message: format!("no such tool: {name}"),
-            data: None,
-        }),
-        Err(ToolError::InvalidArgs(msg)) => Err(JsonRpcError {
-            code: error_codes::INVALID_PARAMS,
-            message: msg,
-            data: None,
-        }),
-        Err(ToolError::Failed(msg)) => {
-            // Tool failures are returned as isError content so the client
-            // can display them, while non-tool errors (invalid params,
-            // method not found) become JSON-RPC errors.
-            error!(tool = %name, error = %msg, "tool failed");
-            Ok(json!({
-                "content": [{"type": "text", "text": msg}],
-                "isError": true,
-            }))
+    let tool_full_name: &str = name.as_str();
+    let tool_name: &str = tool_full_name
+        .strip_prefix("scriptorium_")
+        .unwrap_or(tool_full_name);
+    let span = tracing::info_span!(
+        "mcp.tool",
+        tool_name = %tool_name,
+        tool_full_name = %tool_full_name,
+        otel.kind = "server",
+    );
+
+    async move {
+        // Cap the params preview so we don't log unbounded payloads.
+        let params_json = serde_json::to_string(&req.params).unwrap_or_default();
+        let (params_preview, _trunc_meta) = scriptorium_core::telemetry::payload::cap_body(
+            &params_json,
+            &scriptorium_core::telemetry::envelope::DEFAULT_PAYLOAD_CAP,
+        );
+        tracing::info!(params = %params_preview, "mcp.tool.start");
+
+        let t0 = std::time::Instant::now();
+        let result = registry.invoke(&name, arguments, context).await;
+        let duration_ms = t0.elapsed().as_millis() as u64;
+
+        match &result {
+            Ok(text) => {
+                tracing::info!(
+                    result_size = text.len(),
+                    duration_ms = duration_ms,
+                    otel.status = "ok",
+                    "mcp.tool.end",
+                );
+            }
+            Err(e) => {
+                let msg = match e {
+                    ToolError::NotFound(n) => format!("not found: {n}"),
+                    ToolError::InvalidArgs(m) => format!("invalid args: {m}"),
+                    ToolError::Failed(m) => format!("failed: {m}"),
+                };
+                tracing::error!(
+                    error = %msg,
+                    duration_ms = duration_ms,
+                    otel.status = "error",
+                    "mcp.tool.end",
+                );
+            }
+        }
+
+        match result {
+            Ok(text) => Ok(json!({
+                "content": [{"type": "text", "text": text}],
+                "isError": false,
+            })),
+            Err(ToolError::NotFound(name)) => Err(JsonRpcError {
+                code: error_codes::METHOD_NOT_FOUND,
+                message: format!("no such tool: {name}"),
+                data: None,
+            }),
+            Err(ToolError::InvalidArgs(msg)) => Err(JsonRpcError {
+                code: error_codes::INVALID_PARAMS,
+                message: msg,
+                data: None,
+            }),
+            Err(ToolError::Failed(msg)) => {
+                // Tool failures are returned as isError content so the client
+                // can display them, while non-tool errors (invalid params,
+                // method not found) become JSON-RPC errors.
+                error!(tool = %name, error = %msg, "tool failed");
+                Ok(json!({
+                    "content": [{"type": "text", "text": msg}],
+                    "isError": true,
+                }))
+            }
         }
     }
+    .instrument(span)
+    .await
 }
 
 fn error_response(id: Value, code: i32, message: String) -> JsonRpcResponse {
