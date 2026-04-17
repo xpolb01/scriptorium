@@ -23,6 +23,7 @@ pub mod payload;
 pub mod propagation;
 pub mod resource;
 pub mod schema;
+pub mod store;
 
 pub use envelope::{
     payload_cap_from_env, Attributes, LogRecord, PayloadCap, SeverityNumber, Source, Span,
@@ -31,3 +32,7 @@ pub use envelope::{
 pub use payload::{add_truncation_attrs, cap_attributes, cap_body, cap_bytes, TruncationMeta};
 pub use propagation::{TraceContext, ENV_SESSION_ID, ENV_TRACEPARENT, ENV_TURN_ID};
 pub use resource::Resource;
+pub use store::{
+    Cursor, DropReason, InsertOutcome, LogFilters, LogRow, SpanFilters, SpanRow, TelemetryStats,
+    TelemetryStore, TimelineEntry, TimelineResult, TraceTree, GLOBAL_STATS,
+};
