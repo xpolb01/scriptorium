@@ -32,6 +32,7 @@ directories.workspace = true
 fd-lock.workspace = true
 sha2.workspace = true
 ulid.workspace = true
+rand.workspace = true
 schemars.workspace = true
 jsonschema.workspace = true
 rusqlite.workspace = true
