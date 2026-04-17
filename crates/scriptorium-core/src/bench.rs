@@ -105,13 +105,11 @@ pub fn load_suite(vault: &Vault) -> Result<BenchmarkSuite> {
 pub fn save_suite(vault: &Vault, suite: &BenchmarkSuite) -> Result<()> {
     let path = vault.meta_dir().join(BENCHMARKS_FILE);
     if let Some(parent) = path.as_std_path().parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| Error::io(parent.to_path_buf(), e))?;
+        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent.to_path_buf(), e))?;
     }
     let json = serde_json::to_string_pretty(suite)
         .map_err(|e| Error::Other(anyhow::anyhow!("serialize: {e}")))?;
-    std::fs::write(path.as_std_path(), json)
-        .map_err(|e| Error::io(path.into_std_path_buf(), e))?;
+    std::fs::write(path.as_std_path(), json).map_err(|e| Error::io(path.into_std_path_buf(), e))?;
     Ok(())
 }
 
@@ -262,10 +260,7 @@ fn recall_score(retrieved: &[String], expected: &[String]) -> f32 {
     if expected.is_empty() {
         return 1.0; // vacuously true
     }
-    let hits = retrieved
-        .iter()
-        .filter(|r| expected.contains(r))
-        .count();
+    let hits = retrieved.iter().filter(|r| expected.contains(r)).count();
     hits as f32 / expected.len() as f32
 }
 
@@ -307,7 +302,11 @@ fn ndcg_at_k(retrieved: &[String], expected: &[String], k: usize) -> f32 {
         .take(k)
         .enumerate()
         .map(|(i, stem)| {
-            let rel = if expected.contains(stem) { 1.0_f32 } else { 0.0 };
+            let rel = if expected.contains(stem) {
+                1.0_f32
+            } else {
+                0.0
+            };
             rel / (i as f32 + 2.0).log2()
         })
         .sum();

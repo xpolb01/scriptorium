@@ -55,7 +55,11 @@ pub fn rrf_fuse(lists: &[Vec<SearchHit>]) -> Vec<SearchHit> {
         })
         .collect();
 
-    fused.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    fused.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     fused
 }
 
@@ -64,7 +68,11 @@ pub fn rrf_fuse(lists: &[Vec<SearchHit>]) -> Vec<SearchHit> {
 /// logical chunk even when scores differ across retrieval methods.
 fn identity_key(hit: &SearchHit) -> String {
     let text_prefix = if hit.chunk_text.len() > 50 {
-        &hit.chunk_text[..hit.chunk_text.char_indices().nth(50).map_or(hit.chunk_text.len(), |(i, _)| i)]
+        &hit.chunk_text[..hit
+            .chunk_text
+            .char_indices()
+            .nth(50)
+            .map_or(hit.chunk_text.len(), |(i, _)| i)]
     } else {
         &hit.chunk_text
     };

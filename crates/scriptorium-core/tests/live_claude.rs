@@ -20,7 +20,9 @@ fn provider_or_skip() -> Option<ClaudeProvider> {
     let config = match ClaudeConfig::from_env() {
         Ok(c) => c,
         Err(_) => {
-            eprintln!("SKIP: SCRIPTORIUM_ANTHROPIC_API_KEY not available, skipping live Claude test");
+            eprintln!(
+                "SKIP: SCRIPTORIUM_ANTHROPIC_API_KEY not available, skipping live Claude test"
+            );
             return None;
         }
     };

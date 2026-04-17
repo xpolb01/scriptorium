@@ -122,9 +122,18 @@ fn check_vault(vault: &Vault) -> DoctorCheck {
             format!("Vault at {}, {page_count} wiki pages", vault.root()),
         )
     } else if root_ok {
-        DoctorCheck::warn("vault_exists", format!("Vault root exists but wiki/ missing at {}", vault.wiki_dir()))
+        DoctorCheck::warn(
+            "vault_exists",
+            format!(
+                "Vault root exists but wiki/ missing at {}",
+                vault.wiki_dir()
+            ),
+        )
     } else {
-        DoctorCheck::fail("vault_exists", format!("Vault root not found: {}", vault.root()))
+        DoctorCheck::fail(
+            "vault_exists",
+            format!("Vault root not found: {}", vault.root()),
+        )
     }
 }
 
@@ -161,10 +170,9 @@ fn check_schema(vault: &Vault) -> DoctorCheck {
 fn check_sqlite(store: Option<&EmbeddingsStore>) -> DoctorCheck {
     match store {
         Some(s) => match s.len() {
-            Ok(count) => DoctorCheck::ok(
-                "sqlite_db",
-                format!("Embeddings store open, {count} rows"),
-            ),
+            Ok(count) => {
+                DoctorCheck::ok("sqlite_db", format!("Embeddings store open, {count} rows"))
+            }
             Err(e) => DoctorCheck::fail("sqlite_db", format!("Embeddings store error: {e}")),
         },
         None => DoctorCheck::warn("sqlite_db", "No embeddings database found"),
@@ -177,7 +185,11 @@ fn check_embedding_coverage(vault: &Vault, store: &EmbeddingsStore) -> DoctorChe
         return DoctorCheck::ok("embedding_coverage", "No pages to embed");
     }
     let embedded = store.distinct_page_count().unwrap_or(0);
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     let pct = (embedded as f64 / page_count as f64 * 100.0) as u32;
     if pct >= 90 {
         DoctorCheck::ok(
@@ -259,10 +271,9 @@ fn check_skills(vault: &Vault) -> DoctorCheck {
 
 fn check_learnings(vault: &Vault) -> DoctorCheck {
     match crate::learnings::list_recent(vault, 1000) {
-        Ok(entries) if entries.is_empty() => DoctorCheck::ok(
-            "learnings",
-            "No learnings yet (journal empty)",
-        ),
+        Ok(entries) if entries.is_empty() => {
+            DoctorCheck::ok("learnings", "No learnings yet (journal empty)")
+        }
         Ok(entries) => {
             let now = chrono::Utc::now();
             let active = entries
@@ -271,7 +282,11 @@ fn check_learnings(vault: &Vault) -> DoctorCheck {
                 .count();
             DoctorCheck::ok(
                 "learnings",
-                format!("{} learnings ({active} active, {} decayed)", entries.len(), entries.len() - active),
+                format!(
+                    "{} learnings ({active} active, {} decayed)",
+                    entries.len(),
+                    entries.len() - active
+                ),
             )
         }
         Err(e) => DoctorCheck::warn("learnings", format!("Could not load learnings: {e}")),
@@ -314,7 +329,11 @@ mod tests {
 
         let report = run_doctor(&vault, None);
         // vault_exists should be Ok.
-        let vault_check = report.checks.iter().find(|c| c.name == "vault_exists").unwrap();
+        let vault_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "vault_exists")
+            .unwrap();
         assert_eq!(vault_check.status, CheckStatus::Ok);
         // git_repo should be Ok.
         let git_check = report.checks.iter().find(|c| c.name == "git_repo").unwrap();
@@ -329,7 +348,11 @@ mod tests {
         let vault = Vault::open(dir.path()).unwrap();
 
         let report = run_doctor(&vault, None);
-        let schema_check = report.checks.iter().find(|c| c.name == "schema_exists").unwrap();
+        let schema_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "schema_exists")
+            .unwrap();
         assert_eq!(schema_check.status, CheckStatus::Warn);
     }
 
@@ -341,7 +364,11 @@ mod tests {
         let vault = Vault::open(dir.path()).unwrap();
 
         let report = run_doctor(&vault, None);
-        let db_check = report.checks.iter().find(|c| c.name == "sqlite_db").unwrap();
+        let db_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "sqlite_db")
+            .unwrap();
         assert_eq!(db_check.status, CheckStatus::Warn);
         // No embedding_coverage or stale_embeddings checks should appear.
         assert!(report.checks.iter().all(|c| c.name != "embedding_coverage"));
@@ -374,8 +401,16 @@ See [[nonexistent_page]] for details.
 
         let vault = Vault::open(dir.path()).unwrap();
         let report = run_doctor(&vault, None);
-        let link_check = report.checks.iter().find(|c| c.name == "broken_links").unwrap();
+        let link_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "broken_links")
+            .unwrap();
         assert_eq!(link_check.status, CheckStatus::Warn);
-        assert!(link_check.message.contains("broken"), "message: {}", link_check.message);
+        assert!(
+            link_check.message.contains("broken"),
+            "message: {}",
+            link_check.message
+        );
     }
 }

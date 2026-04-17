@@ -268,7 +268,9 @@ mod tests {
         assert_eq!(doc.url, "https://example.com/hello");
         assert!(doc.title.to_lowercase().contains("hello"));
         assert!(doc.markdown.contains("> Source: https://example.com/hello"));
-        assert!(doc.markdown.contains("> Fetched: 2026-04-07T12:00:00+00:00"));
+        assert!(doc
+            .markdown
+            .contains("> Fetched: 2026-04-07T12:00:00+00:00"));
         assert!(doc.markdown.contains("# Hello World"));
         assert!(doc.markdown.contains("first paragraph"));
         assert!(doc.markdown.contains("second paragraph"));
@@ -282,7 +284,9 @@ mod tests {
             </article></body></html>";
         let doc = convert(html, "https://example.com/untitled", fake_time()).unwrap();
         assert!(!doc.title.is_empty());
-        assert!(doc.markdown.contains("> Source: https://example.com/untitled"));
+        assert!(doc
+            .markdown
+            .contains("> Source: https://example.com/untitled"));
     }
 
     #[test]
@@ -329,7 +333,8 @@ mod tests {
         let html = format!("<html><head><title>Long</title></head><body>{body}</body></html>");
         let doc = convert(&html, "https://example.com/long", fake_time()).unwrap();
         assert!(
-            doc.markdown.contains("[truncated by scriptorium url-ingest]"),
+            doc.markdown
+                .contains("[truncated by scriptorium url-ingest]"),
             "expected truncation marker in markdown of length {}",
             doc.markdown.len()
         );

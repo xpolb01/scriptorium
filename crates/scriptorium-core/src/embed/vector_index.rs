@@ -80,9 +80,10 @@ impl Default for LinearIndex {
 
 impl VectorIndex for LinearIndex {
     fn insert(&self, id: u64, vector: &[f32]) -> Result<()> {
-        let mut entries = self.entries.write().map_err(|e| {
-            Error::Other(anyhow::anyhow!("LinearIndex lock poisoned: {e}"))
-        })?;
+        let mut entries = self
+            .entries
+            .write()
+            .map_err(|e| Error::Other(anyhow::anyhow!("LinearIndex lock poisoned: {e}")))?;
         // Overwrite if exists.
         if let Some(existing) = entries.iter_mut().find(|(eid, _)| *eid == id) {
             existing.1 = vector.to_vec();
@@ -96,9 +97,10 @@ impl VectorIndex for LinearIndex {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let entries = self.entries.read().map_err(|e| {
-            Error::Other(anyhow::anyhow!("LinearIndex lock poisoned: {e}"))
-        })?;
+        let entries = self
+            .entries
+            .read()
+            .map_err(|e| Error::Other(anyhow::anyhow!("LinearIndex lock poisoned: {e}")))?;
         let mut scored: Vec<(u64, f32)> = entries
             .iter()
             .filter(|(_, v)| v.len() == query.len())
@@ -116,9 +118,10 @@ impl VectorIndex for LinearIndex {
     }
 
     fn remove(&self, id: u64) -> Result<()> {
-        let mut entries = self.entries.write().map_err(|e| {
-            Error::Other(anyhow::anyhow!("LinearIndex lock poisoned: {e}"))
-        })?;
+        let mut entries = self
+            .entries
+            .write()
+            .map_err(|e| Error::Other(anyhow::anyhow!("LinearIndex lock poisoned: {e}")))?;
         entries.retain(|(eid, _)| *eid != id);
         Ok(())
     }
@@ -173,10 +176,8 @@ mod hnsw_impl {
             idx.inner
                 .load(path.to_str().unwrap_or(""))
                 .map_err(|e| Error::Other(anyhow::anyhow!("usearch load: {e}")))?;
-            idx.count.store(
-                idx.inner.size(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            idx.count
+                .store(idx.inner.size(), std::sync::atomic::Ordering::Relaxed);
             Ok(idx)
         }
     }
@@ -186,7 +187,8 @@ mod hnsw_impl {
             self.inner
                 .add(id, vector)
                 .map_err(|e| Error::Other(anyhow::anyhow!("usearch insert: {e}")))?;
-            self.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
 
@@ -198,16 +200,13 @@ mod hnsw_impl {
                 .inner
                 .search(query, k)
                 .map_err(|e| Error::Other(anyhow::anyhow!("usearch search: {e}")))?;
-            Ok(results
-                .keys
-                .into_iter()
-                .zip(results.distances)
-                .collect())
+            Ok(results.keys.into_iter().zip(results.distances).collect())
         }
 
         fn remove(&self, id: u64) -> Result<()> {
             let _ = self.inner.remove(id);
-            self.count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.count
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
 
@@ -248,7 +247,10 @@ mod tests {
         let results = idx.search(&unit(vec![0.9, 0.1, 0.0]), 2).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, 1, "x-axis vector should be nearest");
-        assert!(results[0].1 < results[1].1, "first result should have lower distance");
+        assert!(
+            results[0].1 < results[1].1,
+            "first result should have lower distance"
+        );
     }
 
     #[test]
@@ -273,7 +275,10 @@ mod tests {
         // Search near y-axis — the overwritten vector should match.
         let results = idx.search(&[0.0, 1.0], 1).unwrap();
         assert_eq!(results[0].0, 1);
-        assert!(results[0].1 < 0.01, "should be very close to y-axis after overwrite");
+        assert!(
+            results[0].1 < 0.01,
+            "should be very close to y-axis after overwrite"
+        );
     }
 
     #[test]

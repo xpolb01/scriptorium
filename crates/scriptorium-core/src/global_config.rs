@@ -33,8 +33,7 @@ pub struct GlobalConfig {
 impl GlobalConfig {
     /// Platform-appropriate config directory.
     pub fn config_dir() -> Option<PathBuf> {
-        directories::ProjectDirs::from("", "", APP_NAME)
-            .map(|dirs| dirs.config_dir().to_path_buf())
+        directories::ProjectDirs::from("", "", APP_NAME).map(|dirs| dirs.config_dir().to_path_buf())
     }
 
     /// Full path to the global config file.
@@ -45,9 +44,8 @@ impl GlobalConfig {
     /// Load from the platform default path. Returns `Default` if the file
     /// does not exist.
     pub fn load() -> Result<Self> {
-        let path = Self::config_path().ok_or_else(|| {
-            Error::Other(anyhow::anyhow!("cannot determine config directory"))
-        })?;
+        let path = Self::config_path()
+            .ok_or_else(|| Error::Other(anyhow::anyhow!("cannot determine config directory")))?;
         Self::load_from(&path)
     }
 
@@ -63,9 +61,8 @@ impl GlobalConfig {
 
     /// Save to the platform default path, creating parent dirs.
     pub fn save(&self) -> Result<()> {
-        let path = Self::config_path().ok_or_else(|| {
-            Error::Other(anyhow::anyhow!("cannot determine config directory"))
-        })?;
+        let path = Self::config_path()
+            .ok_or_else(|| Error::Other(anyhow::anyhow!("cannot determine config directory")))?;
         self.save_to(&path)
     }
 
@@ -140,8 +137,14 @@ mod tests {
 
         assert_eq!(loaded.default.as_deref(), Some("main"));
         assert_eq!(loaded.vaults.len(), 2);
-        assert_eq!(loaded.find("main").unwrap().path, PathBuf::from("/home/user/vault"));
-        assert_eq!(loaded.find("work").unwrap().path, PathBuf::from("/home/user/work-vault"));
+        assert_eq!(
+            loaded.find("main").unwrap().path,
+            PathBuf::from("/home/user/vault")
+        );
+        assert_eq!(
+            loaded.find("work").unwrap().path,
+            PathBuf::from("/home/user/work-vault")
+        );
     }
 
     #[test]

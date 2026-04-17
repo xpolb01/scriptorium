@@ -99,7 +99,8 @@ pub async fn hybrid_search(
     }
 
     // 4. Keyword search on the original query.
-    let kw_hits = store.keyword_search(question, embed_provider.name(), model, opts.keyword_limit)?;
+    let kw_hits =
+        store.keyword_search(question, embed_provider.name(), model, opts.keyword_limit)?;
     all_lists.push(kw_hits);
 
     // 5. RRF fusion.
@@ -163,11 +164,19 @@ mod tests {
 
         // Chunk A: high cosine similarity to query direction [1,0,0].
         store
-            .upsert(&embed_row(id_a, "alpha vector match", unit(vec![0.95, 0.05, 0.0])))
+            .upsert(&embed_row(
+                id_a,
+                "alpha vector match",
+                unit(vec![0.95, 0.05, 0.0]),
+            ))
             .unwrap();
         // Chunk B: low cosine similarity but contains the keyword "quantum".
         store
-            .upsert(&embed_row(id_b, "quantum mechanics is fascinating", unit(vec![0.0, 0.0, 1.0])))
+            .upsert(&embed_row(
+                id_b,
+                "quantum mechanics is fascinating",
+                unit(vec![0.0, 0.0, 1.0]),
+            ))
             .unwrap();
 
         let mock = MockProvider::constant(""); // expansion will fail → falls back to original
@@ -185,7 +194,10 @@ mod tests {
 
         // Should find at least the keyword match.
         let has_keyword_hit = results.iter().any(|h| h.chunk_text.contains("quantum"));
-        assert!(has_keyword_hit, "keyword-only match should appear in hybrid results");
+        assert!(
+            has_keyword_hit,
+            "keyword-only match should appear in hybrid results"
+        );
     }
 
     #[tokio::test]

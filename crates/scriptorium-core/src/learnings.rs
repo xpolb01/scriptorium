@@ -83,8 +83,7 @@ pub fn capture(vault: &Vault, learning: &Learning) -> Result<()> {
 
     // Ensure the directory exists.
     if let Some(parent) = path.as_std_path().parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| Error::io(parent.to_path_buf(), e))?;
+        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent.to_path_buf(), e))?;
     }
 
     let mut file = std::fs::OpenOptions::new()
@@ -92,8 +91,7 @@ pub fn capture(vault: &Vault, learning: &Learning) -> Result<()> {
         .append(true)
         .open(path.as_std_path())
         .map_err(|e| Error::io(path.clone().into_std_path_buf(), e))?;
-    writeln!(file, "{json}")
-        .map_err(|e| Error::io(path.into_std_path_buf(), e))?;
+    writeln!(file, "{json}").map_err(|e| Error::io(path.into_std_path_buf(), e))?;
     Ok(())
 }
 
@@ -115,10 +113,7 @@ pub fn retrieve(vault: &Vault, tags: &[&str], limit: usize) -> Result<Vec<Learni
 
     // If tags are provided, boost entries that match.
     if tags.is_empty() {
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     } else {
         scored.sort_by(|a, b| {
             let a_match = tag_match_score(&a.0, tags);
@@ -131,11 +126,7 @@ pub fn retrieve(vault: &Vault, tags: &[&str], limit: usize) -> Result<Vec<Learni
         });
     }
 
-    Ok(scored
-        .into_iter()
-        .take(limit)
-        .map(|(l, _)| l)
-        .collect())
+    Ok(scored.into_iter().take(limit).map(|(l, _)| l).collect())
 }
 
 /// Search learnings by keyword in the `insight` and `key` fields.
@@ -179,8 +170,7 @@ pub fn prune_stale(vault: &Vault) -> Result<usize> {
         for l in &keep {
             let json = serde_json::to_string(l)
                 .map_err(|e| Error::Other(anyhow::anyhow!("serialize: {e}")))?;
-            writeln!(file, "{json}")
-                .map_err(|e| Error::io(path.clone().into_std_path_buf(), e))?;
+            writeln!(file, "{json}").map_err(|e| Error::io(path.clone().into_std_path_buf(), e))?;
         }
     }
     Ok(pruned_count)
@@ -297,7 +287,12 @@ mod tests {
     use super::*;
     use chrono::Duration;
 
-    fn make_learning(key: &str, lt: LearningType, confidence: u8, source: LearningSource) -> Learning {
+    fn make_learning(
+        key: &str,
+        lt: LearningType,
+        confidence: u8,
+        source: LearningSource,
+    ) -> Learning {
         Learning {
             ts: Utc::now(),
             skill: "test".into(),
@@ -318,7 +313,12 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".scriptorium")).unwrap();
         let vault = crate::vault::Vault::open(dir.path()).unwrap();
 
-        let l = make_learning("test-key", LearningType::Pattern, 7, LearningSource::Observed);
+        let l = make_learning(
+            "test-key",
+            LearningType::Pattern,
+            7,
+            LearningSource::Observed,
+        );
         capture(&vault, &l).unwrap();
         capture(&vault, &l).unwrap();
 
@@ -333,12 +333,22 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".scriptorium")).unwrap();
         let vault = crate::vault::Vault::open(dir.path()).unwrap();
 
-        let mut l1 = make_learning("dup-key", LearningType::Pitfall, 5, LearningSource::Observed);
+        let mut l1 = make_learning(
+            "dup-key",
+            LearningType::Pitfall,
+            5,
+            LearningSource::Observed,
+        );
         l1.ts = Utc::now() - Duration::hours(1);
         l1.insight = "old insight".into();
         capture(&vault, &l1).unwrap();
 
-        let l2 = make_learning("dup-key", LearningType::Pitfall, 8, LearningSource::Observed);
+        let l2 = make_learning(
+            "dup-key",
+            LearningType::Pitfall,
+            8,
+            LearningSource::Observed,
+        );
         capture(&vault, &l2).unwrap();
 
         let results = retrieve(&vault, &[], 10).unwrap();
@@ -357,7 +367,12 @@ mod tests {
         l1.tags = vec!["llm".into(), "ingest".into()];
         capture(&vault, &l1).unwrap();
 
-        let mut l2 = make_learning("untagged", LearningType::Pattern, 9, LearningSource::Observed);
+        let mut l2 = make_learning(
+            "untagged",
+            LearningType::Pattern,
+            9,
+            LearningSource::Observed,
+        );
         l2.tags = vec!["unrelated".into()];
         capture(&vault, &l2).unwrap();
 
@@ -380,7 +395,12 @@ mod tests {
 
     #[test]
     fn user_stated_does_not_decay() {
-        let mut l = make_learning("pref", LearningType::Preference, 8, LearningSource::UserStated);
+        let mut l = make_learning(
+            "pref",
+            LearningType::Preference,
+            8,
+            LearningSource::UserStated,
+        );
         l.ts = Utc::now() - Duration::days(365);
         let eff = effective_confidence(&l, Utc::now());
         assert!((eff - 8.0).abs() < 0.01, "user-stated should not decay");
@@ -393,7 +413,12 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".scriptorium")).unwrap();
         let vault = crate::vault::Vault::open(dir.path()).unwrap();
 
-        let mut l = make_learning("search-test", LearningType::Pattern, 7, LearningSource::Observed);
+        let mut l = make_learning(
+            "search-test",
+            LearningType::Pattern,
+            7,
+            LearningSource::Observed,
+        );
         l.insight = "Claude sometimes omits log_entry on large ingests".into();
         capture(&vault, &l).unwrap();
 

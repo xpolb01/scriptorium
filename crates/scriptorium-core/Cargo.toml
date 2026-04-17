@@ -31,6 +31,7 @@ camino.workspace = true
 directories.workspace = true
 fd-lock.workspace = true
 sha2.workspace = true
+base64.workspace = true
 ulid.workspace = true
 rand.workspace = true
 hostname.workspace = true

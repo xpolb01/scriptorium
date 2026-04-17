@@ -94,19 +94,24 @@ async fn events_handler(
     Query(params): Query<EventsParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let limit = params.limit.unwrap_or(50);
-    
+
     let since = if let Some(s) = params.since {
         match chrono::DateTime::parse_from_rfc3339(&s) {
             Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
-            Err(e) => return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": "invalid_since",
-                "detail": format!("`since` must be RFC3339: {e}")
-            })))),
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_since",
+                        "detail": format!("`since` must be RFC3339: {e}")
+                    })),
+                ))
+            }
         }
     } else {
         None
     };
-    
+
     let db_path = state.db_path.clone();
 
     let events = tokio::task::spawn_blocking(move || {
@@ -173,8 +178,10 @@ async fn errors_handler(
 /// GET /api/health — Returns Vec<CheckItem> (session + vault merged).
 async fn health_handler(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<scriptorium_core::hooks_check::CheckItem>>, (StatusCode, Json<serde_json::Value>)>
-{
+) -> Result<
+    Json<Vec<scriptorium_core::hooks_check::CheckItem>>,
+    (StatusCode, Json<serde_json::Value>),
+> {
     let settings_path = state.settings_path.clone();
     let hooks_dir = state.hooks_dir.clone();
     let vault_path = state.vault_path.clone();
@@ -245,8 +252,7 @@ pub async fn start_dashboard(
     if let Some(ref jsonl) = jsonl_path {
         if jsonl.exists() {
             eprintln!("Importing events from {}…", jsonl.display());
-            let store =
-                HooksStore::open(&db_path).map_err(|e| miette!("open hooks db: {e}"))?;
+            let store = HooksStore::open(&db_path).map_err(|e| miette!("open hooks db: {e}"))?;
             let report = store
                 .import_jsonl(jsonl, false)
                 .map_err(|e| miette!("import: {e}"))?;
@@ -262,8 +268,8 @@ pub async fn start_dashboard(
         }
     }
 
-    let _verify = HooksStore::open(&db_path)
-        .map_err(|e| miette!("cannot open hooks database: {e}"))?;
+    let _verify =
+        HooksStore::open(&db_path).map_err(|e| miette!("cannot open hooks database: {e}"))?;
 
     let state = Arc::new(AppState {
         db_path,
@@ -275,9 +281,7 @@ pub async fn start_dashboard(
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
             |origin: &HeaderValue, _parts: &_| {
-                origin
-                    .as_bytes()
-                    .starts_with(b"http://127.0.0.1")
+                origin.as_bytes().starts_with(b"http://127.0.0.1")
                     || origin.as_bytes().starts_with(b"http://localhost")
             },
         ))
@@ -439,12 +443,7 @@ mod tests {
     async fn oneshot_events(state: Arc<AppState>, uri: &str) -> (StatusCode, Vec<u8>) {
         let app = build_events_router(state);
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(uri)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -481,8 +480,7 @@ mod tests {
             vault_path: None,
         });
 
-        let (status, _body) =
-            oneshot_events(state, "/api/events?since=2026-04-16T08:00:00Z").await;
+        let (status, _body) = oneshot_events(state, "/api/events?since=2026-04-16T08:00:00Z").await;
         assert_eq!(
             status,
             StatusCode::OK,

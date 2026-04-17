@@ -231,7 +231,13 @@ impl EmbeddingsStore {
                 r"SELECT rowid FROM embeddings
                   WHERE page_id = ?1 AND content_hash = ?2 AND chunk_idx = ?3
                     AND provider = ?4 AND model = ?5",
-                params![page_id_str, row.content_hash, chunk_idx, row.provider, row.model],
+                params![
+                    page_id_str,
+                    row.content_hash,
+                    chunk_idx,
+                    row.provider,
+                    row.model
+                ],
                 |r| r.get(0),
             )
             .map_err(wrap_sql)?;
@@ -243,7 +249,14 @@ impl EmbeddingsStore {
             .execute(
                 r"INSERT INTO fts_chunks(rowid, page_id, chunk_text, heading, provider, model)
                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![rowid, page_id_str, row.chunk_text, row.heading, row.provider, row.model],
+                params![
+                    rowid,
+                    page_id_str,
+                    row.chunk_text,
+                    row.heading,
+                    row.provider,
+                    row.model
+                ],
             )
             .map_err(wrap_sql)?;
 
@@ -802,9 +815,15 @@ mod tests {
         let pruned = store.retain_page_versions(&keep).unwrap();
         assert_eq!(pruned, 2, "both C chunks should have been pruned");
         assert_eq!(store.len().unwrap(), 4);
-        assert!(store.has_page_version(a, "a-hash", "mock", "mock-1").unwrap());
-        assert!(store.has_page_version(b, "b-hash", "mock", "mock-1").unwrap());
-        assert!(!store.has_page_version(c, "c-hash", "mock", "mock-1").unwrap());
+        assert!(store
+            .has_page_version(a, "a-hash", "mock", "mock-1")
+            .unwrap());
+        assert!(store
+            .has_page_version(b, "b-hash", "mock", "mock-1")
+            .unwrap());
+        assert!(!store
+            .has_page_version(c, "c-hash", "mock", "mock-1")
+            .unwrap());
     }
 
     /// Retaining [(A, "hash-2")] when the store has rows for A at both
@@ -833,8 +852,12 @@ mod tests {
         let pruned = store.retain_page_versions(&keep).unwrap();
         assert_eq!(pruned, 2, "both hash-1 rows should have been pruned");
         assert_eq!(store.len().unwrap(), 1);
-        assert!(!store.has_page_version(a, "hash-1", "mock", "mock-1").unwrap());
-        assert!(store.has_page_version(a, "hash-2", "mock", "mock-1").unwrap());
+        assert!(!store
+            .has_page_version(a, "hash-1", "mock", "mock-1")
+            .unwrap());
+        assert!(store
+            .has_page_version(a, "hash-2", "mock", "mock-1")
+            .unwrap());
     }
 
     /// An empty keep set deletes every row. Sanity check for the "vault
@@ -881,7 +904,13 @@ mod tests {
         let store = EmbeddingsStore::in_memory().unwrap();
         let id = PageId::new();
         store
-            .upsert(&row(id, "h1", 0, "the quick brown fox", unit(vec![1.0, 0.0])))
+            .upsert(&row(
+                id,
+                "h1",
+                0,
+                "the quick brown fox",
+                unit(vec![1.0, 0.0]),
+            ))
             .unwrap();
         let fts_count: i64 = store
             .conn
@@ -912,7 +941,10 @@ mod tests {
         assert_eq!(fts_count, 1, "FTS5 should have only one row after prune");
         // Keyword search for "beta" should return nothing.
         let hits = store.keyword_search("beta", "mock", "mock-1", 10).unwrap();
-        assert!(hits.is_empty(), "pruned chunk should not appear in keyword search");
+        assert!(
+            hits.is_empty(),
+            "pruned chunk should not appear in keyword search"
+        );
     }
 
     /// Keyword search returns chunks matching the query term.
@@ -921,15 +953,35 @@ mod tests {
         let store = EmbeddingsStore::in_memory().unwrap();
         let id = PageId::new();
         store
-            .upsert(&row(id, "h1", 0, "photosynthesis is vital for plants", unit(vec![1.0, 0.0, 0.0])))
+            .upsert(&row(
+                id,
+                "h1",
+                0,
+                "photosynthesis is vital for plants",
+                unit(vec![1.0, 0.0, 0.0]),
+            ))
             .unwrap();
         store
-            .upsert(&row(id, "h1", 1, "quantum mechanics explains wave behavior", unit(vec![0.0, 1.0, 0.0])))
+            .upsert(&row(
+                id,
+                "h1",
+                1,
+                "quantum mechanics explains wave behavior",
+                unit(vec![0.0, 1.0, 0.0]),
+            ))
             .unwrap();
         store
-            .upsert(&row(id, "h1", 2, "climate change affects biodiversity", unit(vec![0.0, 0.0, 1.0])))
+            .upsert(&row(
+                id,
+                "h1",
+                2,
+                "climate change affects biodiversity",
+                unit(vec![0.0, 0.0, 1.0]),
+            ))
             .unwrap();
-        let hits = store.keyword_search("photosynthesis", "mock", "mock-1", 10).unwrap();
+        let hits = store
+            .keyword_search("photosynthesis", "mock", "mock-1", 10)
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].chunk_text.contains("photosynthesis"));
     }
@@ -940,10 +992,22 @@ mod tests {
         let store = EmbeddingsStore::in_memory().unwrap();
         let id = PageId::new();
         store
-            .upsert(&row(id, "h1", 0, "the dog likes to run in the park", unit(vec![1.0, 0.0])))
+            .upsert(&row(
+                id,
+                "h1",
+                0,
+                "the dog likes to run in the park",
+                unit(vec![1.0, 0.0]),
+            ))
             .unwrap();
-        let hits = store.keyword_search("running", "mock", "mock-1", 10).unwrap();
-        assert_eq!(hits.len(), 1, "porter stemming should match 'running' to 'run'");
+        let hits = store
+            .keyword_search("running", "mock", "mock-1", 10)
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "porter stemming should match 'running' to 'run'"
+        );
     }
 
     /// No matches returns empty, not an error.
@@ -954,7 +1018,9 @@ mod tests {
         store
             .upsert(&row(id, "h1", 0, "alpha beta gamma", unit(vec![1.0, 0.0])))
             .unwrap();
-        let hits = store.keyword_search("zygote", "mock", "mock-1", 10).unwrap();
+        let hits = store
+            .keyword_search("zygote", "mock", "mock-1", 10)
+            .unwrap();
         assert!(hits.is_empty());
     }
 
@@ -967,15 +1033,25 @@ mod tests {
         r1.provider = "openai".into();
         r1.model = "ada-002".into();
         store.upsert(&r1).unwrap();
-        let mut r2 = row(id, "h1", 1, "shared keyword content here too", unit(vec![0.0, 1.0]));
+        let mut r2 = row(
+            id,
+            "h1",
+            1,
+            "shared keyword content here too",
+            unit(vec![0.0, 1.0]),
+        );
         r2.provider = "mock".into();
         r2.model = "mock-1".into();
         store.upsert(&r2).unwrap();
         // Search scoped to mock — should only find one.
-        let hits = store.keyword_search("shared keyword", "mock", "mock-1", 10).unwrap();
+        let hits = store
+            .keyword_search("shared keyword", "mock", "mock-1", 10)
+            .unwrap();
         assert_eq!(hits.len(), 1);
         // Search scoped to openai — should only find one.
-        let hits = store.keyword_search("shared keyword", "openai", "ada-002", 10).unwrap();
+        let hits = store
+            .keyword_search("shared keyword", "openai", "ada-002", 10)
+            .unwrap();
         assert_eq!(hits.len(), 1);
     }
 
@@ -986,9 +1062,19 @@ mod tests {
         assert_eq!(store.distinct_page_count().unwrap(), 0);
         let a = PageId::new();
         let b = PageId::new();
-        store.upsert(&row(a, "ha", 0, "a0", unit(vec![1.0, 0.0]))).unwrap();
-        store.upsert(&row(a, "ha", 1, "a1", unit(vec![0.0, 1.0]))).unwrap();
-        store.upsert(&row(b, "hb", 0, "b0", unit(vec![1.0, 0.0]))).unwrap();
-        assert_eq!(store.distinct_page_count().unwrap(), 2, "two pages, not three rows");
+        store
+            .upsert(&row(a, "ha", 0, "a0", unit(vec![1.0, 0.0])))
+            .unwrap();
+        store
+            .upsert(&row(a, "ha", 1, "a1", unit(vec![0.0, 1.0])))
+            .unwrap();
+        store
+            .upsert(&row(b, "hb", 0, "b0", unit(vec![1.0, 0.0])))
+            .unwrap();
+        assert_eq!(
+            store.distinct_page_count().unwrap(),
+            2,
+            "two pages, not three rows"
+        );
     }
 }

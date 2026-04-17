@@ -20,11 +20,11 @@ use super::chunk::{split_into_sections, Chunk};
 
 /// Five levels of delimiters, from coarsest to finest.
 const LEVELS: &[&[&str]] = &[
-    &["\n\n"],                                       // L0: paragraphs
-    &["\n"],                                         // L1: lines
-    &[". ", "! ", "? ", ".\n", "!\n", "?\n"],       // L2: sentences
-    &["; ", ": ", ", "],                             // L3: clauses
-    &[],                                             // L4: whitespace (special-cased)
+    &["\n\n"],                                // L0: paragraphs
+    &["\n"],                                  // L1: lines
+    &[". ", "! ", "? ", ".\n", "!\n", "?\n"], // L2: sentences
+    &["; ", ": ", ", "],                      // L3: clauses
+    &[],                                      // L4: whitespace (special-cased)
 ];
 
 /// Split `body` into chunks using the recursive delimiter hierarchy.
@@ -201,11 +201,7 @@ mod tests {
 
     #[test]
     fn recursive_greedy_merge_combines_small_pieces() {
-        let pieces = vec![
-            "a".to_string(),
-            "b".to_string(),
-            "c".to_string(),
-        ];
+        let pieces = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let merged = greedy_merge(&pieces, 5);
         assert_eq!(merged.len(), 1, "three tiny pieces should merge into one");
         assert_eq!(merged[0], "abc");

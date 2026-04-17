@@ -70,9 +70,7 @@ pub async fn pre_ingest(config: &HooksConfig, source: &Path) -> Result<()> {
     let Some(cmd) = &config.pre_ingest else {
         return Ok(());
     };
-    let vars = HashMap::from([
-        ("source".to_string(), source.display().to_string()),
-    ]);
+    let vars = HashMap::from([("source".to_string(), source.display().to_string())]);
     let result = run_shell(cmd, &vars).await;
     match result {
         HookResult::Skipped | HookResult::Ok => Ok(()),
@@ -142,9 +140,7 @@ pub async fn on_watch_trigger(config: &HooksConfig, path: &Path) -> Result<()> {
     let Some(cmd) = &config.on_watch_trigger else {
         return Ok(());
     };
-    let vars = HashMap::from([
-        ("path".to_string(), path.display().to_string()),
-    ]);
+    let vars = HashMap::from([("path".to_string(), path.display().to_string())]);
     let result = run_shell(cmd, &vars).await;
     match result {
         HookResult::Skipped | HookResult::Ok => Ok(()),
@@ -240,7 +236,15 @@ mod tests {
         pre_ingest(&config, &PathBuf::from("/tmp/test.md"))
             .await
             .unwrap();
-        post_ingest(&config, &PathBuf::from("/tmp/test.md"), "abc", "summary", 1, 0).await;
+        post_ingest(
+            &config,
+            &PathBuf::from("/tmp/test.md"),
+            "abc",
+            "summary",
+            1,
+            0,
+        )
+        .await;
         post_maintain(&config, 0, 0, 0, 0).await;
         on_watch_trigger(&config, &PathBuf::from("/tmp/test.md"))
             .await

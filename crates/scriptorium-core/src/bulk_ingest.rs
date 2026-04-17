@@ -86,10 +86,7 @@ pub async fn bulk_ingest(
     options: &BulkIngestOptions,
     progress: impl Fn(usize, usize, &Path),
 ) -> Result<BulkIngestReport> {
-    bulk_ingest_with_retrieval(
-        vault, provider, dir, options, progress, None, None, None,
-    )
-    .await
+    bulk_ingest_with_retrieval(vault, provider, dir, options, progress, None, None, None).await
 }
 
 /// Like [`bulk_ingest`] but with optional embeddings retrieval.
@@ -160,9 +157,16 @@ pub async fn bulk_ingest_with_retrieval(
 
         // Ingest with error isolation.
         match ingest::ingest_with_retrieval(
-            vault, provider, file_path, ingest_opts.clone(),
-            embed_store, embed_provider, embed_model,
-        ).await {
+            vault,
+            provider,
+            file_path,
+            ingest_opts.clone(),
+            embed_store,
+            embed_provider,
+            embed_model,
+        )
+        .await
+        {
             Ok(report) => {
                 info!(
                     path = %file_path.display(),
@@ -224,11 +228,7 @@ fn discover_files(dir: &Path) -> Result<Vec<PathBuf>> {
         )));
     }
     let mut files = Vec::new();
-    for entry in ignore::WalkBuilder::new(dir)
-        .hidden(true)
-        .build()
-        .flatten()
-    {
+    for entry in ignore::WalkBuilder::new(dir).hidden(true).build().flatten() {
         let path = entry.path();
         if !path.is_file() {
             continue;

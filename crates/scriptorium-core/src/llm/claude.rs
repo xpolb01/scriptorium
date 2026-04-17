@@ -246,9 +246,8 @@ fn extract_text(resp: &MessagesResponse) -> Result<String, LlmError> {
     // structured response.
     for block in &resp.content {
         if let ContentBlock::ToolUse { input, .. } = block {
-            return serde_json::to_string(input).map_err(|e| {
-                LlmError::InvalidResponse(format!("serialize tool_use input: {e}"))
-            });
+            return serde_json::to_string(input)
+                .map_err(|e| LlmError::InvalidResponse(format!("serialize tool_use input: {e}")));
         }
     }
     // Fall back to any text block if the model didn't emit a tool_use.
@@ -545,13 +544,11 @@ mod tests {
         });
         let cleaned = clean_schema_for_anthropic(&input);
         assert_eq!(
-            cleaned["additionalProperties"],
-            false,
+            cleaned["additionalProperties"], false,
             "root object must have additionalProperties: false"
         );
         assert_eq!(
-            cleaned["definitions"]["IngestPageAction"]["additionalProperties"],
-            false,
+            cleaned["definitions"]["IngestPageAction"]["additionalProperties"], false,
             "nested object in definitions must have additionalProperties: false"
         );
     }

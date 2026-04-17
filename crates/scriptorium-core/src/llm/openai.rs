@@ -40,18 +40,16 @@ pub struct OpenAiConfig {
 
 impl OpenAiConfig {
     pub fn from_env() -> Result<Self, LlmError> {
-        let api_key = crate::keychain::resolve_key(
-            "OPENAI_API_KEY",
-            crate::keychain::services::OPENAI,
-        )
-        .ok_or_else(|| {
-            LlmError::api(
-                "openai",
-                0,
-                "OPENAI_API_KEY not found in env or keychain. \
+        let api_key =
+            crate::keychain::resolve_key("OPENAI_API_KEY", crate::keychain::services::OPENAI)
+                .ok_or_else(|| {
+                    LlmError::api(
+                        "openai",
+                        0,
+                        "OPENAI_API_KEY not found in env or keychain. \
                  Run `scriptorium setup` to configure.",
-            )
-        })?;
+                    )
+                })?;
         Ok(Self {
             api_key,
             model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string()),

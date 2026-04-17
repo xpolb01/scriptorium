@@ -52,9 +52,8 @@ pub fn load_manifest(vault: &Vault) -> Result<SkillManifest> {
     let path = vault.root().join(SKILLS_DIR).join(MANIFEST_FILE);
     match std::fs::read_to_string(path.as_std_path()) {
         Ok(text) => {
-            let manifest: SkillManifest = serde_json::from_str(&text).map_err(|e| {
-                Error::Other(anyhow::anyhow!("invalid skills manifest: {e}"))
-            })?;
+            let manifest: SkillManifest = serde_json::from_str(&text)
+                .map_err(|e| Error::Other(anyhow::anyhow!("invalid skills manifest: {e}")))?;
             Ok(manifest)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SkillManifest {
@@ -79,9 +78,7 @@ pub fn load_skill(vault: &Vault, name: &str) -> Result<Skill> {
         .skills
         .iter()
         .find(|s| s.name == name)
-        .ok_or_else(|| {
-            Error::Other(anyhow::anyhow!("skill not found: {name}"))
-        })?;
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("skill not found: {name}")))?;
 
     let skill_path = Utf8PathBuf::from(SKILLS_DIR).join(&entry.path);
     let abs_path = vault.root().join(&skill_path);
@@ -104,12 +101,30 @@ pub fn init_skills(vault: &Vault) -> Result<usize> {
         .map_err(|e| Error::io(skills_dir.clone().into_std_path_buf(), e))?;
 
     let templates: &[(&str, &str)] = &[
-        ("manifest.json", include_str!("../../../templates/skills/manifest.json")),
-        ("ingest/SKILL.md", include_str!("../../../templates/skills/ingest/SKILL.md")),
-        ("query/SKILL.md", include_str!("../../../templates/skills/query/SKILL.md")),
-        ("maintain/SKILL.md", include_str!("../../../templates/skills/maintain/SKILL.md")),
-        ("review/SKILL.md", include_str!("../../../templates/skills/review/SKILL.md")),
-        ("learn/SKILL.md", include_str!("../../../templates/skills/learn/SKILL.md")),
+        (
+            "manifest.json",
+            include_str!("../../../templates/skills/manifest.json"),
+        ),
+        (
+            "ingest/SKILL.md",
+            include_str!("../../../templates/skills/ingest/SKILL.md"),
+        ),
+        (
+            "query/SKILL.md",
+            include_str!("../../../templates/skills/query/SKILL.md"),
+        ),
+        (
+            "maintain/SKILL.md",
+            include_str!("../../../templates/skills/maintain/SKILL.md"),
+        ),
+        (
+            "review/SKILL.md",
+            include_str!("../../../templates/skills/review/SKILL.md"),
+        ),
+        (
+            "learn/SKILL.md",
+            include_str!("../../../templates/skills/learn/SKILL.md"),
+        ),
     ];
 
     let mut written = 0;
@@ -119,8 +134,7 @@ pub fn init_skills(vault: &Vault) -> Result<usize> {
             continue;
         }
         if let Some(parent) = path.as_std_path().parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::io(parent.to_path_buf(), e))?;
+            std::fs::create_dir_all(parent).map_err(|e| Error::io(parent.to_path_buf(), e))?;
         }
         std::fs::write(path.as_std_path(), content)
             .map_err(|e| Error::io(path.into_std_path_buf(), e))?;

@@ -995,11 +995,7 @@ async fn ingest_persists_failure_record_on_unsalvageable_response() {
         .unwrap()
         .filter_map(Result::ok)
         .collect();
-    assert_eq!(
-        entries.len(),
-        1,
-        "exactly one failure file must be written"
-    );
+    assert_eq!(entries.len(), 1, "exactly one failure file must be written");
     let filename = entries[0].file_name();
     let filename = filename.to_string_lossy();
     assert!(

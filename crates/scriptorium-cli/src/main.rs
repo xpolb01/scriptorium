@@ -456,7 +456,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::VaultMgmt(sub) => handle_vault_command(sub),
         Command::Hooks(sub) => {
             #[cfg(feature = "dashboard")]
-            if let HooksCommand::Dashboard { port, no_browser, db, jsonl, settings, hooks_dir, vault } = sub {
+            if let HooksCommand::Dashboard {
+                port,
+                no_browser,
+                db,
+                jsonl,
+                settings,
+                hooks_dir,
+                vault,
+            } = sub
+            {
                 let db_path = db.unwrap_or_else(default_hooks_db_path);
                 let settings_path = settings.unwrap_or_else(default_settings_path);
                 let hooks_dir_path = hooks_dir.unwrap_or_else(default_hooks_dir);
@@ -470,7 +479,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         .arg(format!("http://127.0.0.1:{port}"))
                         .spawn();
                 }
-                dashboard::start_dashboard(port, db_path, jsonl, settings_path, hooks_dir_path, vault_path).await?;
+                dashboard::start_dashboard(
+                    port,
+                    db_path,
+                    jsonl,
+                    settings_path,
+                    hooks_dir_path,
+                    vault_path,
+                )
+                .await?;
                 return Ok(ExitCode::SUCCESS);
             }
             handle_hooks_command(sub)
@@ -498,349 +515,351 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         command => {
             let vault_path = resolve_vault_path(explicit_vault)?;
             match command {
-        Command::Setup => {
-            let vault = open_vault(&vault_path)?;
-            let stdin = std::io::stdin();
-            let mut input = stdin.lock();
-            let mut output = std::io::stderr();
-            scriptorium_core::setup::run_setup(&vault, &mut input, &mut output)
-                .into_diagnostic()?;
-            auto_register_vault(vault.root().as_std_path());
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Ingest {
-            source,
-            url,
-            provider,
-            model,
-            dry_run,
-        } => {
-            let vault = open_vault(&vault_path)?;
-            let cfg = load_config(&vault);
-            let resolved_provider = provider.unwrap_or_else(|| provider_from(&cfg));
-            if let Some(ref m) = model {
-                set_model_env(provider_kind_name(resolved_provider), m);
-            }
-            let provider = build_provider(resolved_provider)?;
-            // Resolve to a concrete file path. URL ingest fetches, runs
-            // Readability, converts to markdown, writes a tempfile, and the
-            // regular file-ingest path takes over. The returned struct holds
-            // the tempdir alive until end of scope.
-            let resolved = resolve_ingest_source(source, url).await?;
-            let report = ingest::ingest_with_options(
-                &vault,
-                provider.as_ref(),
-                &resolved.path,
-                ingest::IngestOptions {
-                    dry_run,
-                    hooks: Some(cfg.hooks.clone()),
-                },
-            )
-            .await
-            .into_diagnostic()?;
-            if dry_run {
-                println!(
-                    "ingest DRY RUN: would create {} page(s), update {} — nothing written.",
-                    report.created, report.updated
-                );
-                println!("         summary: {}", report.summary);
-                println!("         diff:");
-                for change in &report.dry_run_diff {
-                    println!(
-                        "           {:?} {} ({} bytes)",
-                        change.action, change.path, change.bytes
-                    );
-                }
-            } else {
-                println!(
-                    "ingest: {} created, {} updated, commit {}",
-                    report.created, report.updated, report.commit_id
-                );
-                println!("        summary: {}", report.summary);
-
-                // Refresh the embeddings store so freshly-ingested pages
-                // are immediately searchable via `query` and the MCP
-                // `scriptorium_search` / `scriptorium_query` tools.
-                // `embed::reindex` is cache-aware (keyed by content_hash)
-                // so existing chunks are skipped — only new/changed
-                // content pays the embedding cost. Without this step the
-                // store stays stale until a manual `scriptorium reindex`,
-                // which makes new pages invisible to retrieval.
-                let store = open_store(&vault)?;
-                let embed_provider = build_provider(embed_provider_from(&cfg))?;
-                let embedded = scriptorium_core::embed::reindex(
-                    &vault,
-                    &store,
-                    embed_provider.as_ref(),
-                    &cfg.embeddings.model,
-                )
-                .await
-                .into_diagnostic()?;
-                if embedded > 0 {
-                    println!("        embedded: {embedded} new chunk(s)");
-                }
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Query {
-            question,
-            top_k,
-            provider,
-        } => {
-            let vault = open_vault(&vault_path)?;
-            let cfg = load_config(&vault);
-            // Query needs TWO providers: one for the chat (answer generation)
-            // and one for embedding the question (retrieval). If --provider
-            // overrides, use it for chat only; embeddings always come from
-            // cfg.embeddings.provider.
-            let llm_provider = build_provider(provider.unwrap_or_else(|| provider_from(&cfg)))?;
-            let embed_provider = build_provider(embed_provider_from(&cfg))?;
-            let store = open_store(&vault)?;
-            let report = query::query(
-                &vault,
-                &store,
-                llm_provider.as_ref(),
-                embed_provider.as_ref(),
-                &cfg.embeddings.model,
-                &question,
-                top_k,
-            )
-            .await
-            .into_diagnostic()?;
-            println!("{}\n", report.answer.answer);
-            if !report.cited_stems.is_empty() {
-                println!("cited: {}", report.cited_stems.join(", "));
-            }
-            if let Some(conf) = report.answer.confidence {
-                println!("confidence: {conf:.2}");
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Reindex { provider } => {
-            let vault = open_vault(&vault_path)?;
-            let cfg = load_config(&vault);
-            // reindex uses the embeddings provider, not the chat provider.
-            // --provider here overrides the embeddings choice, not the chat.
-            let embed_provider =
-                build_provider(provider.unwrap_or_else(|| embed_provider_from(&cfg)))?;
-            let store = open_store(&vault)?;
-            let report = core::reindex::reindex_all(
-                &vault,
-                &store,
-                embed_provider.as_ref(),
-                &cfg.embeddings.model,
-            )
-            .await
-            .into_diagnostic()?;
-            println!("reindex: embedded {} chunk(s)", report.embeddings_written);
-            if report.index_updated {
-                println!("reindex: regenerated index.md");
-            } else {
-                println!("reindex: index.md already up to date");
-            }
-            print_lint_report(&report.lint);
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Lint { strict, fix } => {
-            let vault = open_vault(&vault_path)?;
-            if fix {
-                let fix_report = core::lint::fix::run(&vault).into_diagnostic()?;
-                if fix_report.is_noop() {
-                    println!("lint --fix: nothing to fix");
-                } else {
-                    println!(
-                        "lint --fix: fixed {} issue(s) in commit {}",
-                        fix_report.fixed.len(),
-                        fix_report.commit_id.as_deref().unwrap_or("?")
-                    );
-                    for issue in &fix_report.fixed {
-                        let path = issue.path.as_deref().map_or("?", camino::Utf8Path::as_str);
-                        println!("  fixed: {path} [{}] {}", issue.rule, issue.message);
-                    }
-                }
-                if !fix_report.skipped.is_empty() {
-                    println!(
-                        "lint --fix: {} issue(s) skipped (require manual review):",
-                        fix_report.skipped.len()
-                    );
-                    for (issue, reason) in &fix_report.skipped {
-                        let path = issue.path.as_deref().map_or("?", camino::Utf8Path::as_str);
-                        println!("  skipped: {path} [{}] {} — {reason}", issue.rule, issue.message);
-                    }
-                }
-                println!();
-            }
-            let report = core::lint::run(&vault).into_diagnostic()?;
-            print_lint_report(&report);
-            let exit = if report.has_errors() || (strict && !report.is_clean()) {
-                ExitCode::from(1)
-            } else {
-                ExitCode::SUCCESS
-            };
-            Ok(exit)
-        }
-        Command::Undo => {
-            let vault = open_vault(&vault_path)?;
-            undo(&vault)?;
-            println!("undo: reverted the most recent scriptorium commit");
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Doctor { json } => {
-            let vault = open_vault(&vault_path)?;
-            let store = open_store(&vault).ok();
-            let report =
-                scriptorium_core::doctor::run_doctor(&vault, store.as_ref());
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report)
-                        .map_err(|e| miette!("json: {e}"))?
-                );
-            } else {
-                print_doctor_report(&report);
-            }
-            let exit = if report.has_failures() {
-                ExitCode::from(1)
-            } else {
-                ExitCode::SUCCESS
-            };
-            Ok(exit)
-        }
-        Command::Maintain { fix, provider } => {
-            let vault = open_vault(&vault_path)?;
-            let cfg = load_config(&vault);
-            let store = open_store(&vault)?;
-            let embed_provider = build_provider(
-                provider.unwrap_or_else(|| embed_provider_from(&cfg)),
-            )?;
-            let options = scriptorium_core::maintain::MaintainOptions { fix };
-            let report = scriptorium_core::maintain::maintain(
-                &vault,
-                &store,
-                Some(embed_provider.as_ref()),
-                &cfg.embeddings.model,
-                &options,
-            )
-            .await
-            .into_diagnostic()?;
-            let s = report.summary();
-            println!("Maintenance Report");
-            println!("==================");
-            println!("  Lint: {} error(s), {} warning(s)", s.errors, s.warnings);
-            println!("  Stale pages: {}", s.stale_pages);
-            println!("  Stale embeddings: {}", s.stale_embeddings);
-            println!(
-                "  Embedding coverage: {}/{}",
-                s.embedded, s.total_pages
-            );
-            if fix {
-                println!("  Auto-fixed: {}", s.auto_fixed);
-                println!("  Chunks re-embedded: {}", s.chunks_reembedded);
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::BulkIngest {
-            dir,
-            provider,
-            model,
-            fresh,
-            dry_run,
-        } => {
-            let vault = open_vault(&vault_path)?;
-            let cfg = load_config(&vault);
-            let resolved_provider = provider.unwrap_or_else(|| provider_from(&cfg));
-            if let Some(ref m) = model {
-                // Use the resolved provider name (--provider flag or config
-                // default) so the right env var is set when --provider
-                // overrides the config.
-                set_model_env(provider_kind_name(resolved_provider), m);
-            }
-            let llm = build_provider(resolved_provider)?;
-            if fresh {
-                let cp = vault.meta_dir().join("bulk-ingest-checkpoint.json");
-                let _ = std::fs::remove_file(cp.as_std_path());
-            }
-            let options = scriptorium_core::bulk_ingest::BulkIngestOptions {
-                dry_run,
-                ..Default::default()
-            };
-            let report = scriptorium_core::bulk_ingest::bulk_ingest(
-                &vault,
-                llm.as_ref(),
-                &dir,
-                &options,
-                |cur, total, path| {
-                    eprintln!("[{cur}/{total}] {}", path.display());
-                },
-            )
-            .await
-            .into_diagnostic()?;
-            println!("Bulk Ingest Report");
-            println!("==================");
-            println!("  Discovered: {}", report.total_discovered);
-            println!("  Skipped (checkpoint): {}", report.skipped_checkpoint);
-            println!(
-                "  Skipped (already interned): {}",
-                report.skipped_already_interned
-            );
-            println!("  Ingested: {}", report.ingested);
-            println!("  Failed: {}", report.failed.len());
-            for err in &report.failed {
-                eprintln!("    {} — {}", err.path.display(), err.error);
-            }
-            println!("  Elapsed: {:.1}s", report.elapsed.as_secs_f64());
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Bench {
-            json,
-            init,
-            provider,
-        } => {
-            let vault = open_vault(&vault_path)?;
-            if init {
-                let suite = scriptorium_core::bench::load_suite(&vault)
-                    .into_diagnostic()?;
-                if suite.benchmarks.is_empty() {
-                    scriptorium_core::bench::save_suite(&vault, &suite)
+                Command::Setup => {
+                    let vault = open_vault(&vault_path)?;
+                    let stdin = std::io::stdin();
+                    let mut input = stdin.lock();
+                    let mut output = std::io::stderr();
+                    scriptorium_core::setup::run_setup(&vault, &mut input, &mut output)
                         .into_diagnostic()?;
-                    println!(
-                        "Created empty benchmarks.json at {}",
-                        vault.meta_dir().join("benchmarks.json")
-                    );
-                } else {
-                    println!("benchmarks.json already exists with {} cases.", suite.benchmarks.len());
+                    auto_register_vault(vault.root().as_std_path());
+                    Ok(ExitCode::SUCCESS)
                 }
-                return Ok(ExitCode::SUCCESS);
-            }
-            let cfg = load_config(&vault);
-            let store = open_store(&vault)?;
-            let llm = build_provider(
-                provider.unwrap_or_else(|| provider_from(&cfg)),
-            )?;
-            let embed = build_provider(embed_provider_from(&cfg))?;
-            let report = scriptorium_core::bench::run_benchmarks(
-                &vault,
-                &store,
-                embed.as_ref(),
-                llm.as_ref(),
-                &cfg.embeddings.model,
-            )
-            .await
-            .into_diagnostic()?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report)
-                        .map_err(|e| miette!("json: {e}"))?
-                );
-            } else {
-                println!("Benchmark Report");
-                println!("================");
-                if report.results.is_empty() {
-                    println!("  No benchmark cases defined. Run `scriptorium bench --init` first.");
-                } else {
-                    for r in &report.results {
+                Command::Ingest {
+                    source,
+                    url,
+                    provider,
+                    model,
+                    dry_run,
+                } => {
+                    let vault = open_vault(&vault_path)?;
+                    let cfg = load_config(&vault);
+                    let resolved_provider = provider.unwrap_or_else(|| provider_from(&cfg));
+                    if let Some(ref m) = model {
+                        set_model_env(provider_kind_name(resolved_provider), m);
+                    }
+                    let provider = build_provider(resolved_provider)?;
+                    // Resolve to a concrete file path. URL ingest fetches, runs
+                    // Readability, converts to markdown, writes a tempfile, and the
+                    // regular file-ingest path takes over. The returned struct holds
+                    // the tempdir alive until end of scope.
+                    let resolved = resolve_ingest_source(source, url).await?;
+                    let report = ingest::ingest_with_options(
+                        &vault,
+                        provider.as_ref(),
+                        &resolved.path,
+                        ingest::IngestOptions {
+                            dry_run,
+                            hooks: Some(cfg.hooks.clone()),
+                        },
+                    )
+                    .await
+                    .into_diagnostic()?;
+                    if dry_run {
                         println!(
+                            "ingest DRY RUN: would create {} page(s), update {} — nothing written.",
+                            report.created, report.updated
+                        );
+                        println!("         summary: {}", report.summary);
+                        println!("         diff:");
+                        for change in &report.dry_run_diff {
+                            println!(
+                                "           {:?} {} ({} bytes)",
+                                change.action, change.path, change.bytes
+                            );
+                        }
+                    } else {
+                        println!(
+                            "ingest: {} created, {} updated, commit {}",
+                            report.created, report.updated, report.commit_id
+                        );
+                        println!("        summary: {}", report.summary);
+
+                        // Refresh the embeddings store so freshly-ingested pages
+                        // are immediately searchable via `query` and the MCP
+                        // `scriptorium_search` / `scriptorium_query` tools.
+                        // `embed::reindex` is cache-aware (keyed by content_hash)
+                        // so existing chunks are skipped — only new/changed
+                        // content pays the embedding cost. Without this step the
+                        // store stays stale until a manual `scriptorium reindex`,
+                        // which makes new pages invisible to retrieval.
+                        let store = open_store(&vault)?;
+                        let embed_provider = build_provider(embed_provider_from(&cfg))?;
+                        let embedded = scriptorium_core::embed::reindex(
+                            &vault,
+                            &store,
+                            embed_provider.as_ref(),
+                            &cfg.embeddings.model,
+                        )
+                        .await
+                        .into_diagnostic()?;
+                        if embedded > 0 {
+                            println!("        embedded: {embedded} new chunk(s)");
+                        }
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Query {
+                    question,
+                    top_k,
+                    provider,
+                } => {
+                    let vault = open_vault(&vault_path)?;
+                    let cfg = load_config(&vault);
+                    // Query needs TWO providers: one for the chat (answer generation)
+                    // and one for embedding the question (retrieval). If --provider
+                    // overrides, use it for chat only; embeddings always come from
+                    // cfg.embeddings.provider.
+                    let llm_provider =
+                        build_provider(provider.unwrap_or_else(|| provider_from(&cfg)))?;
+                    let embed_provider = build_provider(embed_provider_from(&cfg))?;
+                    let store = open_store(&vault)?;
+                    let report = query::query(
+                        &vault,
+                        &store,
+                        llm_provider.as_ref(),
+                        embed_provider.as_ref(),
+                        &cfg.embeddings.model,
+                        &question,
+                        top_k,
+                    )
+                    .await
+                    .into_diagnostic()?;
+                    println!("{}\n", report.answer.answer);
+                    if !report.cited_stems.is_empty() {
+                        println!("cited: {}", report.cited_stems.join(", "));
+                    }
+                    if let Some(conf) = report.answer.confidence {
+                        println!("confidence: {conf:.2}");
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Reindex { provider } => {
+                    let vault = open_vault(&vault_path)?;
+                    let cfg = load_config(&vault);
+                    // reindex uses the embeddings provider, not the chat provider.
+                    // --provider here overrides the embeddings choice, not the chat.
+                    let embed_provider =
+                        build_provider(provider.unwrap_or_else(|| embed_provider_from(&cfg)))?;
+                    let store = open_store(&vault)?;
+                    let report = core::reindex::reindex_all(
+                        &vault,
+                        &store,
+                        embed_provider.as_ref(),
+                        &cfg.embeddings.model,
+                    )
+                    .await
+                    .into_diagnostic()?;
+                    println!("reindex: embedded {} chunk(s)", report.embeddings_written);
+                    if report.index_updated {
+                        println!("reindex: regenerated index.md");
+                    } else {
+                        println!("reindex: index.md already up to date");
+                    }
+                    print_lint_report(&report.lint);
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Lint { strict, fix } => {
+                    let vault = open_vault(&vault_path)?;
+                    if fix {
+                        let fix_report = core::lint::fix::run(&vault).into_diagnostic()?;
+                        if fix_report.is_noop() {
+                            println!("lint --fix: nothing to fix");
+                        } else {
+                            println!(
+                                "lint --fix: fixed {} issue(s) in commit {}",
+                                fix_report.fixed.len(),
+                                fix_report.commit_id.as_deref().unwrap_or("?")
+                            );
+                            for issue in &fix_report.fixed {
+                                let path =
+                                    issue.path.as_deref().map_or("?", camino::Utf8Path::as_str);
+                                println!("  fixed: {path} [{}] {}", issue.rule, issue.message);
+                            }
+                        }
+                        if !fix_report.skipped.is_empty() {
+                            println!(
+                                "lint --fix: {} issue(s) skipped (require manual review):",
+                                fix_report.skipped.len()
+                            );
+                            for (issue, reason) in &fix_report.skipped {
+                                let path =
+                                    issue.path.as_deref().map_or("?", camino::Utf8Path::as_str);
+                                println!(
+                                    "  skipped: {path} [{}] {} — {reason}",
+                                    issue.rule, issue.message
+                                );
+                            }
+                        }
+                        println!();
+                    }
+                    let report = core::lint::run(&vault).into_diagnostic()?;
+                    print_lint_report(&report);
+                    let exit = if report.has_errors() || (strict && !report.is_clean()) {
+                        ExitCode::from(1)
+                    } else {
+                        ExitCode::SUCCESS
+                    };
+                    Ok(exit)
+                }
+                Command::Undo => {
+                    let vault = open_vault(&vault_path)?;
+                    undo(&vault)?;
+                    println!("undo: reverted the most recent scriptorium commit");
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Doctor { json } => {
+                    let vault = open_vault(&vault_path)?;
+                    let store = open_store(&vault).ok();
+                    let report = scriptorium_core::doctor::run_doctor(&vault, store.as_ref());
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report)
+                                .map_err(|e| miette!("json: {e}"))?
+                        );
+                    } else {
+                        print_doctor_report(&report);
+                    }
+                    let exit = if report.has_failures() {
+                        ExitCode::from(1)
+                    } else {
+                        ExitCode::SUCCESS
+                    };
+                    Ok(exit)
+                }
+                Command::Maintain { fix, provider } => {
+                    let vault = open_vault(&vault_path)?;
+                    let cfg = load_config(&vault);
+                    let store = open_store(&vault)?;
+                    let embed_provider =
+                        build_provider(provider.unwrap_or_else(|| embed_provider_from(&cfg)))?;
+                    let options = scriptorium_core::maintain::MaintainOptions { fix };
+                    let report = scriptorium_core::maintain::maintain(
+                        &vault,
+                        &store,
+                        Some(embed_provider.as_ref()),
+                        &cfg.embeddings.model,
+                        &options,
+                    )
+                    .await
+                    .into_diagnostic()?;
+                    let s = report.summary();
+                    println!("Maintenance Report");
+                    println!("==================");
+                    println!("  Lint: {} error(s), {} warning(s)", s.errors, s.warnings);
+                    println!("  Stale pages: {}", s.stale_pages);
+                    println!("  Stale embeddings: {}", s.stale_embeddings);
+                    println!("  Embedding coverage: {}/{}", s.embedded, s.total_pages);
+                    if fix {
+                        println!("  Auto-fixed: {}", s.auto_fixed);
+                        println!("  Chunks re-embedded: {}", s.chunks_reembedded);
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::BulkIngest {
+                    dir,
+                    provider,
+                    model,
+                    fresh,
+                    dry_run,
+                } => {
+                    let vault = open_vault(&vault_path)?;
+                    let cfg = load_config(&vault);
+                    let resolved_provider = provider.unwrap_or_else(|| provider_from(&cfg));
+                    if let Some(ref m) = model {
+                        // Use the resolved provider name (--provider flag or config
+                        // default) so the right env var is set when --provider
+                        // overrides the config.
+                        set_model_env(provider_kind_name(resolved_provider), m);
+                    }
+                    let llm = build_provider(resolved_provider)?;
+                    if fresh {
+                        let cp = vault.meta_dir().join("bulk-ingest-checkpoint.json");
+                        let _ = std::fs::remove_file(cp.as_std_path());
+                    }
+                    let options = scriptorium_core::bulk_ingest::BulkIngestOptions {
+                        dry_run,
+                        ..Default::default()
+                    };
+                    let report = scriptorium_core::bulk_ingest::bulk_ingest(
+                        &vault,
+                        llm.as_ref(),
+                        &dir,
+                        &options,
+                        |cur, total, path| {
+                            eprintln!("[{cur}/{total}] {}", path.display());
+                        },
+                    )
+                    .await
+                    .into_diagnostic()?;
+                    println!("Bulk Ingest Report");
+                    println!("==================");
+                    println!("  Discovered: {}", report.total_discovered);
+                    println!("  Skipped (checkpoint): {}", report.skipped_checkpoint);
+                    println!(
+                        "  Skipped (already interned): {}",
+                        report.skipped_already_interned
+                    );
+                    println!("  Ingested: {}", report.ingested);
+                    println!("  Failed: {}", report.failed.len());
+                    for err in &report.failed {
+                        eprintln!("    {} — {}", err.path.display(), err.error);
+                    }
+                    println!("  Elapsed: {:.1}s", report.elapsed.as_secs_f64());
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Bench {
+                    json,
+                    init,
+                    provider,
+                } => {
+                    let vault = open_vault(&vault_path)?;
+                    if init {
+                        let suite =
+                            scriptorium_core::bench::load_suite(&vault).into_diagnostic()?;
+                        if suite.benchmarks.is_empty() {
+                            scriptorium_core::bench::save_suite(&vault, &suite)
+                                .into_diagnostic()?;
+                            println!(
+                                "Created empty benchmarks.json at {}",
+                                vault.meta_dir().join("benchmarks.json")
+                            );
+                        } else {
+                            println!(
+                                "benchmarks.json already exists with {} cases.",
+                                suite.benchmarks.len()
+                            );
+                        }
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    let cfg = load_config(&vault);
+                    let store = open_store(&vault)?;
+                    let llm = build_provider(provider.unwrap_or_else(|| provider_from(&cfg)))?;
+                    let embed = build_provider(embed_provider_from(&cfg))?;
+                    let report = scriptorium_core::bench::run_benchmarks(
+                        &vault,
+                        &store,
+                        embed.as_ref(),
+                        llm.as_ref(),
+                        &cfg.embeddings.model,
+                    )
+                    .await
+                    .into_diagnostic()?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report)
+                                .map_err(|e| miette!("json: {e}"))?
+                        );
+                    } else {
+                        println!("Benchmark Report");
+                        println!("================");
+                        if report.results.is_empty() {
+                            println!("  No benchmark cases defined. Run `scriptorium bench --init` first.");
+                        } else {
+                            for r in &report.results {
+                                println!(
                             "  {}: P@{k}={p:.2} R={r:.2} F1={f:.2} MRR={m:.2} NDCG@{k}={n:.2}",
                             r.query,
                             k = r.k,
@@ -850,168 +869,174 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                             m = r.mrr,
                             n = r.ndcg,
                         );
-                    }
-                }
-                println!();
-                println!("  Mean precision: {:.2}", report.mean_precision);
-                println!("  Mean recall:    {:.2}", report.mean_recall);
-                println!("  Mean F1:        {:.2}", report.mean_f1);
-                println!("  Mean MRR:       {:.2}", report.mean_mrr);
-                println!("  Mean NDCG:      {:.2}", report.mean_ndcg);
-                println!("  Coverage:       {:.0}%", report.coverage * 100.0);
-                println!("  Stale ratio:    {:.0}%", report.stale_ratio * 100.0);
-                println!("  Health score:   {:.1}/10", report.health_score);
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Learn(sub) => {
-            let vault = open_vault(&vault_path)?;
-            match sub {
-                LearnCommand::List { n } => {
-                    let entries = scriptorium_core::learnings::list_recent(&vault, n)
-                        .into_diagnostic()?;
-                    if entries.is_empty() {
-                        println!("No learnings yet.");
-                    } else {
-                        for l in &entries {
-                            println!(
-                                "  [{:?}] {} — {} (conf: {}, {})",
-                                l.learning_type,
-                                l.key,
-                                l.insight,
-                                l.confidence,
-                                l.ts.format("%Y-%m-%d")
-                            );
+                            }
                         }
+                        println!();
+                        println!("  Mean precision: {:.2}", report.mean_precision);
+                        println!("  Mean recall:    {:.2}", report.mean_recall);
+                        println!("  Mean F1:        {:.2}", report.mean_f1);
+                        println!("  Mean MRR:       {:.2}", report.mean_mrr);
+                        println!("  Mean NDCG:      {:.2}", report.mean_ndcg);
+                        println!("  Coverage:       {:.0}%", report.coverage * 100.0);
+                        println!("  Stale ratio:    {:.0}%", report.stale_ratio * 100.0);
+                        println!("  Health score:   {:.1}/10", report.health_score);
                     }
-                }
-                LearnCommand::Search { query } => {
-                    let entries = scriptorium_core::learnings::search(&vault, &query)
-                        .into_diagnostic()?;
-                    if entries.is_empty() {
-                        println!("No matches for '{query}'.");
-                    } else {
-                        for l in &entries {
-                            println!(
-                                "  [{:?}] {} — {}",
-                                l.learning_type, l.key, l.insight
-                            );
-                        }
-                    }
-                }
-                LearnCommand::Add { json } => {
-                    let learning: scriptorium_core::learnings::Learning =
-                        serde_json::from_str(&json)
-                            .map_err(|e| miette!("invalid JSON: {e}"))?;
-                    scriptorium_core::learnings::capture(&vault, &learning)
-                        .into_diagnostic()?;
-                    println!("Captured: [{:?}] {}", learning.learning_type, learning.key);
-                }
-                LearnCommand::Prune => {
-                    let pruned = scriptorium_core::learnings::prune_stale(&vault)
-                        .into_diagnostic()?;
-                    println!("Pruned {pruned} stale learning(s).");
-                }
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Skill(sub) => {
-            let vault = open_vault(&vault_path)?;
-            match sub {
-                SkillCommand::List => {
-                    let skills = scriptorium_core::skills::list_skills(&vault)
-                        .into_diagnostic()?;
-                    if skills.is_empty() {
-                        println!("No skills found. Run `scriptorium skill init` to scaffold defaults.");
-                    } else {
-                        for s in &skills {
-                            println!("  {} — {}", s.name, s.description);
-                        }
-                    }
-                }
-                SkillCommand::Show { name } => {
-                    let skill = scriptorium_core::skills::load_skill(&vault, &name)
-                        .into_diagnostic()?;
-                    println!("{}", skill.content);
-                }
-                SkillCommand::Init => {
-                    let written = scriptorium_core::skills::init_skills(&vault)
-                        .into_diagnostic()?;
-                    if written == 0 {
-                        println!("Skills already exist, nothing to do.");
-                    } else {
-                        println!("Scaffolded {written} skill files in {}/",
-                            scriptorium_core::skills::skills_dir(&vault));
-                    }
-                }
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Config => {
-            let vault = open_vault(&vault_path)?;
-            let cfg = load_config(&vault);
-            print_config(&cfg);
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Serve { provider } => {
-            let vault = open_vault(&vault_path)?;
-            let cfg = load_config(&vault);
-            // The MCP server needs both a chat provider (for ingest + query)
-            // and an embeddings provider (for search + query retrieval).
-            // --provider overrides the chat slot only; embeddings always
-            // come from cfg.embeddings.provider.
-            let llm_provider = build_provider(provider.unwrap_or_else(|| provider_from(&cfg)))?;
-            let embed_provider = build_provider(embed_provider_from(&cfg))?;
-            let context = scriptorium_mcp::ServerContext {
-                vault,
-                llm_provider,
-                embed_provider,
-                embeddings_model: cfg.embeddings.model.clone(),
-            };
-            scriptorium_mcp::serve_stdio(context)
-                .await
-                .map_err(|e| miette!("mcp server: {e}"))?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Watch { provider } => {
-            let vault = open_vault(&vault_path)?;
-            let cfg = load_config(&vault);
-            let provider = build_provider(provider.unwrap_or_else(|| provider_from(&cfg)))?;
-            println!(
-                "watch: watching {}/sources/ — drop new files there to auto-ingest",
-                vault.root()
-            );
-            let hooks = if cfg.hooks == scriptorium_core::hooks::HooksConfig::default() {
-                None
-            } else {
-                Some(cfg.hooks.clone())
-            };
-            core::watch::watch(vault, provider, hooks)
-                .await
-                .into_diagnostic()?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Social(sub) => {
-            let vault = open_vault(&vault_path)?;
-            match sub {
-                SocialCommand::Facebook {
-                    export_dirs,
-                    categories,
-                    provider,
-                    model,
-                    dry_run,
-                } => {
-                    handle_social_facebook(
-                        &vault, &vault_path, export_dirs, categories,
-                        provider, model, dry_run,
-                    ).await?;
                     Ok(ExitCode::SUCCESS)
                 }
-            }
-        }
-        // Already handled before vault resolution.
-        Command::VaultMgmt(_) | Command::Init { .. } | Command::Hooks(_) => unreachable!(),
-        } // inner match
+                Command::Learn(sub) => {
+                    let vault = open_vault(&vault_path)?;
+                    match sub {
+                        LearnCommand::List { n } => {
+                            let entries = scriptorium_core::learnings::list_recent(&vault, n)
+                                .into_diagnostic()?;
+                            if entries.is_empty() {
+                                println!("No learnings yet.");
+                            } else {
+                                for l in &entries {
+                                    println!(
+                                        "  [{:?}] {} — {} (conf: {}, {})",
+                                        l.learning_type,
+                                        l.key,
+                                        l.insight,
+                                        l.confidence,
+                                        l.ts.format("%Y-%m-%d")
+                                    );
+                                }
+                            }
+                        }
+                        LearnCommand::Search { query } => {
+                            let entries = scriptorium_core::learnings::search(&vault, &query)
+                                .into_diagnostic()?;
+                            if entries.is_empty() {
+                                println!("No matches for '{query}'.");
+                            } else {
+                                for l in &entries {
+                                    println!("  [{:?}] {} — {}", l.learning_type, l.key, l.insight);
+                                }
+                            }
+                        }
+                        LearnCommand::Add { json } => {
+                            let learning: scriptorium_core::learnings::Learning =
+                                serde_json::from_str(&json)
+                                    .map_err(|e| miette!("invalid JSON: {e}"))?;
+                            scriptorium_core::learnings::capture(&vault, &learning)
+                                .into_diagnostic()?;
+                            println!("Captured: [{:?}] {}", learning.learning_type, learning.key);
+                        }
+                        LearnCommand::Prune => {
+                            let pruned = scriptorium_core::learnings::prune_stale(&vault)
+                                .into_diagnostic()?;
+                            println!("Pruned {pruned} stale learning(s).");
+                        }
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Skill(sub) => {
+                    let vault = open_vault(&vault_path)?;
+                    match sub {
+                        SkillCommand::List => {
+                            let skills =
+                                scriptorium_core::skills::list_skills(&vault).into_diagnostic()?;
+                            if skills.is_empty() {
+                                println!("No skills found. Run `scriptorium skill init` to scaffold defaults.");
+                            } else {
+                                for s in &skills {
+                                    println!("  {} — {}", s.name, s.description);
+                                }
+                            }
+                        }
+                        SkillCommand::Show { name } => {
+                            let skill = scriptorium_core::skills::load_skill(&vault, &name)
+                                .into_diagnostic()?;
+                            println!("{}", skill.content);
+                        }
+                        SkillCommand::Init => {
+                            let written =
+                                scriptorium_core::skills::init_skills(&vault).into_diagnostic()?;
+                            if written == 0 {
+                                println!("Skills already exist, nothing to do.");
+                            } else {
+                                println!(
+                                    "Scaffolded {written} skill files in {}/",
+                                    scriptorium_core::skills::skills_dir(&vault)
+                                );
+                            }
+                        }
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Config => {
+                    let vault = open_vault(&vault_path)?;
+                    let cfg = load_config(&vault);
+                    print_config(&cfg);
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Serve { provider } => {
+                    let vault = open_vault(&vault_path)?;
+                    let cfg = load_config(&vault);
+                    // The MCP server needs both a chat provider (for ingest + query)
+                    // and an embeddings provider (for search + query retrieval).
+                    // --provider overrides the chat slot only; embeddings always
+                    // come from cfg.embeddings.provider.
+                    let llm_provider =
+                        build_provider(provider.unwrap_or_else(|| provider_from(&cfg)))?;
+                    let embed_provider = build_provider(embed_provider_from(&cfg))?;
+                    let context = scriptorium_mcp::ServerContext {
+                        vault,
+                        llm_provider,
+                        embed_provider,
+                        embeddings_model: cfg.embeddings.model.clone(),
+                    };
+                    scriptorium_mcp::serve_stdio(context)
+                        .await
+                        .map_err(|e| miette!("mcp server: {e}"))?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Watch { provider } => {
+                    let vault = open_vault(&vault_path)?;
+                    let cfg = load_config(&vault);
+                    let provider = build_provider(provider.unwrap_or_else(|| provider_from(&cfg)))?;
+                    println!(
+                        "watch: watching {}/sources/ — drop new files there to auto-ingest",
+                        vault.root()
+                    );
+                    let hooks = if cfg.hooks == scriptorium_core::hooks::HooksConfig::default() {
+                        None
+                    } else {
+                        Some(cfg.hooks.clone())
+                    };
+                    core::watch::watch(vault, provider, hooks)
+                        .await
+                        .into_diagnostic()?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Social(sub) => {
+                    let vault = open_vault(&vault_path)?;
+                    match sub {
+                        SocialCommand::Facebook {
+                            export_dirs,
+                            categories,
+                            provider,
+                            model,
+                            dry_run,
+                        } => {
+                            handle_social_facebook(
+                                &vault,
+                                &vault_path,
+                                export_dirs,
+                                categories,
+                                provider,
+                                model,
+                                dry_run,
+                            )
+                            .await?;
+                            Ok(ExitCode::SUCCESS)
+                        }
+                    }
+                }
+                // Already handled before vault resolution.
+                Command::VaultMgmt(_) | Command::Init { .. } | Command::Hooks(_) => unreachable!(),
+            } // inner match
         } // outer `command =>` arm
     }
 }
@@ -1068,8 +1093,7 @@ async fn handle_social_facebook(
     if staging_dir.exists() {
         let _ = std::fs::remove_dir_all(&staging_dir);
     }
-    std::fs::create_dir_all(&staging_dir)
-        .map_err(|e| miette!("create staging dir: {e}"))?;
+    std::fs::create_dir_all(&staging_dir).map_err(|e| miette!("create staging dir: {e}"))?;
 
     let export_options = facebook::FacebookImportOptions {
         export_dirs,
@@ -1146,14 +1170,13 @@ async fn handle_social_facebook(
         &ingest_options,
         |cur, _total, path| {
             phase2.set_position(cur as u64);
-            let fname = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy();
+            let fname = path.file_name().unwrap_or_default().to_string_lossy();
             phase2.set_message(fname.to_string());
         },
         store.as_ref(),
-        embed_provider.as_ref().map(|p| p.as_ref() as &dyn LlmProvider),
+        embed_provider
+            .as_ref()
+            .map(|p| p.as_ref() as &dyn LlmProvider),
         Some(&cfg.embeddings.model),
     )
     .await
@@ -1195,7 +1218,10 @@ async fn handle_social_facebook(
     eprintln!("========================");
     eprintln!("  Sources generated: {}", export_report.total_files_written);
     eprintln!("  Pages ingested:    {}", ingest_report.ingested);
-    eprintln!("  Pages skipped:     {}", ingest_report.skipped_already_interned);
+    eprintln!(
+        "  Pages skipped:     {}",
+        ingest_report.skipped_already_interned
+    );
     eprintln!("  Failures:          {}", ingest_report.failed.len());
     eprintln!("  Chunks embedded:   {embedded}");
     if !ingest_report.failed.is_empty() {
@@ -1255,14 +1281,10 @@ async fn resolve_ingest_source(
                 _resolved: Some(resolved),
             })
         }
-        (None, None) => Err(miette!(
-            "must provide either <source> path or --url <url>"
-        )),
+        (None, None) => Err(miette!("must provide either <source> path or --url <url>")),
         // clap's `conflicts_with = "source"` should make this case unreachable
         // at parse time, but we still return a clean error rather than panic.
-        (Some(_), Some(_)) => Err(miette!(
-            "cannot provide both <source> path and --url"
-        )),
+        (Some(_), Some(_)) => Err(miette!("cannot provide both <source> path and --url")),
     }
 }
 
@@ -1310,8 +1332,7 @@ fn auto_register_vault(path: &std::path::Path) {
 }
 
 fn handle_vault_command(sub: VaultCommand) -> Result<ExitCode> {
-    let mut global = scriptorium_core::global_config::GlobalConfig::load()
-        .into_diagnostic()?;
+    let mut global = scriptorium_core::global_config::GlobalConfig::load().into_diagnostic()?;
 
     match sub {
         VaultCommand::List => {
@@ -1368,7 +1389,9 @@ fn handle_vault_command(sub: VaultCommand) -> Result<ExitCode> {
         }
         VaultCommand::Show { name } => {
             let entry = if let Some(n) = &name {
-                global.find(n).ok_or_else(|| miette!("no vault named '{n}'"))?
+                global
+                    .find(n)
+                    .ok_or_else(|| miette!("no vault named '{n}'"))?
             } else {
                 global
                     .default_vault()
@@ -1386,7 +1409,10 @@ fn handle_vault_command(sub: VaultCommand) -> Result<ExitCode> {
                 if cfg_path.as_std_path().exists() {
                     let cfg = load_config(&vault);
                     println!("LLM:     {} / {}", cfg.llm.provider, cfg.llm.model);
-                    println!("Embed:   {} / {}", cfg.embeddings.provider, cfg.embeddings.model);
+                    println!(
+                        "Embed:   {} / {}",
+                        cfg.embeddings.provider, cfg.embeddings.model
+                    );
                 }
             } else {
                 println!("Status:  NOT FOUND (directory missing or inaccessible)");
@@ -1408,15 +1434,19 @@ fn handle_hooks_command(sub: HooksCommand) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         HooksCommand::Migrate { jsonl, db, dry_run }
-        | HooksCommand::Import { jsonl, db, dry_run } => {
-            hooks_import_inner(jsonl, db, dry_run)
-        }
-        HooksCommand::Check { test, json, quick, settings, hooks_dir, vault } => {
-            hooks_check_inner(test, json, quick, settings, hooks_dir, vault)
-        }
-        HooksCommand::List { settings, hooks_dir } => {
-            hooks_list_inner(settings, hooks_dir)
-        }
+        | HooksCommand::Import { jsonl, db, dry_run } => hooks_import_inner(jsonl, db, dry_run),
+        HooksCommand::Check {
+            test,
+            json,
+            quick,
+            settings,
+            hooks_dir,
+            vault,
+        } => hooks_check_inner(test, json, quick, settings, hooks_dir, vault),
+        HooksCommand::List {
+            settings,
+            hooks_dir,
+        } => hooks_list_inner(settings, hooks_dir),
         #[cfg(feature = "dashboard")]
         HooksCommand::Dashboard { .. } => unreachable!("handled in run()"),
     }
@@ -1463,10 +1493,7 @@ fn hooks_check_inner(
 }
 
 #[allow(clippy::unnecessary_wraps)]
-fn hooks_list_inner(
-    settings: Option<PathBuf>,
-    hooks_dir: Option<PathBuf>,
-) -> Result<ExitCode> {
+fn hooks_list_inner(settings: Option<PathBuf>, hooks_dir: Option<PathBuf>) -> Result<ExitCode> {
     let settings_path = settings.unwrap_or_else(default_settings_path);
     let hooks_path = hooks_dir.unwrap_or_else(default_hooks_dir);
 
@@ -1554,8 +1581,7 @@ fn hooks_log_inner(
     db_path: Option<PathBuf>,
     dry_run_flag: bool,
 ) -> std::result::Result<(), String> {
-    let raw = std::io::read_to_string(std::io::stdin())
-        .map_err(|e| format!("read stdin: {e}"))?;
+    let raw = std::io::read_to_string(std::io::stdin()).map_err(|e| format!("read stdin: {e}"))?;
 
     if raw.trim().is_empty() {
         return Ok(());
@@ -1566,8 +1592,7 @@ fn hooks_log_inner(
 
     let event = map_raw_to_hook_event(&parsed, &raw)?;
 
-    let is_dry_run =
-        dry_run_flag || std::env::var("SCRIPTORIUM_DRY_RUN").is_ok_and(|v| v == "1");
+    let is_dry_run = dry_run_flag || std::env::var("SCRIPTORIUM_DRY_RUN").is_ok_and(|v| v == "1");
     if is_dry_run {
         return Ok(());
     }
@@ -1595,9 +1620,8 @@ fn map_raw_to_hook_event(
 ) -> std::result::Result<scriptorium_core::hooks_store::HookEvent, String> {
     use scriptorium_core::hooks_store::{HookEvent, HooksStore};
 
-    let str_field = |key: &str| -> Option<String> {
-        v.get(key).and_then(|val| val.as_str()).map(String::from)
-    };
+    let str_field =
+        |key: &str| -> Option<String> { v.get(key).and_then(|val| val.as_str()).map(String::from) };
     let int_field = |key: &str| -> Option<i32> {
         v.get(key)
             .and_then(serde_json::Value::as_i64)
@@ -1644,8 +1668,7 @@ fn map_raw_to_hook_event(
     let session_id =
         str_field("session_id").ok_or_else(|| "missing required field: session_id".to_string())?;
 
-    let ts = str_field("ts")
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let ts = str_field("ts").unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
     Ok(HookEvent {
         id: None,
@@ -1701,9 +1724,7 @@ fn default_hooks_jsonl_path() -> PathBuf {
 
 fn default_settings_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".claude")
-        .join("settings.json")
+    PathBuf::from(home).join(".claude").join("settings.json")
 }
 
 fn default_hooks_dir() -> PathBuf {
