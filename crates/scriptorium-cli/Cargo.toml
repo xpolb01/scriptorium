@@ -40,3 +40,7 @@ indicatif.workspace = true
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"

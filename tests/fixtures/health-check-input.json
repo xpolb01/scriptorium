@@ -1,0 +1,14 @@
+{
+  "timestamp": 1713360000000000000,
+  "checks": [
+    {
+      "name": "database_accessible",
+      "status": "ok"
+    },
+    {
+      "name": "disk_usage",
+      "status": "ok",
+      "details": "2.1 GB used"
+    }
+  ]
+}
