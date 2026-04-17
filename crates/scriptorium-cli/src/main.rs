@@ -135,6 +135,15 @@ enum Command {
         /// Override the embeddings provider declared in config.
         #[arg(long, value_enum)]
         provider: Option<ProviderKind>,
+        /// Prune old telemetry (logs, spans, orphan resources) older than --older-than.
+        #[arg(long)]
+        prune_telemetry: bool,
+        /// Duration threshold for --prune-telemetry (e.g. `30d`, `12h`, `60m`, `90s`).
+        #[arg(long)]
+        older_than: Option<String>,
+        /// For --prune-telemetry: compute the report without deleting.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Bulk-ingest all eligible files from a directory. Supports checkpoint
@@ -880,7 +889,32 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     };
                     Ok(exit)
                 }
-                Command::Maintain { fix, provider } => {
+                Command::Maintain {
+                    fix,
+                    provider,
+                    prune_telemetry,
+                    older_than,
+                    dry_run,
+                } => {
+                    if prune_telemetry {
+                        let spec = older_than.ok_or_else(|| {
+                            miette!("--older-than is required with --prune-telemetry")
+                        })?;
+                        let duration = scriptorium_core::maintain::parse_older_than(&spec)
+                            .map_err(|e| miette!("invalid --older-than '{spec}': {e}"))?;
+                        let db_path = default_hooks_db_path();
+                        let store = scriptorium_core::telemetry::TelemetryStore::open(&db_path)
+                            .map_err(|e| miette!("open telemetry store: {e}"))?;
+                        let report =
+                            scriptorium_core::maintain::prune_telemetry(&store, duration, dry_run)
+                                .map_err(|e| miette!("prune failed: {e}"))?;
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report)
+                                .map_err(|e| miette!("json: {e}"))?
+                        );
+                        return Ok(ExitCode::SUCCESS);
+                    }
                     let vault = open_vault(&vault_path)?;
                     let cfg = load_config(&vault);
                     let store = open_store(&vault)?;

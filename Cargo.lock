@@ -2693,6 +2693,7 @@ dependencies = [
  "clap",
  "indicatif",
  "miette",
+ "rusqlite",
  "scriptorium-core",
  "scriptorium-mcp",
  "serde",
