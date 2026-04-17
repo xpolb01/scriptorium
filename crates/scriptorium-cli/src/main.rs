@@ -7,6 +7,8 @@
 
 #[cfg(feature = "dashboard")]
 mod dashboard;
+mod log_cmd;
+mod trace_cmd;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -199,6 +201,12 @@ enum Command {
     /// Claude Code hook event ingestion into `SQLite`.
     #[command(subcommand)]
     Hooks(HooksCommand),
+
+    /// OTel-shaped log emit / tail subcommands.
+    Log(log_cmd::LogCommand),
+
+    /// Trace tree inspect / new-root + span start / span end.
+    Trace(trace_cmd::TraceCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -467,6 +475,14 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         // --- commands that don't need vault resolution ---
         Command::VaultMgmt(sub) => handle_vault_command(sub),
+        Command::Log(cmd) => {
+            log_cmd::run(cmd, default_hooks_db_path())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Trace(cmd) => {
+            trace_cmd::run(cmd, default_hooks_db_path())?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Hooks(sub) => {
             #[cfg(feature = "dashboard")]
             if let HooksCommand::Dashboard {
@@ -1048,7 +1064,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     }
                 }
                 // Already handled before vault resolution.
-                Command::VaultMgmt(_) | Command::Init { .. } | Command::Hooks(_) => unreachable!(),
+                Command::VaultMgmt(_)
+                | Command::Init { .. }
+                | Command::Hooks(_)
+                | Command::Log(_)
+                | Command::Trace(_) => unreachable!(),
             } // inner match
         } // outer `command =>` arm
     }
