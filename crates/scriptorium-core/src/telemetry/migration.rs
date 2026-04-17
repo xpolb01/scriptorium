@@ -501,8 +501,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.sqlite");
         let store = TelemetryStore::open(&path).expect("open store");
-        // Hook events table lives beside the telemetry tables in the same DB.
         let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP VIEW IF EXISTS hook_events; DROP TRIGGER IF EXISTS hook_events_insert;",
+        )
+        .unwrap();
         conn.execute_batch(HOOK_EVENTS_DDL).unwrap();
         (dir, store)
     }

@@ -18,12 +18,15 @@ use rusqlite::{Connection, OptionalExtension};
 /// Migration 001 source (embedded at compile time).
 pub const MIGRATION_001: &str = include_str!("../../migrations/001_telemetry_initial.sql");
 
+/// Migration 002 source (hook_events compat shim — Strategy B).
+pub const MIGRATION_002: &str = include_str!("../../migrations/002_hook_events_compat.sql");
+
 /// The highest schema version this build knows how to produce.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Ordered registry of all known migrations. Version numbers MUST be
 /// strictly increasing and contiguous starting at 1.
-const MIGRATIONS: &[(u32, &str)] = &[(1, MIGRATION_001)];
+const MIGRATIONS: &[(u32, &str)] = &[(1, MIGRATION_001), (2, MIGRATION_002)];
 
 /// Apply every migration whose version is greater than the DB's current
 /// recorded version. Returns the final schema version.
@@ -190,6 +193,131 @@ mod tests {
     }
 
     #[test]
+    fn fresh_db_applies_to_v2() {
+        let conn = fresh_conn();
+        let v = apply_migrations(&conn).expect("apply");
+        assert_eq!(v, 2);
+
+        let view_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='hook_events'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(view_count, 1, "hook_events must be a VIEW after v2");
+
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='hook_events'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0, "physical hook_events table must be gone");
+
+        let trigger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='hook_events_insert'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger_count, 1, "INSTEAD OF INSERT trigger must exist");
+    }
+
+    #[test]
+    fn idempotent_reapply_v2() {
+        let conn = fresh_conn();
+        apply_migrations(&conn).unwrap();
+        apply_migrations(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_version WHERE version = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn view_projects_logs_source_hook() {
+        let conn = fresh_conn();
+        apply_migrations(&conn).unwrap();
+
+        let resource_id: i64 = conn
+            .query_row(
+                "SELECT id FROM resources WHERE attributes_hash='hook-events-compat-shim-v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO logs (time_unix_nano, observed_time_unix_nano, severity_number, \
+             body, resource_id, attributes, source, dedup_hash) \
+             VALUES (1700000000000000000, 1700000000000000000, 9, 'hook.turn_scored', ?1, \
+             '{\"session_id\":\"sess-abc\",\"score\":7,\"decision\":\"ingest\",\"raw_json_hash\":\"hash-1\"}', \
+             'hook', 'test-dedup-1')",
+            rusqlite::params![resource_id],
+        )
+        .unwrap();
+
+        let (session_id, hook_type, score, decision, raw_json_hash): (
+            String,
+            String,
+            Option<i32>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT session_id, hook_type, score, decision, raw_json_hash FROM hook_events",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(session_id, "sess-abc");
+        assert_eq!(hook_type, "stop");
+        assert_eq!(score, Some(7));
+        assert_eq!(decision.as_deref(), Some("ingest"));
+        assert_eq!(raw_json_hash.as_deref(), Some("hash-1"));
+    }
+
+    #[test]
+    fn instead_of_trigger_redirects_insert_to_logs() {
+        let conn = fresh_conn();
+        apply_migrations(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO hook_events (ts, session_id, hook_type, score, decision, raw_json, raw_json_hash) \
+             VALUES ('2026-04-15T10:00:00Z', 'sess-xyz', 'stop', 8, 'ingest', '{\"k\":1}', 'hash-xyz')",
+            [],
+        )
+        .unwrap();
+
+        let logs_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM logs WHERE source='hook' AND dedup_hash='legacy-shim:hash-xyz'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(logs_count, 1, "trigger must redirect insert to logs");
+
+        let (session_id, hook_type, score): (String, String, Option<i32>) = conn
+            .query_row(
+                "SELECT session_id, hook_type, score FROM hook_events WHERE raw_json_hash='hash-xyz'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(session_id, "sess-xyz");
+        assert_eq!(hook_type, "stop");
+        assert_eq!(score, Some(8));
+    }
+
+    #[test]
     fn partial_apply_recovery() {
         let conn = fresh_conn();
         conn.execute_batch(
@@ -201,7 +329,7 @@ mod tests {
         .unwrap();
 
         let v = apply_migrations(&conn).unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, CURRENT_SCHEMA_VERSION);
 
         let tables: i64 = conn
             .query_row(
