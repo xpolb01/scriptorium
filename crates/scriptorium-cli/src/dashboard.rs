@@ -11,15 +11,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
+use std::str::FromStr;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use scriptorium_core::hooks_store::HooksStore;
+use scriptorium_core::telemetry::{
+    store::{SummaryGroupBy, SummaryReport},
+    Cursor, LogFilters, Source, SpanFilters, TelemetryStore,
+};
 
 // ── App state ────────────────────────────────────────────────────────────
 
@@ -35,6 +40,28 @@ struct AppState {
     settings_path: PathBuf,
     hooks_dir: PathBuf,
     vault_path: Option<PathBuf>,
+    telemetry: Arc<TelemetryStore>,
+}
+
+fn cap_limit(raw: Option<u32>) -> u32 {
+    raw.unwrap_or(50).clamp(1, 1000)
+}
+
+fn parse_sources(csv: Option<&str>) -> Vec<Source> {
+    csv.map(|s| {
+        s.split(',')
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| Source::from_str(t.trim()).ok())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn json_err(status: StatusCode, detail: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({ "error": "internal", "detail": detail })),
+    )
 }
 
 // ── Query parameter structs ──────────────────────────────────────────────
@@ -226,6 +253,221 @@ async fn index_handler() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
 }
 
+// ── Telemetry query params ───────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct LogsParams {
+    source: Option<String>,
+    severity: Option<u8>,
+    search: Option<String>,
+    trace_id: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpansParams {
+    source: Option<String>,
+    name: Option<String>,
+    trace_id: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TimelineParams {
+    sources: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryWindowParams {
+    window: Option<u64>,
+}
+
+async fn logs_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<LogsParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let limit = cap_limit(params.limit);
+    let filters = LogFilters {
+        sources: parse_sources(params.source.as_deref()),
+        min_severity: params.severity,
+        search: params.search,
+        trace_id: params.trace_id,
+        since_unix_nano: None,
+    };
+    let cursor = params.cursor.as_deref().and_then(Cursor::decode);
+    let tele = state.telemetry.clone();
+
+    let result = tokio::task::spawn_blocking(move || tele.query_logs(filters, cursor, limit))
+        .await
+        .map_err(|_| json_err(StatusCode::INTERNAL_SERVER_ERROR, "logs task panicked"))?
+        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")))?;
+
+    let (items, next) = result;
+    Ok(Json(serde_json::json!({
+        "items": items,
+        "next_cursor": next.map(|c| c.encode()),
+    })))
+}
+
+async fn spans_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SpansParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let limit = cap_limit(params.limit);
+    let filters = SpanFilters {
+        sources: parse_sources(params.source.as_deref()),
+        name: params.name,
+        trace_id: params.trace_id,
+        since_unix_nano: None,
+    };
+    let cursor = params.cursor.as_deref().and_then(Cursor::decode);
+    let tele = state.telemetry.clone();
+
+    let (items, next) =
+        tokio::task::spawn_blocking(move || tele.query_spans(filters, cursor, limit))
+            .await
+            .map_err(|_| json_err(StatusCode::INTERNAL_SERVER_ERROR, "spans task panicked"))?
+            .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")))?;
+
+    Ok(Json(serde_json::json!({
+        "items": items,
+        "next_cursor": next.map(|c| c.encode()),
+    })))
+}
+
+async fn trace_handler(
+    State(state): State<Arc<AppState>>,
+    Path(trace_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tele = state.telemetry.clone();
+    let tree = tokio::task::spawn_blocking(move || tele.query_trace(&trace_id))
+        .await
+        .map_err(|_| json_err(StatusCode::INTERNAL_SERVER_ERROR, "trace task panicked"))?
+        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")))?;
+    Ok(Json(
+        serde_json::to_value(tree).unwrap_or(serde_json::json!({})),
+    ))
+}
+
+async fn timeline_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<TimelineParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let limit = cap_limit(params.limit);
+    let sources = parse_sources(params.sources.as_deref());
+    let cursor = params.cursor.as_deref().and_then(Cursor::decode);
+    let tele = state.telemetry.clone();
+
+    let result = tokio::task::spawn_blocking(move || tele.query_timeline(&sources, cursor, limit))
+        .await
+        .map_err(|_| json_err(StatusCode::INTERNAL_SERVER_ERROR, "timeline task panicked"))?
+        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")))?;
+
+    let items: Vec<serde_json::Value> = result
+        .items
+        .into_iter()
+        .map(|e| {
+            use scriptorium_core::telemetry::TimelineEntry;
+            match e {
+                TimelineEntry::Log(l) => serde_json::json!({
+                    "timeline_key": format!("log:{}", l.id),
+                    "kind": "log",
+                    "time_unix_nano": l.time_unix_nano,
+                    "source": l.source,
+                    "log": l,
+                }),
+                TimelineEntry::SpanStart(s) => serde_json::json!({
+                    "timeline_key": format!("span:{}", s.span_id),
+                    "kind": "span_start",
+                    "time_unix_nano": s.start_time_unix_nano,
+                    "source": s.source,
+                    "span": s,
+                }),
+            }
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "items": items,
+        "next_cursor": result.next_cursor.map(|c| c.encode()),
+    })))
+}
+
+fn summary_report(
+    state: &Arc<AppState>,
+    source: &'static str,
+    group_by: SummaryGroupBy<'static>,
+    window_ms: u64,
+) -> Result<SummaryReport, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .telemetry
+        .span_summary(source, group_by, window_ms)
+        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")))
+}
+
+async fn cli_summary_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SummaryWindowParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let window = params.window.unwrap_or(3_600_000);
+    let state2 = state.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        summary_report(&state2, "cli", SummaryGroupBy::SpanAttr("command"), window)
+    })
+    .await
+    .map_err(|_| json_err(StatusCode::INTERNAL_SERVER_ERROR, "cli summary panicked"))??;
+    Ok(Json(serde_json::json!({
+        "top_commands": report.top,
+        "total_invocations": report.total,
+        "error_count": report.error_count,
+    })))
+}
+
+async fn mcp_summary_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SummaryWindowParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let window = params.window.unwrap_or(3_600_000);
+    let state2 = state.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        summary_report(
+            &state2,
+            "mcp",
+            SummaryGroupBy::SpanAttr("tool_name"),
+            window,
+        )
+    })
+    .await
+    .map_err(|_| json_err(StatusCode::INTERNAL_SERVER_ERROR, "mcp summary panicked"))??;
+    Ok(Json(serde_json::json!({
+        "top_tools": report.top,
+        "total_calls": report.total,
+        "error_count": report.error_count,
+        "session_count": report.session_count,
+    })))
+}
+
+async fn hook_summary_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SummaryWindowParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let window = params.window.unwrap_or(3_600_000);
+    let tele = state.telemetry.clone();
+    let report = tokio::task::spawn_blocking(move || tele.log_summary_by_body("hook", 40, window))
+        .await
+        .map_err(|_| json_err(StatusCode::INTERNAL_SERVER_ERROR, "hook summary panicked"))?
+        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")))?;
+    Ok(Json(serde_json::json!({
+        "top_commands": report.top,
+        "total_invocations": report.total,
+        "error_count": report.error_count,
+    })))
+}
+
 // ── Public entry point ───────────────────────────────────────────────────
 
 /// Start the hooks health dashboard web server.
@@ -249,33 +491,20 @@ pub async fn start_dashboard(
         std::fs::create_dir_all(parent).into_diagnostic()?;
     }
 
-    if let Some(ref jsonl) = jsonl_path {
-        if jsonl.exists() {
-            eprintln!("Importing events from {}…", jsonl.display());
-            let store = HooksStore::open(&db_path).map_err(|e| miette!("open hooks db: {e}"))?;
-            let report = store
-                .import_jsonl(jsonl, false)
-                .map_err(|e| miette!("import: {e}"))?;
-            eprintln!(
-                "Import: {} imported, {} duplicates skipped, {} malformed",
-                report.imported, report.skipped_duplicate, report.skipped_malformed,
-            );
-        } else {
-            eprintln!(
-                "JSONL file not found: {} — skipping import",
-                jsonl.display()
-            );
-        }
-    }
+    let _ = jsonl_path;
 
     let _verify =
         HooksStore::open(&db_path).map_err(|e| miette!("cannot open hooks database: {e}"))?;
+    let telemetry = Arc::new(
+        TelemetryStore::open(&db_path).map_err(|e| miette!("cannot open telemetry store: {e}"))?,
+    );
 
     let state = Arc::new(AppState {
         db_path,
         settings_path,
         hooks_dir,
         vault_path,
+        telemetry,
     });
 
     let cors = CorsLayer::new()
@@ -294,6 +523,13 @@ pub async fn start_dashboard(
         .route("/api/events", get(events_handler))
         .route("/api/errors", get(errors_handler))
         .route("/api/health", get(health_handler))
+        .route("/api/logs", get(logs_handler))
+        .route("/api/spans", get(spans_handler))
+        .route("/api/traces/:trace_id", get(trace_handler))
+        .route("/api/timeline", get(timeline_handler))
+        .route("/api/cli/summary", get(cli_summary_handler))
+        .route("/api/mcp/summary", get(mcp_summary_handler))
+        .route("/api/hook/summary", get(hook_summary_handler))
         .layer(cors)
         .with_state(state);
 
@@ -328,24 +564,29 @@ mod tests {
     use scriptorium_core::hooks_check::{CheckItem, CheckStatus};
     use tower::ServiceExt;
 
+    fn tmp_state(db: &str) -> Arc<AppState> {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("scr-dash-{n}-{db}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join(db);
+        let telemetry = Arc::new(TelemetryStore::open(&db_path).unwrap());
+        Arc::new(AppState {
+            db_path,
+            settings_path: PathBuf::from("/nonexistent/settings.json"),
+            hooks_dir: PathBuf::from("/nonexistent/hooks"),
+            vault_path: None,
+            telemetry,
+        })
+    }
+
     #[test]
     fn app_state_carries_new_paths() {
-        let db_path = PathBuf::from("/tmp/hooks.sqlite");
-        let settings_path = PathBuf::from("/tmp/settings.json");
-        let hooks_dir = PathBuf::from("/tmp/hooks");
-        let vault_path = Some(PathBuf::from("/tmp/vault"));
-
-        let state = AppState {
-            db_path: db_path.clone(),
-            settings_path: settings_path.clone(),
-            hooks_dir: hooks_dir.clone(),
-            vault_path: vault_path.clone(),
-        };
-
-        assert_eq!(state.db_path, db_path);
-        assert_eq!(state.settings_path, settings_path);
-        assert_eq!(state.hooks_dir, hooks_dir);
-        assert_eq!(state.vault_path, vault_path);
+        let state = tmp_state("hooks.sqlite");
+        assert!(state.db_path.ends_with("hooks.sqlite"));
+        assert_eq!(state.vault_path, None);
     }
 
     fn build_test_router(state: Arc<AppState>) -> Router {
@@ -375,12 +616,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_handler_returns_checkitem_array() {
-        let state = Arc::new(AppState {
-            db_path: PathBuf::from("/tmp/health-t1.sqlite"),
-            settings_path: PathBuf::from("/nonexistent/settings.json"),
-            hooks_dir: PathBuf::from("/nonexistent/hooks"),
-            vault_path: None,
-        });
+        let state = tmp_state("health-t1.sqlite");
 
         let (status, body) = oneshot_health(state).await;
         assert_eq!(status, StatusCode::OK);
@@ -394,12 +630,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_handler_missing_settings_surfaces_fail_item() {
-        let state = Arc::new(AppState {
-            db_path: PathBuf::from("/tmp/health-t2.sqlite"),
-            settings_path: PathBuf::from("/nonexistent/settings.json"),
-            hooks_dir: PathBuf::from("/nonexistent/hooks"),
-            vault_path: None,
-        });
+        let state = tmp_state("health-t2.sqlite");
 
         let (status, body) = oneshot_health(state).await;
         assert_eq!(status, StatusCode::OK);
@@ -412,12 +643,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_handler_no_vault_surfaces_info_item() {
-        let state = Arc::new(AppState {
-            db_path: PathBuf::from("/tmp/health-t3.sqlite"),
-            settings_path: PathBuf::from("/nonexistent/settings.json"),
-            hooks_dir: PathBuf::from("/nonexistent/hooks"),
-            vault_path: None,
-        });
+        let state = tmp_state("health-t3.sqlite");
 
         let (status, body) = oneshot_health(state).await;
         assert_eq!(status, StatusCode::OK);
@@ -456,12 +682,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_handler_missing_since_works() {
-        let state = Arc::new(AppState {
-            db_path: PathBuf::from("/tmp/events-t1.sqlite"),
-            settings_path: PathBuf::from("/nonexistent/settings.json"),
-            hooks_dir: PathBuf::from("/nonexistent/hooks"),
-            vault_path: None,
-        });
+        let state = tmp_state("events-t1.sqlite");
 
         let (status, _body) = oneshot_events(state, "/api/events").await;
         assert_eq!(
@@ -473,12 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_handler_valid_since_parses() {
-        let state = Arc::new(AppState {
-            db_path: PathBuf::from("/tmp/events-t2.sqlite"),
-            settings_path: PathBuf::from("/nonexistent/settings.json"),
-            hooks_dir: PathBuf::from("/nonexistent/hooks"),
-            vault_path: None,
-        });
+        let state = tmp_state("events-t2.sqlite");
 
         let (status, _body) = oneshot_events(state, "/api/events?since=2026-04-16T08:00:00Z").await;
         assert_eq!(
@@ -490,12 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_handler_invalid_since_400() {
-        let state = Arc::new(AppState {
-            db_path: PathBuf::from("/tmp/events-t3.sqlite"),
-            settings_path: PathBuf::from("/nonexistent/settings.json"),
-            hooks_dir: PathBuf::from("/nonexistent/hooks"),
-            vault_path: None,
-        });
+        let state = tmp_state("events-t3.sqlite");
 
         let (status, body) = oneshot_events(state, "/api/events?since=not-a-date").await;
         assert_eq!(

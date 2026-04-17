@@ -218,6 +218,70 @@ pub struct LogFilters {
     pub since_unix_nano: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum SummaryGroupBy<'a> {
+    SpanName,
+    SpanAttr(&'a str),
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SummaryRow {
+    pub name: String,
+    pub count: u64,
+    pub avg_duration_ms: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub failure_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SummaryReport {
+    pub top: Vec<SummaryRow>,
+    pub total: u64,
+    pub error_count: u64,
+    pub session_count: u64,
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn aggregate_group(name: String, points: &[(i64, bool)]) -> SummaryRow {
+    let count = points.len() as u64;
+    let mut durs_ms: Vec<f64> = points
+        .iter()
+        .map(|(ns, _)| (*ns as f64) / 1_000_000.0)
+        .collect();
+    durs_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let avg = if durs_ms.is_empty() {
+        0.0
+    } else {
+        durs_ms.iter().sum::<f64>() / (durs_ms.len() as f64)
+    };
+    let percentile = |p: f64| -> f64 {
+        if durs_ms.is_empty() {
+            return 0.0;
+        }
+        let idx = ((p / 100.0) * (durs_ms.len() as f64 - 1.0)).round() as usize;
+        durs_ms[idx.min(durs_ms.len() - 1)]
+    };
+    let failures = points.iter().filter(|(_, err)| *err).count() as f64;
+    let failure_rate = if count == 0 {
+        0.0
+    } else {
+        failures / (count as f64)
+    };
+    SummaryRow {
+        name,
+        count,
+        avg_duration_ms: avg,
+        p50_ms: percentile(50.0),
+        p95_ms: percentile(95.0),
+        failure_rate,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SpanFilters {
     pub sources: Vec<Source>,
@@ -840,6 +904,159 @@ impl TelemetryStore {
         Ok(TimelineResult {
             items: merged,
             next_cursor,
+        })
+    }
+
+    /// Aggregate completed spans (`end_time_unix_nano IS NOT NULL`) for a
+    /// given `source`, grouped by [`SummaryGroupBy`]. Computes per-group
+    /// count, avg/p50/p95 duration, and failure rate (share of spans with
+    /// `status_code = 'ERROR'`).
+    ///
+    /// `window_ms` is relative to "now"; non-positive windows disable the
+    /// time filter. At most 10k rows are fetched to bound p50/p95 work.
+    #[allow(
+        clippy::needless_pass_by_value,
+        clippy::cast_precision_loss,
+        clippy::similar_names
+    )]
+    pub fn span_summary(
+        &self,
+        source: &str,
+        group_by: SummaryGroupBy,
+        window_ms: u64,
+    ) -> rusqlite::Result<SummaryReport> {
+        let conn = Connection::open(&self.inner.db_path)?;
+        configure_conn(&conn)?;
+
+        let since_ns: i64 = {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+                .unwrap_or(0);
+            if window_ms == 0 {
+                0
+            } else {
+                let window_ns =
+                    i64::try_from(window_ms.saturating_mul(1_000_000)).unwrap_or(i64::MAX);
+                now_ns.saturating_sub(window_ns)
+            }
+        };
+
+        let group_expr = match group_by {
+            SummaryGroupBy::SpanName => "name".to_string(),
+            SummaryGroupBy::SpanAttr(key) => {
+                format!("json_extract(attributes, '$.{}')", key.replace('\'', "''"))
+            }
+        };
+
+        let sql = format!(
+            "SELECT {group_expr} AS grp, \
+             (end_time_unix_nano - start_time_unix_nano) AS dur_ns, \
+             status_code, trace_id \
+             FROM spans \
+             WHERE source = ?1 AND start_time_unix_nano > ?2 AND end_time_unix_nano IS NOT NULL \
+             LIMIT 10000"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<(Option<String>, i64, String, String)> = stmt
+            .query_map(params![source, since_ns], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let total = rows.len() as u64;
+        let error_count = rows
+            .iter()
+            .filter(|(_, _, code, _)| code == "ERROR")
+            .count() as u64;
+
+        let mut sessions = std::collections::HashSet::new();
+        let mut groups: HashMap<String, Vec<(i64, bool)>> = HashMap::new();
+        for (grp, dur, code, tid) in rows {
+            let key = grp.unwrap_or_else(|| "(none)".to_string());
+            groups.entry(key).or_default().push((dur, code == "ERROR"));
+            sessions.insert(tid);
+        }
+
+        let mut summary: Vec<SummaryRow> = groups
+            .into_iter()
+            .map(|(name, points)| aggregate_group(name, &points))
+            .collect();
+        summary.sort_by(|a, b| b.count.cmp(&a.count));
+        summary.truncate(10);
+
+        Ok(SummaryReport {
+            top: summary,
+            total,
+            error_count,
+            session_count: sessions.len() as u64,
+        })
+    }
+
+    /// Aggregate logs by body prefix of `prefix_len` chars for the given
+    /// `source`, over the last `window_ms`. Durations are zero (logs have
+    /// no duration); `failure_rate` is share of rows with `severity >=
+    /// ERROR (17)`.
+    #[allow(clippy::cast_precision_loss, clippy::similar_names)]
+    pub fn log_summary_by_body(
+        &self,
+        source: &str,
+        prefix_len: usize,
+        window_ms: u64,
+    ) -> rusqlite::Result<SummaryReport> {
+        let conn = Connection::open(&self.inner.db_path)?;
+        configure_conn(&conn)?;
+
+        let since_ns: i64 = {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+                .unwrap_or(0);
+            if window_ms == 0 {
+                0
+            } else {
+                let window_ns =
+                    i64::try_from(window_ms.saturating_mul(1_000_000)).unwrap_or(i64::MAX);
+                now_ns.saturating_sub(window_ns)
+            }
+        };
+
+        let sql = "SELECT substr(body, 1, ?1) AS grp, severity_number \
+                   FROM logs WHERE source = ?2 AND time_unix_nano > ?3 LIMIT 10000";
+        let plen = i64::try_from(prefix_len.max(1)).unwrap_or(40);
+        let mut stmt = conn.prepare(sql)?;
+        let rows: Vec<(String, i64)> = stmt
+            .query_map(params![plen, source, since_ns], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let total = rows.len() as u64;
+        let error_count = rows.iter().filter(|(_, sev)| *sev >= 17).count() as u64;
+
+        let mut groups: HashMap<String, Vec<(i64, bool)>> = HashMap::new();
+        for (grp, sev) in rows {
+            groups.entry(grp).or_default().push((0, sev >= 17));
+        }
+
+        let mut summary: Vec<SummaryRow> = groups
+            .into_iter()
+            .map(|(name, points)| aggregate_group(name, &points))
+            .collect();
+        summary.sort_by(|a, b| b.count.cmp(&a.count));
+        summary.truncate(10);
+
+        Ok(SummaryReport {
+            top: summary,
+            total,
+            error_count,
+            session_count: 0,
         })
     }
 
