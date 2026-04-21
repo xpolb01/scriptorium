@@ -15,16 +15,14 @@ pub fn check(pages: &[Page]) -> Vec<LintIssue> {
     pages
         .iter()
         .filter(|p| !has_timeline_section(&p.body))
-        .map(|p| {
-            LintIssue {
-                severity: Severity::Info,
-                rule: MISSING_TIMELINE.into(),
-                page: Some(p.frontmatter.id),
-                path: Some(p.path.clone()),
-                message: "page lacks a ## Timeline section below a --- separator; \
+        .map(|p| LintIssue {
+            severity: Severity::Info,
+            rule: MISSING_TIMELINE.into(),
+            page: Some(p.frontmatter.id),
+            path: Some(p.path.clone()),
+            message: "page lacks a ## Timeline section below a --- separator; \
                           consider adding one for provenance tracking"
-                    .into(),
-            }
+                .into(),
         })
         .collect()
 }

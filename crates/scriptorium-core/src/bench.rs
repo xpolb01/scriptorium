@@ -293,7 +293,7 @@ fn mean_reciprocal_rank(retrieved: &[String], expected: &[String]) -> f32 {
 /// NDCG@k — Normalized Discounted Cumulative Gain at rank k.
 ///
 /// Binary relevance: 1 if the retrieved item is in the expected set, 0
-/// otherwise. DCG = Σ rel_i / log₂(i+2) for i in 0..k. IDCG is the
+/// otherwise. DCG = Σ `rel_i` / log₂(i+2) for i in 0..k. IDCG is the
 /// DCG of a perfect ranking (all expected items at the top).
 #[allow(clippy::cast_precision_loss)]
 fn ndcg_at_k(retrieved: &[String], expected: &[String], k: usize) -> f32 {

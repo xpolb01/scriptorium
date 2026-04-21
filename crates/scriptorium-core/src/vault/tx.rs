@@ -283,6 +283,7 @@ fn validate_pending(vault: &Vault, pending: &BTreeMap<Utf8PathBuf, Pending>) -> 
         });
     }
     issues.extend(lint::frontmatter::check(&scan.pages));
+    issues.extend(lint::frontmatter::check_duplicate_stems(&scan.pages));
     issues.extend(lint::broken_links::check(&graph));
     issues.extend(lint::orphans::check(&graph));
     Ok(LintReport { issues })

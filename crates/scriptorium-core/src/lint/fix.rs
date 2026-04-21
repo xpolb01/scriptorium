@@ -70,8 +70,7 @@ pub fn run(vault: &Vault) -> Result<FixReport> {
                     continue;
                 };
                 let mut next = page.clone();
-                let bumped: DateTime<_> =
-                    next.frontmatter.created.max(next.frontmatter.updated);
+                let bumped: DateTime<_> = next.frontmatter.created.max(next.frontmatter.updated);
                 next.frontmatter.updated = bumped;
                 tx.write_page(&next)?;
                 fixed.push(issue.clone());
@@ -211,7 +210,10 @@ mod tests {
         let report = run(&vault).unwrap();
         assert!(report.is_noop(), "no fixable issues, expected no-op");
         assert!(report.commit_id.is_none(), "no commit on no-op");
-        assert!(!report.skipped.is_empty(), "the broken link should appear as skipped");
+        assert!(
+            !report.skipped.is_empty(),
+            "the broken link should appear as skipped"
+        );
         assert!(report
             .skipped
             .iter()
