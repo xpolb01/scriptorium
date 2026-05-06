@@ -258,7 +258,8 @@ pub async fn ingest_with_retrieval(
         &response.model,
         &response.usage,
     );
-    let raw: crate::llm::prompts::IngestPlanRaw = match serde_json::from_str(&response.text) {
+    let salvaged = crate::llm::extract_json_payload(&response.text);
+    let raw: crate::llm::prompts::IngestPlanRaw = match serde_json::from_str(&salvaged) {
         Ok(r) => r,
         Err(parse_err) => {
             // Persist the full context so the bug is debuggable after the
@@ -331,6 +332,10 @@ pub async fn ingest_with_retrieval(
             dry_run_diff: Vec::new(),
             redundant: true,
         });
+    }
+
+    for page in &mut plan.pages {
+        page.body = normalize_wikilinks(&page.body);
     }
 
     guard_stem_collisions(&mut plan, &stem_to_path, &existing_paths)?;
@@ -450,6 +455,16 @@ pub async fn ingest_with_retrieval(
         dry_run_diff: Vec::new(),
         redundant: false,
     })
+}
+
+fn normalize_wikilinks(body: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\[\[wiki/[^\]/|]+/([^\]/|]+?)(?:\.md)?(\|[^\]]+)?\]\]")
+            .expect("normalize_wikilinks regex is valid")
+    });
+    re.replace_all(body, "[[$1$2]]").into_owned()
 }
 
 #[allow(clippy::case_sensitive_file_extension_comparisons)]

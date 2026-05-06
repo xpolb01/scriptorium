@@ -157,6 +157,10 @@ pub trait LlmProvider: Send + Sync {
 
 /// Helper: call [`LlmProvider::complete`] and deserialize the response as JSON
 /// into `T`. Use this for operations whose prompt forces structured output.
+///
+/// Tolerates two common wire-format quirks from non-strict providers (Ollama,
+/// `mlx_lm.server`, llama.cpp without grammar): leading/trailing markdown code
+/// fences (``` ```json ... ``` ```) and prose before/after the JSON object.
 pub async fn complete_as<T>(
     provider: &dyn LlmProvider,
     req: CompletionRequest,
@@ -165,6 +169,67 @@ where
     T: serde::de::DeserializeOwned,
 {
     let resp = provider.complete(req).await?;
-    serde_json::from_str(&resp.text)
+    let payload = extract_json_payload(&resp.text);
+    serde_json::from_str(&payload)
         .map_err(|e| LlmError::InvalidResponse(format!("json parse: {e}")))
+}
+
+/// Locate the JSON object inside an LLM response that may be wrapped in
+/// markdown fences or surrounded by prose. Strips one optional ```` ```json ````
+/// or ```` ``` ```` fence, then narrows to the outermost `{...}` span.
+pub fn extract_json_payload(text: &str) -> String {
+    let trimmed = text.trim();
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```JSON"))
+        .or_else(|| trimmed.strip_prefix("```"))
+        .map(|rest| {
+            let rest = rest.trim_start_matches(|c: char| c == '\n' || c == '\r' || c == ' ');
+            rest.strip_suffix("```")
+                .map(str::trim)
+                .unwrap_or(rest)
+                .to_string()
+        })
+        .unwrap_or_else(|| trimmed.to_string());
+    if let (Some(start), Some(end)) = (unfenced.find('{'), unfenced.rfind('}')) {
+        if end >= start {
+            return unfenced[start..=end].to_string();
+        }
+    }
+    unfenced
+}
+
+#[cfg(test)]
+mod extract_json_payload_tests {
+    use super::extract_json_payload;
+
+    #[test]
+    fn strips_json_fence() {
+        let raw = "```json\n{\"a\":1}\n```";
+        assert_eq!(extract_json_payload(raw), "{\"a\":1}");
+    }
+
+    #[test]
+    fn strips_bare_fence() {
+        let raw = "```\n{\"a\":1}\n```";
+        assert_eq!(extract_json_payload(raw), "{\"a\":1}");
+    }
+
+    #[test]
+    fn passes_through_clean_json() {
+        let raw = "{\"a\":1}";
+        assert_eq!(extract_json_payload(raw), "{\"a\":1}");
+    }
+
+    #[test]
+    fn narrows_to_object_when_prose_surrounds() {
+        let raw = "Here is the plan:\n{\"a\":1}\nHope that helps.";
+        assert_eq!(extract_json_payload(raw), "{\"a\":1}");
+    }
+
+    #[test]
+    fn preserves_nested_objects() {
+        let raw = "```json\n{\"a\":{\"b\":1}}\n```";
+        assert_eq!(extract_json_payload(raw), "{\"a\":{\"b\":1}}");
+    }
 }
