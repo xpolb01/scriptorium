@@ -165,6 +165,44 @@ enum Command {
         dry_run: bool,
     },
 
+    /// Append a source to the ingest queue without running synthesis.
+    IngestEnqueue {
+        #[arg(value_name = "SOURCE")]
+        source: PathBuf,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Drain the queue: dedup, then synthesize survivors serially.
+    IngestDrain {
+        #[arg(long, default_value_t = 120)]
+        debounce: u64,
+        #[arg(long)]
+        max: Option<usize>,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long, value_enum)]
+        provider: Option<ProviderKind>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Inspect or clear the ingest queue.
+    IngestQueue {
+        #[arg(long, conflicts_with_all = ["stats", "clear"])]
+        list: bool,
+        #[arg(long, conflicts_with_all = ["list", "clear"])]
+        stats: bool,
+        #[arg(long, conflicts_with_all = ["list", "stats"])]
+        clear: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
     /// Show the resolved config for this vault.
     Config,
 
@@ -577,6 +615,9 @@ fn command_name_for_span(cmd: &Command) -> &'static str {
         Command::Doctor { .. } => "doctor",
         Command::Maintain { .. } => "maintain",
         Command::BulkIngest { .. } => "bulk-ingest",
+        Command::IngestEnqueue { .. } => "ingest-enqueue",
+        Command::IngestDrain { .. } => "ingest-drain",
+        Command::IngestQueue { .. } => "ingest-queue",
         Command::Config => "config",
         Command::Skill(_) => "skill",
         Command::Learn(_) => "learn",
@@ -993,6 +1034,132 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         eprintln!("    {} — {}", err.path.display(), err.error);
                     }
                     println!("  Elapsed: {:.1}s", report.elapsed.as_secs_f64());
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::IngestEnqueue {
+                    source,
+                    session_id,
+                    json,
+                } => {
+                    let vault = open_vault(&vault_path)?;
+                    let marker = scriptorium_core::ingest_queue::enqueue(
+                        &vault,
+                        &source,
+                        session_id.as_deref(),
+                    )
+                    .into_diagnostic()?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&marker).into_diagnostic()?
+                        );
+                    } else {
+                        println!(
+                            "queued: {} (session={})",
+                            marker.source.display(),
+                            marker.session_id.as_deref().unwrap_or("-")
+                        );
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::IngestDrain {
+                    debounce,
+                    max,
+                    dry_run,
+                    provider,
+                    model,
+                    json,
+                } => {
+                    let vault = open_vault(&vault_path)?;
+                    let cfg = load_config(&vault);
+                    let resolved_provider = provider.unwrap_or_else(|| provider_from(&cfg));
+                    if let Some(ref m) = model {
+                        set_model_env(provider_kind_name(resolved_provider), m);
+                    }
+                    let llm = build_provider(resolved_provider)?;
+                    let drain_cfg = scriptorium_core::ingest_queue::DrainConfig {
+                        debounce: std::time::Duration::from_secs(debounce),
+                        max_per_run: max,
+                        dry_run,
+                    };
+                    let report =
+                        scriptorium_core::ingest_queue::drain(&vault, llm.as_ref(), drain_cfg)
+                            .await
+                            .into_diagnostic()?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report).into_diagnostic()?
+                        );
+                    } else {
+                        println!(
+                            "drain: considered={} ingested={} dup={} young={} missing={} unknown_version={} redundant={} failures={}",
+                            report.considered,
+                            report.ingested,
+                            report.skipped_dup,
+                            report.skipped_young,
+                            report.skipped_missing,
+                            report.skipped_unknown_version,
+                            report.redundant_skips,
+                            report.failures.len()
+                        );
+                        for f in &report.failures {
+                            eprintln!("  fail: {} — {}", f.marker.display(), f.error);
+                        }
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::IngestQueue {
+                    list,
+                    stats,
+                    clear,
+                    json,
+                } => {
+                    let vault = open_vault(&vault_path)?;
+                    if clear {
+                        let n = scriptorium_core::ingest_queue::clear_queue(&vault)
+                            .into_diagnostic()?;
+                        if json {
+                            println!("{{\"cleared\": {n}}}");
+                        } else {
+                            println!("cleared {n} marker(s)");
+                        }
+                    } else if list {
+                        let markers = scriptorium_core::ingest_queue::list_queued(&vault)
+                            .into_diagnostic()?;
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&markers).into_diagnostic()?
+                            );
+                        } else {
+                            for m in &markers {
+                                println!(
+                                    "{}  {}  {}",
+                                    m.enqueued_at.to_rfc3339(),
+                                    m.source.display(),
+                                    m.session_id.as_deref().unwrap_or("-")
+                                );
+                            }
+                            println!("({} marker(s))", markers.len());
+                        }
+                    } else {
+                        let _ = stats;
+                        let s = scriptorium_core::ingest_queue::queue_stats(&vault)
+                            .into_diagnostic()?;
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&s).into_diagnostic()?);
+                        } else {
+                            println!(
+                                "pending={} oldest={:?}s newest={:?}s lock={} pid={:?}",
+                                s.pending,
+                                s.oldest_age_secs,
+                                s.newest_age_secs,
+                                s.drain_lock_held,
+                                s.drain_lock_pid
+                            );
+                        }
+                    }
                     Ok(ExitCode::SUCCESS)
                 }
                 Command::Bench {
