@@ -96,6 +96,9 @@ impl ToolRegistry {
             "scriptorium_learn_search" => learn_search_tool(args, ctx),
             "scriptorium_learn_retrieve" => learn_retrieve_tool(args, ctx),
             "scriptorium_bench" => bench_tool(ctx).await,
+            "scriptorium_ingest_enqueue" => enqueue_tool(args, ctx),
+            "scriptorium_drain" => drain_tool(args, ctx).await,
+            "scriptorium_queue_status" => queue_status_tool(ctx),
             other => Err(ToolError::NotFound(other.to_string())),
         }
     }
@@ -303,6 +306,35 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                     "limit": { "type": "integer", "default": 5, "minimum": 1, "maximum": 20 }
                 }
             }),
+        },
+        ToolSpec {
+            name: "scriptorium_ingest_enqueue",
+            description: "Append a source path to the ingest queue. Returns immediately; no LLM call. Use this for automation flows; for interactive single-source ingest prefer scriptorium_ingest.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "source":     {"type": "string", "description": "Absolute path to a local source file."},
+                    "session_id": {"type": "string"}
+                },
+                "required": ["source"]
+            }),
+        },
+        ToolSpec {
+            name: "scriptorium_drain",
+            description: "Drain the ingest queue: dedup pending markers and synthesize survivors. Idempotent; second concurrent call exits cleanly.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "debounce_secs": {"type": "integer", "default": 120, "minimum": 0},
+                    "max":           {"type": "integer", "minimum": 1},
+                    "dry_run":       {"type": "boolean", "default": false}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "scriptorium_queue_status",
+            description: "Return queue size, oldest marker age, drain.lock state.",
+            input_schema: json!({"type": "object", "properties": {}}),
         },
     ]
 }
@@ -724,6 +756,51 @@ fn skill_read_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError
     Ok(skill.content)
 }
 
+fn enqueue_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError> {
+    #[derive(Deserialize)]
+    struct Args {
+        source: String,
+        #[serde(default)]
+        session_id: Option<String>,
+    }
+    let args: Args = serde_json::from_value(args)?;
+    let path = std::path::PathBuf::from(args.source);
+    let marker = core::ingest_queue::enqueue(&ctx.vault, &path, args.session_id.as_deref())
+        .map_err(|e| ToolError::Failed(format!("enqueue: {e}")))?;
+    serde_json::to_string_pretty(&marker)
+        .map_err(|e| ToolError::Failed(format!("serialize marker: {e}")))
+}
+
+async fn drain_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError> {
+    #[derive(Deserialize)]
+    struct Args {
+        #[serde(default)]
+        debounce_secs: Option<u64>,
+        #[serde(default)]
+        max: Option<usize>,
+        #[serde(default)]
+        dry_run: bool,
+    }
+    let args: Args = serde_json::from_value(args)?;
+    let cfg = core::ingest_queue::DrainConfig {
+        debounce: std::time::Duration::from_secs(args.debounce_secs.unwrap_or(120)),
+        max_per_run: args.max,
+        dry_run: args.dry_run,
+    };
+    let report = core::ingest_queue::drain(&ctx.vault, ctx.llm_provider.as_ref(), cfg)
+        .await
+        .map_err(|e| ToolError::Failed(format!("drain: {e}")))?;
+    serde_json::to_string_pretty(&report)
+        .map_err(|e| ToolError::Failed(format!("serialize drain report: {e}")))
+}
+
+fn queue_status_tool(ctx: &ServerContext) -> Result<String, ToolError> {
+    let stats = core::ingest_queue::queue_stats(&ctx.vault)
+        .map_err(|e| ToolError::Failed(format!("queue_stats: {e}")))?;
+    serde_json::to_string_pretty(&stats)
+        .map_err(|e| ToolError::Failed(format!("serialize queue stats: {e}")))
+}
+
 // ---------- helpers ----------
 
 fn parse_vault_path(raw: &str) -> Result<Utf8PathBuf, ToolError> {
@@ -888,6 +965,7 @@ mod tests {
                 body: body.into(),
             }],
             log_entry: format!("ingested {title}"),
+            redundant: false,
         }
     }
 
