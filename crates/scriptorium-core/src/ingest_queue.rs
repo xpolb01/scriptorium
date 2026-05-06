@@ -498,8 +498,101 @@ fn parse_marker_timestamp(path: &Path) -> Option<u64> {
 /// FAIL if any marker older than `stuck_threshold` (default 3600s) or
 /// `drain.lock` pid is alive but no progress in dedup-stats. Returns a
 /// [`DoctorCheck`] named `queue_health`.
-pub fn queue_health_check(_vault: &Vault, _stuck_threshold: Duration) -> DoctorCheck {
-    unimplemented!("commit 5")
+pub fn queue_health_check(vault: &Vault, stuck_threshold: Duration) -> DoctorCheck {
+    use crate::doctor::CheckStatus;
+
+    let mut messages: Vec<String> = Vec::new();
+    let mut status = CheckStatus::Ok;
+
+    let paths = match list_marker_paths(vault) {
+        Ok(p) => p,
+        Err(e) => {
+            return DoctorCheck {
+                name: "queue_health".into(),
+                status: CheckStatus::Warn,
+                message: format!("could not list ingest-queue: {e}"),
+            };
+        }
+    };
+    let pending = paths.len();
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let threshold_secs = stuck_threshold.as_secs();
+
+    if pending > 1000 {
+        status = CheckStatus::Warn;
+        messages.push(format!("queue has {pending} pending markers (>1000)"));
+    }
+
+    for path in &paths {
+        if let Some(ts) = parse_marker_timestamp(path) {
+            let age = now_secs.saturating_sub(ts);
+            if age > threshold_secs {
+                status = CheckStatus::Fail;
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("<unknown>");
+                messages.push(format!("marker {name} is {age}s old (> {threshold_secs}s)"));
+            }
+        }
+    }
+
+    let meta = vault.meta_dir().into_std_path_buf();
+    let lock_held = meta.join(DRAIN_LOCK_FILE).exists();
+    let pid = read_drain_pidfile(&meta).ok().flatten();
+    if lock_held {
+        match pid {
+            Some(p) if !pid_alive(p) => {
+                status = CheckStatus::Fail;
+                messages.push(format!("drain.lock present but pid {p} is not alive"));
+            }
+            Some(p) => {
+                if let Some(last_run) = last_drain_stats_ts(vault) {
+                    let age: u64 = (Utc::now() - last_run)
+                        .num_seconds()
+                        .try_into()
+                        .unwrap_or(0);
+                    if age > threshold_secs {
+                        status = CheckStatus::Fail;
+                        messages.push(format!(
+                            "drain pid {p} alive but last drain-stats entry is {age}s old"
+                        ));
+                    }
+                } else if status == CheckStatus::Ok {
+                    status = CheckStatus::Warn;
+                    messages.push(format!("drain.lock held by pid {p}, no drain-stats yet"));
+                }
+            }
+            None => {
+                if status == CheckStatus::Ok {
+                    status = CheckStatus::Warn;
+                    messages.push("drain.lock present without drain.pid".into());
+                }
+            }
+        }
+    }
+
+    let message = if messages.is_empty() {
+        format!("{pending} pending markers, drain idle")
+    } else {
+        messages.join("; ")
+    };
+    DoctorCheck {
+        name: "queue_health".into(),
+        status,
+        message,
+    }
+}
+
+fn last_drain_stats_ts(vault: &Vault) -> Option<DateTime<Utc>> {
+    let path = vault.meta_dir().join(DRAIN_STATS_FILE).into_std_path_buf();
+    let bytes = fs::read(&path).ok()?;
+    let stats: DrainStatsFile = serde_json::from_slice(&bytes).ok()?;
+    stats.runs.last().map(|r| r.ts)
 }
 
 fn canonical_hash(text: &str) -> String {
@@ -598,7 +691,6 @@ fn write_drain_pidfile(meta: &Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
 fn read_drain_pidfile(meta: &Path) -> Result<Option<u32>> {
     let path = meta.join(DRAIN_PID_FILE);
     match fs::read_to_string(&path) {
@@ -608,9 +700,17 @@ fn read_drain_pidfile(meta: &Path) -> Result<Option<u32>> {
     }
 }
 
-#[allow(dead_code)]
-fn pid_alive(_pid: u32) -> bool {
-    true
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1002,5 +1102,74 @@ mod tests {
         let remaining = list_queued(&vault).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].source, bad.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn pid_alive_returns_false_for_unlikely_pid() {
+        assert!(!pid_alive(u32::MAX));
+        assert!(!pid_alive(0));
+    }
+
+    #[test]
+    fn queue_health_ok_when_empty() {
+        let (_dir, vault) = make_test_vault();
+        let check = queue_health_check(&vault, Duration::from_secs(3600));
+        assert_eq!(check.name, "queue_health");
+        assert_eq!(check.status, crate::doctor::CheckStatus::Ok);
+    }
+
+    #[test]
+    fn queue_health_warn_when_count_over_1000() {
+        let (_dir, vault) = make_test_vault();
+        let dir = vault.meta_dir().join(QUEUE_SUBDIR).into_std_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let body = serde_json::to_vec(&QueueMarker {
+            version: 1,
+            source: PathBuf::from("/tmp/x"),
+            session_id: None,
+            enqueued_at: Utc::now(),
+        })
+        .unwrap();
+        for i in 0..1001 {
+            let name = format!("{now_secs}-{i:08x}.json");
+            fs::write(dir.join(name), &body).unwrap();
+        }
+        let check = queue_health_check(&vault, Duration::from_secs(3600));
+        assert_eq!(check.status, crate::doctor::CheckStatus::Warn);
+        assert!(check.message.contains("1001"));
+    }
+
+    #[test]
+    fn queue_health_fail_on_old_marker() {
+        let (_dir, vault) = make_test_vault();
+        let dir = vault.meta_dir().join(QUEUE_SUBDIR).into_std_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        let body = serde_json::to_vec(&QueueMarker {
+            version: 1,
+            source: PathBuf::from("/tmp/x"),
+            session_id: None,
+            enqueued_at: Utc::now(),
+        })
+        .unwrap();
+        fs::write(dir.join("1000-deadbeef.json"), &body).unwrap();
+        let check = queue_health_check(&vault, Duration::from_secs(60));
+        assert_eq!(check.status, crate::doctor::CheckStatus::Fail);
+        assert!(check.message.contains("1000-deadbeef.json"));
+    }
+
+    #[test]
+    fn queue_health_fail_on_dead_pidfile() {
+        let (_dir, vault) = make_test_vault();
+        let meta = vault.meta_dir().into_std_path_buf();
+        fs::create_dir_all(&meta).unwrap();
+        fs::write(meta.join(DRAIN_LOCK_FILE), b"").unwrap();
+        fs::write(meta.join(DRAIN_PID_FILE), format!("{}\n", u32::MAX)).unwrap();
+        let check = queue_health_check(&vault, Duration::from_secs(3600));
+        assert_eq!(check.status, crate::doctor::CheckStatus::Fail);
+        assert!(check.message.contains("not alive"));
     }
 }

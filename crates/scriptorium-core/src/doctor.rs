@@ -98,6 +98,10 @@ pub fn run_doctor(vault: &Vault, store: Option<&EmbeddingsStore>) -> DoctorRepor
     checks.push(check_git_clean(vault));
     checks.push(check_skills(vault));
     checks.push(check_learnings(vault));
+    checks.push(crate::ingest_queue::queue_health_check(
+        vault,
+        std::time::Duration::from_secs(3600),
+    ));
 
     let status = if checks.iter().any(|c| c.status == CheckStatus::Fail) {
         OverallStatus::Unhealthy
