@@ -773,7 +773,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     if let Some(ref m) = model {
                         set_model_env(provider_kind_name(resolved_provider), m);
                     }
-                    let provider = build_provider(resolved_provider)?;
+                    let provider = build_chat_provider(resolved_provider, &cfg)?;
                     // Resolve to a concrete file path. URL ingest fetches, runs
                     // Readability, converts to markdown, writes a tempfile, and the
                     // regular file-ingest path takes over. The returned struct holds
@@ -846,7 +846,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     // overrides, use it for chat only; embeddings always come from
                     // cfg.embeddings.provider.
                     let llm_provider =
-                        build_provider(provider.unwrap_or_else(|| provider_from(&cfg)))?;
+                        build_chat_provider(provider.unwrap_or_else(|| provider_from(&cfg)), &cfg)?;
                     let embed_provider = build_provider(embed_provider_from(&cfg))?;
                     let store = open_store(&vault)?;
                     let report = query::query(
@@ -1033,7 +1033,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         // overrides the config.
                         set_model_env(provider_kind_name(resolved_provider), m);
                     }
-                    let llm = build_provider(resolved_provider)?;
+                    let llm = build_chat_provider(resolved_provider, &cfg)?;
                     if fresh {
                         let cp = vault.meta_dir().join("bulk-ingest-checkpoint.json");
                         let _ = std::fs::remove_file(cp.as_std_path());
@@ -1296,7 +1296,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     }
                     let cfg = load_config(&vault);
                     let store = open_store(&vault)?;
-                    let llm = build_provider(provider.unwrap_or_else(|| provider_from(&cfg)))?;
+                    let llm =
+                        build_chat_provider(provider.unwrap_or_else(|| provider_from(&cfg)), &cfg)?;
                     let embed = build_provider(embed_provider_from(&cfg))?;
                     let report = scriptorium_core::bench::run_benchmarks(
                         &vault,
@@ -1440,7 +1441,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     // --provider overrides the chat slot only; embeddings always
                     // come from cfg.embeddings.provider.
                     let llm_provider =
-                        build_provider(provider.unwrap_or_else(|| provider_from(&cfg)))?;
+                        build_chat_provider(provider.unwrap_or_else(|| provider_from(&cfg)), &cfg)?;
                     let embed_provider = build_provider(embed_provider_from(&cfg))?;
                     let context = scriptorium_mcp::ServerContext {
                         vault,
@@ -1456,7 +1457,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 Command::Watch { provider } => {
                     let vault = open_vault(&vault_path)?;
                     let cfg = load_config(&vault);
-                    let provider = build_provider(provider.unwrap_or_else(|| provider_from(&cfg)))?;
+                    let provider =
+                        build_chat_provider(provider.unwrap_or_else(|| provider_from(&cfg)), &cfg)?;
                     println!(
                         "watch: watching {}/sources/ — drop new files there to auto-ingest",
                         vault.root()
@@ -1602,7 +1604,7 @@ async fn handle_social_facebook(
     if let Some(ref m) = model {
         set_model_env(provider_kind_name(resolved_provider), m);
     }
-    let llm = build_provider(resolved_provider)?;
+    let llm = build_chat_provider(resolved_provider, &cfg)?;
 
     let total_files = export_report.total_files_written as u64;
     let phase2 = ProgressBar::new(total_files);
@@ -2297,6 +2299,40 @@ fn provider_kind_from_string(s: &str) -> ProviderKind {
         "ollama" => ProviderKind::Ollama,
         _ => ProviderKind::Mock,
     }
+}
+
+/// Build the chat provider, applying meridian routing when configured and
+/// reachable. Falls back to direct provider construction when meridian is
+/// disabled or the probe fails — never fails closed.
+fn build_chat_provider(kind: ProviderKind, cfg: &Config) -> Result<Arc<dyn LlmProvider>> {
+    let probe_result = scriptorium_core::llm::meridian::probe(&cfg.meridian);
+    tracing::debug!(
+        kind = ?kind,
+        meridian_enabled = cfg.meridian.enabled,
+        meridian_url = %cfg.meridian.url,
+        meridian_probe = probe_result,
+        "build_chat_provider routing decision"
+    );
+    if matches!(kind, ProviderKind::Claude) && probe_result {
+        tracing::info!(
+            url = %cfg.meridian.url,
+            model = %cfg.llm.model,
+            "routing claude through meridian proxy"
+        );
+        let openai_cfg = OpenAiConfig {
+            api_key: "meridian".into(),
+            model: cfg.llm.model.clone(),
+            embed_model: String::new(),
+            embed_dim: 0,
+            base_url: cfg.meridian.url.trim_end_matches('/').to_string(),
+            timeout: std::time::Duration::from_secs(cfg.llm.timeout_secs),
+            max_attempts: 3,
+        };
+        return Ok(Arc::new(
+            OpenAiProvider::new(openai_cfg).map_err(|e| miette!("meridian init: {e}"))?,
+        ));
+    }
+    build_provider(kind)
 }
 
 fn build_provider(kind: ProviderKind) -> Result<Arc<dyn LlmProvider>> {

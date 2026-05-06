@@ -6,10 +6,13 @@
 
 use std::io::{BufRead, Write};
 
-use crate::config::{ChunkStrategy, Config, EmbeddingsConfig, GitConfig, LlmConfig, PathsConfig};
+use crate::config::{
+    ChunkStrategy, Config, EmbeddingsConfig, GitConfig, LlmConfig, MeridianConfig, PathsConfig,
+};
 use crate::error::{Error, Result};
 use crate::hooks::HooksConfig;
 use crate::keychain;
+use crate::llm::meridian as meridian_probe;
 use crate::vault::Vault;
 
 /// Provider choice for the wizard.
@@ -106,9 +109,10 @@ pub fn run_setup(
     output.flush().ok();
     let llm_provider = read_provider_choice(input, Provider::Claude);
 
-    // Step 2: API key for LLM provider.
+    let meridian = prompt_meridian(input, output, llm_provider);
+
     let mut keys_stored = 0;
-    if llm_provider.needs_api_key() {
+    if llm_provider.needs_api_key() && !meridian.enabled {
         keys_stored += prompt_and_store_key(input, output, llm_provider, "LLM")?;
     }
 
@@ -173,6 +177,7 @@ pub fn run_setup(
         git: GitConfig::default(),
         paths: PathsConfig::default(),
         hooks: HooksConfig::default(),
+        meridian: meridian.clone(),
     };
 
     let config_path = vault.meta_dir().join("config.toml");
@@ -192,6 +197,52 @@ pub fn run_setup(
         keys_stored,
         config_written: true,
     })
+}
+
+fn prompt_meridian(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    llm_provider: Provider,
+) -> MeridianConfig {
+    if !matches!(llm_provider, Provider::Claude) {
+        return MeridianConfig::default();
+    }
+    let candidate = MeridianConfig {
+        enabled: true,
+        url: MeridianConfig::default().url,
+    };
+    let detected = meridian_probe::probe(&candidate);
+    writeln!(output).ok();
+    writeln!(output, "Step 1b: meridian (local Anthropic proxy)").ok();
+    writeln!(
+        output,
+        "  meridian routes Claude calls through a local proxy that handles auth"
+    )
+    .ok();
+    writeln!(
+        output,
+        "  upstream — when enabled, ANTHROPIC_API_KEY is not required."
+    )
+    .ok();
+    let detect_label = if detected { "yes ✓" } else { "no" };
+    writeln!(output, "  Detected at {}: {}", candidate.url, detect_label).ok();
+    let default_yes = detected;
+    let prompt_suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+    write!(output, "  Use meridian? {prompt_suffix}: ").ok();
+    output.flush().ok();
+    let mut line = String::new();
+    let _ = input.read_line(&mut line);
+    let answer = line.trim().to_ascii_lowercase();
+    let enabled = match answer.as_str() {
+        "" => default_yes,
+        "y" | "yes" => true,
+        "n" | "no" => false,
+        _ => default_yes,
+    };
+    MeridianConfig {
+        enabled,
+        url: candidate.url,
+    }
 }
 
 fn read_provider_choice(input: &mut dyn BufRead, default: Provider) -> Provider {

@@ -15,6 +15,7 @@
 pub mod claude;
 pub mod error;
 pub mod gemini;
+pub mod meridian;
 pub mod mock;
 pub mod ollama;
 pub mod openai;
