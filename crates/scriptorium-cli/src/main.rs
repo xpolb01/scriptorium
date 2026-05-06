@@ -1109,7 +1109,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     if let Some(ref m) = model {
                         set_model_env(provider_kind_name(resolved_provider), m);
                     }
-                    let llm = build_provider(resolved_provider)?;
+                    let llm = build_chat_provider(resolved_provider, &cfg)?;
                     let drain_cfg = scriptorium_core::ingest_queue::DrainConfig {
                         debounce: std::time::Duration::from_secs(debounce),
                         max_per_run: max,
