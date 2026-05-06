@@ -7,6 +7,7 @@
 
 #[cfg(feature = "dashboard")]
 mod dashboard;
+mod drain_install;
 mod log_cmd;
 mod trace_cmd;
 
@@ -190,6 +191,10 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+
+    /// Manage the launchd drain scheduler.
+    #[command(subcommand)]
+    Drain(DrainCommand),
 
     /// Inspect or clear the ingest queue.
     IngestQueue {
@@ -431,6 +436,31 @@ enum SocialCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum DrainCommand {
+    /// Install the launchd job that drains the ingest queue every 60s.
+    Install {
+        #[arg(long)]
+        vault: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        reinstall: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Uninstall the drain launchd job.
+    Uninstall {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show drain launchd job status, recent log, and queue stats.
+    Status {
+        #[arg(long)]
+        vault: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum SkillCommand {
     /// List all registered skills.
     List,
@@ -618,6 +648,9 @@ fn command_name_for_span(cmd: &Command) -> &'static str {
         Command::IngestEnqueue { .. } => "ingest-enqueue",
         Command::IngestDrain { .. } => "ingest-drain",
         Command::IngestQueue { .. } => "ingest-queue",
+        Command::Drain(DrainCommand::Install { .. }) => "drain-install",
+        Command::Drain(DrainCommand::Uninstall { .. }) => "drain-uninstall",
+        Command::Drain(DrainCommand::Status { .. }) => "drain-status",
         Command::Config => "config",
         Command::Skill(_) => "skill",
         Command::Learn(_) => "learn",
@@ -1158,6 +1191,81 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                                 s.drain_lock_held,
                                 s.drain_lock_pid
                             );
+                        }
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Drain(sub) => {
+                    let _ = vault_path;
+                    match sub {
+                        DrainCommand::Install {
+                            vault,
+                            reinstall,
+                            json,
+                        } => {
+                            let report =
+                                crate::drain_install::install(crate::drain_install::InstallOpts {
+                                    vault,
+                                    reinstall,
+                                })
+                                .map_err(|e| miette!("drain install: {e}"))?;
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&report).into_diagnostic()?
+                                );
+                            } else {
+                                println!("installed: {}", report.label);
+                                println!("  plist: {}", report.plist_path.display());
+                                println!("  binary: {}", report.binary.display());
+                                println!("  vault: {}", report.vault.display());
+                                println!("  log: {}", report.log_path.display());
+                                if report.injected_env_keys.is_empty() {
+                                    println!("  injected env keys: (none — keychain empty)");
+                                } else {
+                                    println!(
+                                        "  injected env keys: {}",
+                                        report.injected_env_keys.join(", ")
+                                    );
+                                }
+                            }
+                        }
+                        DrainCommand::Uninstall { json } => {
+                            let report = crate::drain_install::uninstall()
+                                .map_err(|e| miette!("drain uninstall: {e}"))?;
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&report).into_diagnostic()?
+                                );
+                            } else {
+                                println!("uninstalled: {}", report.label);
+                                println!("  plist existed: {}", report.plist_existed);
+                            }
+                        }
+                        DrainCommand::Status { vault, json } => {
+                            let report = crate::drain_install::status(vault)
+                                .map_err(|e| miette!("drain status: {e}"))?;
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&report).into_diagnostic()?
+                                );
+                            } else {
+                                println!("label: {}", report.label);
+                                println!("loaded: {}", report.loaded);
+                                println!("plist exists: {}", report.plist_exists);
+                                if let Some(s) = &report.queue_stats {
+                                    println!(
+                                        "queue: pending={} oldest={:?}s lock={}",
+                                        s.pending, s.oldest_age_secs, s.drain_lock_held
+                                    );
+                                }
+                                println!("--- launchctl print ---");
+                                println!("{}", report.launchctl_print);
+                                println!("--- recent log ---");
+                                println!("{}", report.recent_log);
+                            }
                         }
                     }
                     Ok(ExitCode::SUCCESS)

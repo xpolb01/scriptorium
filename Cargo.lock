@@ -2686,6 +2686,7 @@ checksum = "d68f2ec51b097e4c1a75b681a8bec621909b5e91f15bb7b840c4f2f7b01148b2"
 name = "scriptorium-cli"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "assert_cmd",
  "axum",
  "camino",
