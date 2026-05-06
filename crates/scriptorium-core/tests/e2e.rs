@@ -1087,3 +1087,102 @@ async fn redundant_true_with_nonempty_pages_errors() {
     assert!(msg.contains("redundant=true"), "msg: {msg}");
     assert!(msg.contains("non-empty pages"), "msg: {msg}");
 }
+
+#[tokio::test]
+async fn enqueue_drain_dedup_e2e() {
+    use scriptorium_core::ingest_queue;
+    use scriptorium_core::llm::{
+        prompts::{IngestAction, IngestPageAction, IngestPlan},
+        CompletionResponse, MockProvider, Usage,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let (dir, vault) = empty_test_vault();
+    let sources_dir = dir.path().join("sources/articles");
+
+    let s1 = sources_dir.join("s1.md");
+    let s2 = sources_dir.join("s2.md");
+    let s3 = sources_dir.join("s3.md");
+    std::fs::write(&s1, "Session ID: A\nbody\n").unwrap();
+    std::fs::write(&s2, "Session ID: B\nbody\n").unwrap();
+    std::fs::write(&s3, "Peak Turn Score: 99\nbody\n").unwrap();
+
+    let u1 = sources_dir.join("u1.md");
+    let u2 = sources_dir.join("u2.md");
+    std::fs::write(&u1, "Unique alpha content.\n").unwrap();
+    std::fs::write(&u2, "Unique beta content.\n").unwrap();
+
+    for src in [&s1, &s2, &s3, &u1, &u2] {
+        ingest_queue::enqueue(&vault, src, None).unwrap();
+    }
+    let hash_path = vault
+        .meta_dir()
+        .join("source-hashes.txt")
+        .into_std_path_buf();
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_handler = counter.clone();
+    let mock = MockProvider::with_handler(move |_req| {
+        let n = counter_handler.fetch_add(1, Ordering::SeqCst);
+        let plan = IngestPlan {
+            summary: format!("e2e ingest {n}"),
+            pages: vec![IngestPageAction {
+                action: IngestAction::Create,
+                path: format!("wiki/concepts/e2e-{n}.md"),
+                title: format!("E2E {n}"),
+                tags: vec![],
+                body: format!("Distinct body {n}.\n"),
+            }],
+            log_entry: format!("e2e {n}"),
+            redundant: false,
+        };
+        Ok(CompletionResponse {
+            text: serde_json::to_string(&plan).unwrap(),
+            usage: Usage::default(),
+            model: "mock-1".into(),
+        })
+    });
+
+    let cfg = ingest_queue::DrainConfig {
+        debounce: Duration::from_secs(0),
+        ..Default::default()
+    };
+    let report = ingest_queue::drain(&vault, &mock, cfg).await.unwrap();
+
+    assert_eq!(report.considered, 5);
+    assert_eq!(report.skipped_dup, 2);
+    assert_eq!(report.ingested, 3);
+    assert!(
+        report.failures.is_empty(),
+        "failures: {:?}",
+        report.failures
+    );
+    assert!(ingest_queue::list_queued(&vault).unwrap().is_empty());
+
+    let lines: Vec<String> = std::fs::read_to_string(&hash_path)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(lines.len(), 3, "hash store: {lines:?}");
+
+    let repo = git2::Repository::open(dir.path()).unwrap();
+    let mut walk = repo.revwalk().unwrap();
+    walk.push_head().unwrap();
+    let ingest_commits: usize = walk
+        .filter_map(|oid| {
+            let oid = oid.ok()?;
+            let commit = repo.find_commit(oid).ok()?;
+            let msg = commit.message()?.to_string();
+            if msg.contains("e2e ingest") {
+                Some(())
+            } else {
+                None
+            }
+        })
+        .count();
+    assert_eq!(ingest_commits, 3);
+    assert_eq!(counter.load(Ordering::SeqCst), 3);
+}
