@@ -7,16 +7,23 @@
 //!
 //! See `.sisyphus/plans/ingest-queue-drain.md` for the full design.
 
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::doctor::DoctorCheck;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::llm::LlmProvider;
 use crate::vault::Vault;
+
+const QUEUE_SUBDIR: &str = "ingest-queue";
+const DRAIN_LOCK_FILE: &str = "drain.lock";
+const DRAIN_PID_FILE: &str = "drain.pid";
+const MARKER_SCHEMA_VERSION: u32 = 1;
 
 /// Queue marker on disk: `<vault>/.scriptorium/ingest-queue/<unix-ts>-<8char>.json`.
 ///
@@ -106,8 +113,54 @@ pub struct QueueStats {
 /// retry once with a fresh suffix on EEXIST, then bail).
 ///
 /// Atomic publish: write to `<name>.tmp`, fsync file, rename to final.
-pub fn enqueue(_vault: &Vault, _source: &Path, _session_id: Option<&str>) -> Result<QueueMarker> {
-    unimplemented!("commit 2")
+pub fn enqueue(vault: &Vault, source: &Path, session_id: Option<&str>) -> Result<QueueMarker> {
+    let abs_source = source.canonicalize().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Error::Other(anyhow::anyhow!("source not found: {}", source.display()))
+        } else {
+            Error::io(source, e)
+        }
+    })?;
+
+    let queue_dir = queue_dir_path(vault);
+    fs::create_dir_all(&queue_dir).map_err(|e| Error::io(&queue_dir, e))?;
+
+    let marker = QueueMarker {
+        version: MARKER_SCHEMA_VERSION,
+        source: abs_source,
+        session_id: session_id.map(str::to_owned),
+        enqueued_at: Utc::now(),
+    };
+    let payload = serde_json::to_vec_pretty(&marker)
+        .map_err(|e| Error::Other(anyhow::anyhow!("serialize marker: {e}")))?;
+
+    let unix_secs: u64 = marker.enqueued_at.timestamp().try_into().unwrap_or(0);
+
+    for attempt in 0..2 {
+        let suffix = format!("{:08x}", rand::random::<u32>());
+        let final_name = format!("{unix_secs}-{suffix}.json");
+        let final_path = queue_dir.join(&final_name);
+        if final_path.exists() {
+            if attempt == 1 {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "queue marker filename collision after retry: {final_name}"
+                )));
+            }
+            continue;
+        }
+        let tmp_path = queue_dir.join(format!("{final_name}.tmp"));
+        let mut f = fs::File::create(&tmp_path).map_err(|e| Error::io(&tmp_path, e))?;
+        f.write_all(&payload).map_err(|e| Error::io(&tmp_path, e))?;
+        f.sync_all().map_err(|e| Error::io(&tmp_path, e))?;
+        drop(f);
+        fs::rename(&tmp_path, &final_path).map_err(|e| Error::io(&final_path, e))?;
+        return Ok(marker);
+    }
+    unreachable!("loop exits via return")
+}
+
+fn queue_dir_path(vault: &Vault) -> PathBuf {
+    vault.meta_dir().join(QUEUE_SUBDIR).into_std_path_buf()
 }
 
 /// Drain the queue. Acquires `<vault>/.scriptorium/drain.lock` via
@@ -134,20 +187,119 @@ pub async fn drain(
 
 /// Read all marker files (regardless of age). Sorted oldest first.
 /// Used by `ingest-queue --list` and `--stats`.
-pub fn list_queued(_vault: &Vault) -> Result<Vec<QueueMarker>> {
-    unimplemented!("commit 2")
+pub fn list_queued(vault: &Vault) -> Result<Vec<QueueMarker>> {
+    let mut entries = list_marker_paths(vault)?;
+    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    let mut markers = Vec::with_capacity(entries.len());
+    for path in entries {
+        match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<QueueMarker>(&bytes) {
+                Ok(m) => markers.push(m),
+                Err(e) => eprintln!(
+                    "scriptorium: skipping malformed queue marker {}: {e}",
+                    path.display()
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::io(&path, e)),
+        }
+    }
+    Ok(markers)
+}
+
+fn list_marker_paths(vault: &Vault) -> Result<Vec<PathBuf>> {
+    let dir = queue_dir_path(vault);
+    let read = match fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::io(&dir, e)),
+    };
+    let mut out = Vec::new();
+    for entry in read {
+        let entry = entry.map_err(|e| Error::io(&dir, e))?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            out.push(path);
+        }
+    }
+    Ok(out)
 }
 
 /// Delete every marker file. Does NOT touch `source-hashes.txt` or
 /// `drain.lock`. Used by `ingest-queue --clear`. Ignores missing files
 /// but propagates other IO errors. Returns count deleted.
-pub fn clear_queue(_vault: &Vault) -> Result<usize> {
-    unimplemented!("commit 2")
+pub fn clear_queue(vault: &Vault) -> Result<usize> {
+    let dir = queue_dir_path(vault);
+    let read = match fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(Error::io(&dir, e)),
+    };
+    let mut count = 0usize;
+    for entry in read {
+        let entry = entry.map_err(|e| Error::io(&dir, e))?;
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .map_err(|e| Error::io(&path, e))?
+            .is_file()
+        {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => count += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::io(&path, e)),
+        }
+    }
+    Ok(count)
 }
 
 /// Cheap stats: count + oldest/newest age + `drain.lock` state.
-pub fn queue_stats(_vault: &Vault) -> Result<QueueStats> {
-    unimplemented!("commit 2")
+pub fn queue_stats(vault: &Vault) -> Result<QueueStats> {
+    let paths = list_marker_paths(vault)?;
+    let pending = paths.len();
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut min_ts: Option<u64> = None;
+    let mut max_ts: Option<u64> = None;
+    for p in &paths {
+        if let Some(ts) = parse_marker_timestamp(p) {
+            min_ts = Some(min_ts.map_or(ts, |m| m.min(ts)));
+            max_ts = Some(max_ts.map_or(ts, |m| m.max(ts)));
+        }
+    }
+
+    let oldest_age_secs = min_ts.map(|t| now_secs.saturating_sub(t));
+    let newest_age_secs = max_ts.map(|t| now_secs.saturating_sub(t));
+
+    let meta = vault.meta_dir();
+    let lock_path = meta.join(DRAIN_LOCK_FILE);
+    let pid_path = meta.join(DRAIN_PID_FILE);
+    let drain_lock_held = lock_path.exists();
+    let drain_lock_pid = match fs::read_to_string(pid_path.as_std_path()) {
+        Ok(s) => s.trim().parse::<u32>().ok(),
+        Err(_) => None,
+    };
+
+    Ok(QueueStats {
+        pending,
+        oldest_age_secs,
+        newest_age_secs,
+        drain_lock_held,
+        drain_lock_pid,
+    })
+}
+
+fn parse_marker_timestamp(path: &Path) -> Option<u64> {
+    let stem = path.file_stem()?.to_str()?;
+    let (secs, _) = stem.split_once('-')?;
+    secs.parse::<u64>().ok()
 }
 
 /// Doctor check: WARN if pending > 1000 or lock-pid stale across reboot,
@@ -201,6 +353,19 @@ fn record_drain_stats(_vault: &Vault, _report: &DrainReport) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn make_test_vault() -> (TempDir, Vault) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault = Vault::open(dir.path()).expect("open vault");
+        (dir, vault)
+    }
+
+    fn write_source(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let p = dir.join(name);
+        fs::write(&p, body).unwrap();
+        p
+    }
 
     #[test]
     fn marker_roundtrip() {
@@ -213,5 +378,101 @@ mod tests {
         let json = serde_json::to_string(&original).expect("serialize");
         let parsed: QueueMarker = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn enqueue_writes_marker() {
+        let (dir, vault) = make_test_vault();
+        let src = write_source(dir.path(), "src.md", "hello");
+
+        let marker = enqueue(&vault, &src, Some("sess-1")).expect("enqueue");
+        assert_eq!(marker.version, 1);
+        assert_eq!(marker.session_id.as_deref(), Some("sess-1"));
+        assert!(marker.source.is_absolute());
+        assert_eq!(marker.source, src.canonicalize().unwrap());
+
+        let listed = list_queued(&vault).expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], marker);
+    }
+
+    #[test]
+    fn enqueue_creates_meta_subdirs() {
+        let (dir, vault) = make_test_vault();
+        let queue = vault.meta_dir().join(QUEUE_SUBDIR).into_std_path_buf();
+        assert!(!queue.exists());
+        let src = write_source(dir.path(), "src.md", "x");
+        enqueue(&vault, &src, None).expect("enqueue");
+        assert!(queue.is_dir());
+    }
+
+    #[test]
+    fn enqueue_missing_source() {
+        let (dir, vault) = make_test_vault();
+        let missing = dir.path().join("nope.md");
+        let err = enqueue(&vault, &missing, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("source not found"), "got: {msg}");
+    }
+
+    #[test]
+    fn enqueue_unique_filenames_at_same_second() {
+        let (dir, vault) = make_test_vault();
+        let src = write_source(dir.path(), "src.md", "x");
+        for _ in 0..50 {
+            enqueue(&vault, &src, None).expect("enqueue");
+        }
+        let listed = list_queued(&vault).expect("list");
+        assert_eq!(listed.len(), 50);
+    }
+
+    #[test]
+    fn enqueue_does_not_publish_tmp() {
+        let (dir, vault) = make_test_vault();
+        let src = write_source(dir.path(), "src.md", "x");
+        enqueue(&vault, &src, None).expect("enqueue");
+        let queue = vault.meta_dir().join(QUEUE_SUBDIR).into_std_path_buf();
+        let names: Vec<String> = fs::read_dir(&queue)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1);
+        let p = Path::new(&names[0]);
+        assert_eq!(p.extension().and_then(|s| s.to_str()), Some("json"));
+    }
+
+    #[test]
+    fn list_queued_sorts_oldest_first() {
+        let (_dir, vault) = make_test_vault();
+        let queue = vault.meta_dir().join(QUEUE_SUBDIR).into_std_path_buf();
+        fs::create_dir_all(&queue).unwrap();
+        let body = serde_json::to_vec(&QueueMarker {
+            version: 1,
+            source: PathBuf::from("/tmp/x"),
+            session_id: None,
+            enqueued_at: Utc::now(),
+        })
+        .unwrap();
+        for name in [
+            "200-bbbbbbbb.json",
+            "100-aaaaaaaa.json",
+            "150-cccccccc.json",
+        ] {
+            fs::write(queue.join(name), &body).unwrap();
+        }
+        let listed = list_queued(&vault).expect("list");
+        assert_eq!(listed.len(), 3);
+    }
+
+    #[test]
+    fn clear_queue_removes_all_then_returns_count() {
+        let (dir, vault) = make_test_vault();
+        let src = write_source(dir.path(), "src.md", "x");
+        for _ in 0..3 {
+            enqueue(&vault, &src, None).unwrap();
+        }
+        let removed = clear_queue(&vault).expect("clear");
+        assert_eq!(removed, 3);
+        assert!(list_queued(&vault).unwrap().is_empty());
     }
 }
