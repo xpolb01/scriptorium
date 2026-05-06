@@ -151,6 +151,7 @@ async fn ingest_creates_page_and_log_entry_via_mock() {
             body: "This is a mock page body.\n".into(),
         }],
         log_entry: "ingested test-source.md".into(),
+        redundant: false,
     };
     let mock = MockProvider::constant(serde_json::to_string(&plan).unwrap());
 
@@ -197,6 +198,7 @@ async fn ingest_updates_existing_page_and_preserves_id() {
             body: "Original body.\n".into(),
         }],
         log_entry: "seed".into(),
+        redundant: false,
     };
     let seed = MockProvider::constant(serde_json::to_string(&first_plan).unwrap());
     let source = dir.path().join("sources/articles/seed.md");
@@ -223,6 +225,7 @@ async fn ingest_updates_existing_page_and_preserves_id() {
             body: "Revised body.\n".into(),
         }],
         log_entry: "updated target".into(),
+        redundant: false,
     };
     let updater = MockProvider::constant(serde_json::to_string(&update_plan).unwrap());
     let source2 = dir.path().join("sources/articles/revision.md");
@@ -259,6 +262,7 @@ async fn ingest_aborts_when_plan_introduces_broken_link() {
             body: "Linking to [[ghost-page]].\n".into(),
         }],
         log_entry: "bad".into(),
+        redundant: false,
     };
     let mock = MockProvider::constant(serde_json::to_string(&plan).unwrap());
     let source = dir.path().join("sources/articles/bad.md");
@@ -284,6 +288,7 @@ async fn ingest_dry_run_stages_but_does_not_commit() {
             body: "Body with no wikilinks.\n".into(),
         }],
         log_entry: "would ingest".into(),
+        redundant: false,
     };
     let mock = MockProvider::constant(serde_json::to_string(&plan).unwrap());
     let source = dir.path().join("sources/articles/src.md");
@@ -327,6 +332,7 @@ async fn ingest_writes_usage_log() {
             body: "Body.\n".into(),
         }],
         log_entry: "u".into(),
+        redundant: false,
     };
     let mock = MockProvider::constant(serde_json::to_string(&plan).unwrap());
     let source = dir.path().join("sources/articles/usage.md");
@@ -357,6 +363,7 @@ async fn query_returns_cited_answer_via_mock() {
             body: "Attention weighs sequence positions. It runs in parallel.\n".into(),
         }],
         log_entry: "seed".into(),
+        redundant: false,
     };
     let seed_mock = MockProvider::constant(serde_json::to_string(&seed_plan).unwrap());
     let source = dir.path().join("sources/articles/seed.md");
@@ -415,6 +422,7 @@ async fn query_strips_citations_for_pages_not_retrieved() {
             body: "Alpha is the first letter.\n".into(),
         }],
         log_entry: "seed".into(),
+        redundant: false,
     };
     let seed_mock = MockProvider::constant(serde_json::to_string(&seed).unwrap());
     let source = dir.path().join("sources/articles/seed.md");
@@ -484,6 +492,7 @@ async fn ingest_commit_is_non_empty_and_contains_both_source_and_wiki_page() {
             body: "## Body\n\nPlain body with no wikilinks.\n".into(),
         }],
         log_entry: "ingested source".into(),
+        redundant: false,
     };
     let mock = MockProvider::constant(serde_json::to_string(&plan).unwrap());
     let source = dir.path().join("sources/articles/coverage-source.md");
@@ -591,6 +600,7 @@ async fn ingest_commit_is_non_empty_when_vault_opened_via_relative_path() {
             body: "plain body\n".into(),
         }],
         log_entry: "relative".into(),
+        redundant: false,
     };
     let mock = MockProvider::constant(serde_json::to_string(&plan).unwrap());
     let source = dir.path().join("sources/articles/rel-source.md");
@@ -648,6 +658,7 @@ async fn embed_reindex_after_ingest_writes_chunks_for_new_pages() {
             body: "## First\n\nFirst section body.\n\n## Second\n\nSecond section body.\n".into(),
         }],
         log_entry: "ingested embedme".into(),
+        redundant: false,
     };
     let chat_mock = MockProvider::constant(serde_json::to_string(&plan).unwrap());
     let embed_mock = MockProvider::constant("");
@@ -685,6 +696,7 @@ async fn embed_reindex_after_ingest_is_cache_hit_on_repeat() {
             body: "## Single\n\nOne section is enough.\n".into(),
         }],
         log_entry: "seed".into(),
+        redundant: false,
     };
     let chat_mock = MockProvider::constant(serde_json::to_string(&plan).unwrap());
     let embed_mock = MockProvider::constant("");
@@ -852,6 +864,7 @@ async fn embed_reindex_after_two_distinct_ingests_only_embeds_new_pages() {
             body: "## A1\n\nFirst.\n\n## A2\n\nSecond.\n".into(),
         }],
         log_entry: "a".into(),
+        redundant: false,
     };
     let chat_a = MockProvider::constant(serde_json::to_string(&plan_a).unwrap());
     let source_a = dir.path().join("sources/articles/a.md");
@@ -876,6 +889,7 @@ async fn embed_reindex_after_two_distinct_ingests_only_embeds_new_pages() {
             body: "## B1\n\nB first.\n".into(),
         }],
         log_entry: "b".into(),
+        redundant: false,
     };
     let chat_b = MockProvider::constant(serde_json::to_string(&plan_b).unwrap());
     let source_b = dir.path().join("sources/articles/b.md");
@@ -1016,4 +1030,60 @@ async fn ingest_persists_failure_record_on_unsalvageable_response() {
     // No wiki page was written and log.md was not touched.
     assert!(!dir.path().join("wiki/concepts/broken.md").exists());
     assert!(!dir.path().join("log.md").exists());
+}
+
+#[tokio::test]
+async fn redundant_true_archives_but_skips_pages() {
+    let (dir, vault) = empty_test_vault();
+    let mock = MockProvider::constant(
+        r#"{"summary":"all redundant","pages":[],"log_entry":"covered by existing pages","redundant":true}"#,
+    );
+
+    let source = dir.path().join("sources/articles/redundant-source.md");
+    std::fs::write(&source, "Source contents.\n").unwrap();
+
+    let report = ingest::ingest(&vault, &mock, &source).await.unwrap();
+
+    assert!(report.redundant);
+    assert_eq!(report.created, 0);
+    assert_eq!(report.updated, 0);
+    assert_eq!(report.commit_id.len(), 40);
+    assert!(report.source.as_str().starts_with("sources/articles/"));
+
+    let log = std::fs::read_to_string(dir.path().join("log.md")).unwrap();
+    assert!(log.contains("[skip] redundant"));
+
+    let wiki = dir.path().join("wiki");
+    if wiki.exists() {
+        for entry in std::fs::read_dir(&wiki).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                let count = std::fs::read_dir(&path).unwrap().count();
+                assert_eq!(count, 0, "no wiki pages should be written");
+            }
+        }
+    }
+
+    let repo = git2::Repository::open(dir.path()).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert!(
+        head.message().unwrap().starts_with("[ingest:skip]"),
+        "commit message: {:?}",
+        head.message()
+    );
+}
+
+#[tokio::test]
+async fn redundant_true_with_nonempty_pages_errors() {
+    let (dir, vault) = empty_test_vault();
+    let mock = MockProvider::constant(
+        r#"{"summary":"oops","pages":[{"action":"create","path":"wiki/concepts/x.md","title":"X","tags":[],"body":"hi\n"}],"log_entry":"x","redundant":true}"#,
+    );
+    let source = dir.path().join("sources/articles/bad.md");
+    std::fs::write(&source, "Body").unwrap();
+
+    let err = ingest::ingest(&vault, &mock, &source).await.unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("redundant=true"), "msg: {msg}");
+    assert!(msg.contains("non-empty pages"), "msg: {msg}");
 }

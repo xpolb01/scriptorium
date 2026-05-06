@@ -349,7 +349,7 @@ pub async fn drain(
         )
         .await
         {
-            Ok(_report) => {
+            Ok(ingest_report) => {
                 if let Err(e) = hash_store_append(vault, &hash) {
                     report.failures.push(DrainFailure {
                         marker: marker_path.clone(),
@@ -359,7 +359,9 @@ pub async fn drain(
                 }
                 let _ = fs::remove_file(&marker_path);
                 report.ingested += 1;
-                // TODO(commit-4): increment redundant_skips when report.redundant
+                if ingest_report.redundant {
+                    report.redundant_skips += 1;
+                }
             }
             Err(e) => {
                 report.failures.push(DrainFailure {
@@ -856,6 +858,7 @@ mod tests {
                 body: "Body without wikilinks.\n".into(),
             }],
             log_entry: "drain ingest".into(),
+            redundant: false,
         };
         crate::llm::MockProvider::constant(serde_json::to_string(&plan).unwrap())
     }

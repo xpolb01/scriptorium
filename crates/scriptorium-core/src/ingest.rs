@@ -68,6 +68,10 @@ pub struct IngestReport {
     /// Preview of the change set if this was a dry run. Empty on a real
     /// commit.
     pub dry_run_diff: Vec<crate::vault::ChangeSummary>,
+    /// True if the LLM judged the source redundant relative to existing
+    /// pages. The source was archived and a `[skip] redundant` log line
+    /// added, but no wiki pages were created or updated.
+    pub redundant: bool,
 }
 
 /// Run the full ingest pipeline for a single source file.
@@ -254,8 +258,8 @@ pub async fn ingest_with_retrieval(
         &response.model,
         &response.usage,
     );
-    let mut plan: IngestPlan = match serde_json::from_str::<IngestPlan>(&response.text) {
-        Ok(plan) => plan,
+    let raw: crate::llm::prompts::IngestPlanRaw = match serde_json::from_str(&response.text) {
+        Ok(r) => r,
         Err(parse_err) => {
             // Persist the full context so the bug is debuggable after the
             // fact. Don't let a failure to write the failure record mask
@@ -297,7 +301,38 @@ pub async fn ingest_with_retrieval(
         }
     };
 
-    // 5b. Guard against stem collisions before processing.
+    let plan_redundant = raw.redundant;
+    let raw_pages_empty = raw.pages.is_empty();
+    let mut plan: IngestPlan = IngestPlan::try_from(raw)
+        .map_err(|e| Error::Other(anyhow::anyhow!("ingest plan conversion: {e}")))?;
+
+    if plan_redundant {
+        if !raw_pages_empty {
+            return Err(Error::Other(anyhow::anyhow!(
+                "ingest plan has redundant=true but non-empty pages"
+            )));
+        }
+        let mut tx = vault.begin();
+        tx.put_file(&interned, source_text.clone())?;
+        tx.append(
+            Utf8Path::new("log.md"),
+            &format!("\n[skip] redundant — {interned}\n"),
+        )?;
+        let commit_id = tx.commit(&format!("[ingest:skip] {interned}"))?;
+        if let Some(hooks) = &options.hooks {
+            crate::hooks::post_ingest(hooks, source_path, &commit_id, &plan.summary, 0, 0).await;
+        }
+        return Ok(IngestReport {
+            source: interned,
+            commit_id,
+            created: 0,
+            updated: 0,
+            summary: plan.summary,
+            dry_run_diff: Vec::new(),
+            redundant: true,
+        });
+    }
+
     guard_stem_collisions(&mut plan, &stem_to_path, &existing_paths)?;
 
     // 6. Translate the plan into a VaultTx. Reuse the scan we did for
@@ -387,6 +422,7 @@ pub async fn ingest_with_retrieval(
             updated,
             summary: plan.summary,
             dry_run_diff: diff,
+            redundant: false,
         });
     }
     let commit_message = format!("[ingest] {}", plan.summary);
@@ -412,6 +448,7 @@ pub async fn ingest_with_retrieval(
         updated,
         summary: plan.summary,
         dry_run_diff: Vec::new(),
+        redundant: false,
     })
 }
 
@@ -918,6 +955,7 @@ mod tests {
             summary: "test plan".into(),
             pages,
             log_entry: "test log".into(),
+            redundant: false,
         }
     }
 

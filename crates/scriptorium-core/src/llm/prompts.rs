@@ -58,6 +58,11 @@ pub struct IngestPlan {
     pub pages: Vec<IngestPageAction>,
     /// The entry to append to `log.md`. Should be a single line.
     pub log_entry: String,
+    /// `true` if the source contains no information not already present in
+    /// the retrieved pages. The source is still archived but no wiki pages
+    /// are written. Default `false`.
+    #[serde(default)]
+    pub redundant: bool,
 }
 
 /// Lenient wire shape used only as a deserialization waypoint. Accepts
@@ -70,11 +75,13 @@ pub struct IngestPlan {
 /// exists purely as the target of `#[serde(try_from)]` on [`IngestPlan`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct IngestPlanRaw {
-    summary: String,
-    pages: Vec<IngestPageAction>,
+pub(crate) struct IngestPlanRaw {
+    pub(crate) summary: String,
+    pub(crate) pages: Vec<IngestPageAction>,
     #[serde(default)]
-    log_entry: Option<String>,
+    pub(crate) log_entry: Option<String>,
+    #[serde(default)]
+    pub(crate) redundant: bool,
 }
 
 impl TryFrom<IngestPlanRaw> for IngestPlan {
@@ -88,6 +95,7 @@ impl TryFrom<IngestPlanRaw> for IngestPlan {
             summary: r.summary,
             pages: r.pages,
             log_entry,
+            redundant: r.redundant,
         })
     }
 }
@@ -246,6 +254,12 @@ pub fn ingest_prompt_with_learnings(
          Follow the vault schema below exactly. Never fabricate facts — cite \
          only what is in the source. Prefer updating an existing page over \
          creating a duplicate.\n\n\
+         If the retrieved pages already cover everything in the source — i.e. \
+         the source contains no information not already present in the wiki — \
+         set `redundant: true` and leave `pages` empty. The source will still \
+         be archived under `sources/` and a `[skip] redundant` line written to \
+         `log.md`. Do NOT set `redundant: true` if the source contains any new \
+         information, even minor.\n\n\
          === vault schema ===\n{schema}\n=== end schema ==={learnings}",
         schema = ctx.rendered_schema,
         learnings = learnings_section,
@@ -386,6 +400,7 @@ mod tests {
                 body: "body\n".into(),
             }],
             log_entry: "[2026-04-06] ingest | attention source".into(),
+            redundant: false,
         };
         let json = serde_json::to_string(&plan).unwrap();
         let parsed: IngestPlan = serde_json::from_str(&json).unwrap();
@@ -601,5 +616,32 @@ mod tests {
         let req = ingest_prompt(&ctx, "test.md", "source text");
         let user_msg = &req.messages[0].content;
         assert!(!user_msg.contains("Exact page paths"));
+    }
+
+    #[test]
+    fn schema_advertises_redundant() {
+        let schema = schemars::schema_for!(IngestPlan);
+        let json = serde_json::to_string(&schema).unwrap();
+        assert!(
+            json.contains("\"redundant\""),
+            "redundant field missing from JsonSchema: {json}"
+        );
+        assert!(
+            json.contains("boolean"),
+            "redundant field type missing: {json}"
+        );
+    }
+
+    #[test]
+    fn ingest_prompt_instructs_redundant_flag() {
+        let page = sample_page();
+        let pages = [&page];
+        let ctx = PromptContext::new("# Rules\n", &pages);
+        let req = ingest_prompt(&ctx, "test.md", "src");
+        assert!(
+            req.system.contains("redundant: true"),
+            "system prompt missing redundant instruction: {sys}",
+            sys = req.system
+        );
     }
 }
