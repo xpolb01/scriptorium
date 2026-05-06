@@ -28,6 +28,7 @@ pub mod hooks_check;
 pub mod hooks_store;
 pub mod index;
 pub mod ingest;
+pub mod ingest_queue;
 pub mod keychain;
 pub mod learnings;
 pub mod lint;
