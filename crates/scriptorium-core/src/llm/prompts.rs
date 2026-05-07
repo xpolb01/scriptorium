@@ -58,6 +58,11 @@ pub struct IngestPlan {
     pub pages: Vec<IngestPageAction>,
     /// The entry to append to `log.md`. Should be a single line.
     pub log_entry: String,
+    /// `true` if the source contains no information not already present in
+    /// the retrieved pages. The source is still archived but no wiki pages
+    /// are written. Default `false`.
+    #[serde(default)]
+    pub redundant: bool,
 }
 
 /// Lenient wire shape used only as a deserialization waypoint. Accepts
@@ -70,11 +75,13 @@ pub struct IngestPlan {
 /// exists purely as the target of `#[serde(try_from)]` on [`IngestPlan`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct IngestPlanRaw {
-    summary: String,
-    pages: Vec<IngestPageAction>,
+pub(crate) struct IngestPlanRaw {
+    pub(crate) summary: String,
+    pub(crate) pages: Vec<IngestPageAction>,
     #[serde(default)]
-    log_entry: Option<String>,
+    pub(crate) log_entry: Option<String>,
+    #[serde(default)]
+    pub(crate) redundant: bool,
 }
 
 impl TryFrom<IngestPlanRaw> for IngestPlan {
@@ -88,6 +95,7 @@ impl TryFrom<IngestPlanRaw> for IngestPlan {
             summary: r.summary,
             pages: r.pages,
             log_entry,
+            redundant: r.redundant,
         })
     }
 }
@@ -103,6 +111,7 @@ fn derive_log_entry(summary: &str, pages: &[IngestPageAction]) -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(try_from = "IngestPageActionRaw")]
 pub struct IngestPageAction {
     pub action: IngestAction,
     /// Vault-relative path, e.g. `wiki/concepts/attention.md`. Must end in
@@ -115,6 +124,53 @@ pub struct IngestPageAction {
     pub tags: Vec<String>,
     /// Markdown body of the page (no frontmatter — the engine writes that).
     pub body: String,
+}
+
+/// Lenient wire shape for [`IngestPageAction`]. Accepts both the canonical
+/// flat layout and the variant where smaller models nest `title`/`tags`
+/// inside a `frontmatter` object — observed with `mlx_lm.server` running
+/// Llama 4 Scout, which conflates the on-disk page skeleton from
+/// `CLAUDE.md` with the wire schema.
+#[derive(Debug, Clone, Deserialize)]
+struct IngestPageActionRaw {
+    action: IngestAction,
+    path: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    frontmatter: Option<IngestPageFrontmatter>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IngestPageFrontmatter {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+}
+
+impl TryFrom<IngestPageActionRaw> for IngestPageAction {
+    type Error = String;
+    fn try_from(r: IngestPageActionRaw) -> Result<Self, Self::Error> {
+        let fm_title = r.frontmatter.as_ref().and_then(|f| f.title.clone());
+        let fm_tags = r.frontmatter.as_ref().and_then(|f| f.tags.clone());
+        let title = r
+            .title
+            .or(fm_title)
+            .ok_or_else(|| format!("page action missing `title` (path={})", r.path))?;
+        let tags = r.tags.or(fm_tags).unwrap_or_default();
+        Ok(Self {
+            action: r.action,
+            path: r.path,
+            title,
+            tags,
+            body: r.body,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -143,8 +199,92 @@ pub struct QueryAnswer {
     #[serde(default)]
     pub citations: Vec<String>,
     /// Confidence 0.0–1.0. `None` means "the model did not express one".
-    #[serde(default)]
+    /// Tolerates both numeric values and label strings (`"low"`, `"medium"`,
+    /// `"high"`, plus `"very low"`/`"very high"`) — small models routinely
+    /// emit labels even when the schema requests a number.
+    #[serde(default, deserialize_with = "deserialize_confidence")]
     pub confidence: Option<f32>,
+}
+
+fn deserialize_confidence<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Number(n)) => n.as_f64().map(|x| x as f32),
+        Some(serde_json::Value::Bool(b)) => Some(if b { 1.0 } else { 0.0 }),
+        Some(serde_json::Value::String(s)) => parse_confidence_label(&s),
+        Some(other) => {
+            return Err(serde::de::Error::custom(format!(
+                "invalid confidence: expected number or label string, got {other}"
+            )));
+        }
+    })
+}
+
+fn parse_confidence_label(raw: &str) -> Option<f32> {
+    let trimmed = raw.trim();
+    if let Ok(n) = trimmed.parse::<f32>() {
+        return Some(n);
+    }
+    match trimmed.to_ascii_lowercase().replace('-', "_").as_str() {
+        "very_low" | "very low" => Some(0.1),
+        "low" => Some(0.3),
+        "medium" | "moderate" | "mid" => Some(0.6),
+        "high" => Some(0.85),
+        "very_high" | "very high" | "certain" => Some(0.95),
+        "" | "none" | "n/a" | "unknown" => None,
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod confidence_salvage_tests {
+    use super::*;
+
+    fn parse(json_value: &str) -> Option<f32> {
+        let answer: QueryAnswer = serde_json::from_str(&format!(
+            r#"{{ "answer": "x", "citations": [], "confidence": {json_value} }}"#
+        ))
+        .expect("must parse");
+        answer.confidence
+    }
+
+    #[test]
+    fn numeric_confidence_passes_through() {
+        assert_eq!(parse("0.7"), Some(0.7));
+        assert_eq!(parse("1.0"), Some(1.0));
+        assert_eq!(parse("0"), Some(0.0));
+    }
+
+    #[test]
+    fn label_strings_map_to_values() {
+        assert_eq!(parse(r#""low""#), Some(0.3));
+        assert_eq!(parse(r#""medium""#), Some(0.6));
+        assert_eq!(parse(r#""high""#), Some(0.85));
+        assert_eq!(parse(r#""HIGH""#), Some(0.85));
+        assert_eq!(parse(r#""very low""#), Some(0.1));
+        assert_eq!(parse(r#""very-high""#), Some(0.95));
+    }
+
+    #[test]
+    fn numeric_string_falls_back_to_parse() {
+        assert_eq!(parse(r#""0.42""#), Some(0.42));
+    }
+
+    #[test]
+    fn null_and_empty_become_none() {
+        assert_eq!(parse("null"), None);
+        assert_eq!(parse(r#""""#), None);
+        assert_eq!(parse(r#""unknown""#), None);
+    }
+
+    #[test]
+    fn unrecognized_label_becomes_none() {
+        assert_eq!(parse(r#""astonishing""#), None);
+    }
 }
 
 impl QueryAnswer {
@@ -246,6 +386,12 @@ pub fn ingest_prompt_with_learnings(
          Follow the vault schema below exactly. Never fabricate facts — cite \
          only what is in the source. Prefer updating an existing page over \
          creating a duplicate.\n\n\
+         If the retrieved pages already cover everything in the source — i.e. \
+         the source contains no information not already present in the wiki — \
+         set `redundant: true` and leave `pages` empty. The source will still \
+         be archived under `sources/` and a `[skip] redundant` line written to \
+         `log.md`. Do NOT set `redundant: true` if the source contains any new \
+         information, even minor.\n\n\
          === vault schema ===\n{schema}\n=== end schema ==={learnings}",
         schema = ctx.rendered_schema,
         learnings = learnings_section,
@@ -260,7 +406,28 @@ pub fn ingest_prompt_with_learnings(
          describing create/update actions, (3) a one-line `log_entry` for \
          `log.md`. All three fields are REQUIRED — omitting any one will \
          cause the ingest to be rejected. Respond with JSON only: no prose, \
-         no apology, no markdown fence.",
+         no apology, no markdown fence.\n\n\
+         ## Exact wire shape\n\n\
+         The response MUST match this JSON shape exactly. `title` and `tags` \
+         live FLAT on each page action — do NOT nest them under a \
+         `frontmatter` object.          The engine writes the on-disk frontmatter; \
+         you only supply these fields. Wikilinks inside `body` use STEM \
+         syntax only — `[[stem]]`, never `[[wiki/<type>/stem.md]]`.\n\n\
+         ```\n\
+         {{\n\
+           \"summary\": \"<one line>\",\n\
+           \"pages\": [\n\
+             {{\n\
+               \"action\": \"create\" | \"update\",\n\
+               \"path\": \"wiki/<type>/<stem>.md\",\n\
+               \"title\": \"<human title>\",\n\
+               \"tags\": [\"<type-tag>\", \"domain/<...>\", \"status/draft\"],\n\
+               \"body\": \"<markdown without frontmatter>\"\n\
+             }}\n\
+           ],\n\
+           \"log_entry\": \"<one line for log.md>\"\n\
+         }}\n\
+         ```",
         pages = ctx.render_pages(),
         valid_links = ctx.render_valid_links(),
     );
@@ -308,7 +475,9 @@ pub fn query_prompt_with_learnings(
          ## Retrieved pages\n\n{pages}\n\
          ## Task\n\n\
          Answer the question. Use `[[stem]]` wikilink format for citations. \
-         Only cite pages that appear above. Respond with JSON only.",
+         Only cite pages that appear above. Respond with JSON only. The \
+         `confidence` field, if present, MUST be a number between 0.0 and \
+         1.0 (e.g. 0.8) — not a string label.",
         pages = ctx.render_pages()
     );
     CompletionRequest {
@@ -386,6 +555,7 @@ mod tests {
                 body: "body\n".into(),
             }],
             log_entry: "[2026-04-06] ingest | attention source".into(),
+            redundant: false,
         };
         let json = serde_json::to_string(&plan).unwrap();
         let parsed: IngestPlan = serde_json::from_str(&json).unwrap();
@@ -601,5 +771,32 @@ mod tests {
         let req = ingest_prompt(&ctx, "test.md", "source text");
         let user_msg = &req.messages[0].content;
         assert!(!user_msg.contains("Exact page paths"));
+    }
+
+    #[test]
+    fn schema_advertises_redundant() {
+        let schema = schemars::schema_for!(IngestPlan);
+        let json = serde_json::to_string(&schema).unwrap();
+        assert!(
+            json.contains("\"redundant\""),
+            "redundant field missing from JsonSchema: {json}"
+        );
+        assert!(
+            json.contains("boolean"),
+            "redundant field type missing: {json}"
+        );
+    }
+
+    #[test]
+    fn ingest_prompt_instructs_redundant_flag() {
+        let page = sample_page();
+        let pages = [&page];
+        let ctx = PromptContext::new("# Rules\n", &pages);
+        let req = ingest_prompt(&ctx, "test.md", "src");
+        assert!(
+            req.system.contains("redundant: true"),
+            "system prompt missing redundant instruction: {sys}",
+            sys = req.system
+        );
     }
 }

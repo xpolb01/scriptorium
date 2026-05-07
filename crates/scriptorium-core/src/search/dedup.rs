@@ -65,7 +65,11 @@ fn merge_duplicates(results: Vec<SearchHit>) -> Vec<SearchHit> {
             .or_insert(hit);
     }
     let mut out: Vec<SearchHit> = best.into_values().collect();
-    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     out
 }
 
@@ -74,7 +78,9 @@ fn merge_duplicates(results: Vec<SearchHit>) -> Vec<SearchHit> {
 fn filter_jaccard(results: Vec<SearchHit>, threshold: f32) -> Vec<SearchHit> {
     let mut kept: Vec<SearchHit> = Vec::new();
     for hit in results {
-        let dominated = kept.iter().any(|k| jaccard(&hit.chunk_text, &k.chunk_text) > threshold);
+        let dominated = kept
+            .iter()
+            .any(|k| jaccard(&hit.chunk_text, &k.chunk_text) > threshold);
         if !dominated {
             kept.push(hit);
         }
@@ -89,7 +95,11 @@ fn enforce_type_diversity(results: Vec<SearchHit>, max_type_ratio: f32) -> Vec<S
         return results;
     }
     let n = results.len();
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     let max_per_type = ((n as f32 * max_type_ratio).ceil() as usize).max(1);
     let mut type_counts: HashMap<String, usize> = HashMap::new();
     let mut kept = Vec::new();
@@ -178,10 +188,7 @@ mod tests {
     #[test]
     fn merge_keeps_highest_score() {
         let id = PageId::new();
-        let results = vec![
-            hit(id, 0, "same chunk", 0.5),
-            hit(id, 0, "same chunk", 0.9),
-        ];
+        let results = vec![hit(id, 0, "same chunk", 0.5), hit(id, 0, "same chunk", 0.9)];
         let merged = merge_duplicates(results);
         assert_eq!(merged.len(), 1);
         assert!((merged[0].score - 0.9).abs() < f32::EPSILON);
@@ -221,12 +228,22 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, &id)| {
-                hit_with_path(id, 0, &format!("concept {i}"), 1.0 - i as f32 * 0.05, "wiki/concepts/foo.md")
+                hit_with_path(
+                    id,
+                    0,
+                    &format!("concept {i}"),
+                    1.0 - i as f32 * 0.05,
+                    "wiki/concepts/foo.md",
+                )
             })
             .collect();
         let filtered = enforce_type_diversity(results, 0.6);
         // ceil(10 * 0.6) = 6
-        assert_eq!(filtered.len(), 6, "should cap at 60% of results for one type");
+        assert_eq!(
+            filtered.len(),
+            6,
+            "should cap at 60% of results for one type"
+        );
     }
 
     #[test]

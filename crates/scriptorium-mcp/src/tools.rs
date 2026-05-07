@@ -96,6 +96,9 @@ impl ToolRegistry {
             "scriptorium_learn_search" => learn_search_tool(args, ctx),
             "scriptorium_learn_retrieve" => learn_retrieve_tool(args, ctx),
             "scriptorium_bench" => bench_tool(ctx).await,
+            "scriptorium_ingest_enqueue" => enqueue_tool(args, ctx),
+            "scriptorium_drain" => drain_tool(args, ctx).await,
+            "scriptorium_queue_status" => queue_status_tool(ctx),
             other => Err(ToolError::NotFound(other.to_string())),
         }
     }
@@ -303,6 +306,35 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                     "limit": { "type": "integer", "default": 5, "minimum": 1, "maximum": 20 }
                 }
             }),
+        },
+        ToolSpec {
+            name: "scriptorium_ingest_enqueue",
+            description: "Append a source path to the ingest queue. Returns immediately; no LLM call. Use this for automation flows; for interactive single-source ingest prefer scriptorium_ingest.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "source":     {"type": "string", "description": "Absolute path to a local source file."},
+                    "session_id": {"type": "string"}
+                },
+                "required": ["source"]
+            }),
+        },
+        ToolSpec {
+            name: "scriptorium_drain",
+            description: "Drain the ingest queue: dedup pending markers and synthesize survivors. Idempotent; second concurrent call exits cleanly.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "debounce_secs": {"type": "integer", "default": 120, "minimum": 0},
+                    "max":           {"type": "integer", "minimum": 1},
+                    "dry_run":       {"type": "boolean", "default": false}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "scriptorium_queue_status",
+            description: "Return queue size, oldest marker age, drain.lock state.",
+            input_schema: json!({"type": "object", "properties": {}}),
         },
     ]
 }
@@ -592,14 +624,12 @@ async fn maintain_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolE
     )
     .await
     .map_err(|e| ToolError::Failed(format!("maintain: {e}")))?;
-    serde_json::to_string_pretty(&report)
-        .map_err(|e| ToolError::Failed(format!("json: {e}")))
+    serde_json::to_string_pretty(&report).map_err(|e| ToolError::Failed(format!("json: {e}")))
 }
 
 fn doctor_tool(ctx: &ServerContext) -> Result<String, ToolError> {
     let store = open_store(ctx).ok();
-    let report =
-        scriptorium_core::doctor::run_doctor(&ctx.vault, store.as_ref());
+    let report = scriptorium_core::doctor::run_doctor(&ctx.vault, store.as_ref());
     serde_json::to_string_pretty(&report).map_err(|e| ToolError::Failed(format!("json: {e}")))
 }
 
@@ -620,37 +650,50 @@ async fn bench_tool(ctx: &ServerContext) -> Result<String, ToolError> {
     )
     .await
     .map_err(|e| ToolError::Failed(format!("bench: {e}")))?;
-    serde_json::to_string_pretty(&report)
-        .map_err(|e| ToolError::Failed(format!("json: {e}")))
+    serde_json::to_string_pretty(&report).map_err(|e| ToolError::Failed(format!("json: {e}")))
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn learn_capture_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError> {
     use scriptorium_core::learnings::{Learning, LearningSource, LearningType};
 
-    let skill = args.get("skill").and_then(|v| v.as_str())
+    let skill = args
+        .get("skill")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::InvalidArgs("missing 'skill'".into()))?
         .to_string();
-    let learning_type: LearningType = args.get("type").and_then(|v| v.as_str())
+    let learning_type: LearningType = args
+        .get("type")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::InvalidArgs("missing 'type'".into()))
-        .and_then(|s| serde_json::from_value(serde_json::Value::String(s.into()))
-            .map_err(|e| ToolError::InvalidArgs(format!("invalid type: {e}"))))?;
-    let key = args.get("key").and_then(|v| v.as_str())
+        .and_then(|s| {
+            serde_json::from_value(serde_json::Value::String(s.into()))
+                .map_err(|e| ToolError::InvalidArgs(format!("invalid type: {e}")))
+        })?;
+    let key = args
+        .get("key")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::InvalidArgs("missing 'key'".into()))?
         .to_string();
-    let insight = args.get("insight").and_then(|v| v.as_str())
+    let insight = args
+        .get("insight")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::InvalidArgs("missing 'insight'".into()))?
         .to_string();
     #[allow(clippy::cast_possible_truncation)]
     let confidence = args.get("confidence").and_then(Value::as_u64).unwrap_or(7) as u8;
-    let source: LearningSource = args.get("source").and_then(Value::as_str)
+    let source: LearningSource = args
+        .get("source")
+        .and_then(Value::as_str)
         .map_or(LearningSource::Observed, |s| {
             serde_json::from_value(Value::String(s.into())).unwrap_or(LearningSource::Observed)
         });
-    let tags: Vec<String> = args.get("tags")
+    let tags: Vec<String> = args
+        .get("tags")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
-    let files: Vec<String> = args.get("files")
+    let files: Vec<String> = args
+        .get("files")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
@@ -667,15 +710,15 @@ fn learn_capture_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolEr
     };
     scriptorium_core::learnings::capture(&ctx.vault, &learning)
         .map_err(|e| ToolError::Failed(format!("capture: {e}")))?;
-    Ok(format!("Captured: [{:?}] {}", learning.learning_type, learning.key))
+    Ok(format!(
+        "Captured: [{:?}] {}",
+        learning.learning_type, learning.key
+    ))
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn learn_search_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError> {
-    let query = args
-        .get("query")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let results = if query.is_empty() {
         scriptorium_core::learnings::list_recent(&ctx.vault, 20)
     } else {
@@ -711,6 +754,51 @@ fn skill_read_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError
     let skill = scriptorium_core::skills::load_skill(&ctx.vault, name)
         .map_err(|e| ToolError::Failed(format!("skill '{name}': {e}")))?;
     Ok(skill.content)
+}
+
+fn enqueue_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError> {
+    #[derive(Deserialize)]
+    struct Args {
+        source: String,
+        #[serde(default)]
+        session_id: Option<String>,
+    }
+    let args: Args = serde_json::from_value(args)?;
+    let path = std::path::PathBuf::from(args.source);
+    let marker = core::ingest_queue::enqueue(&ctx.vault, &path, args.session_id.as_deref())
+        .map_err(|e| ToolError::Failed(format!("enqueue: {e}")))?;
+    serde_json::to_string_pretty(&marker)
+        .map_err(|e| ToolError::Failed(format!("serialize marker: {e}")))
+}
+
+async fn drain_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError> {
+    #[derive(Deserialize)]
+    struct Args {
+        #[serde(default)]
+        debounce_secs: Option<u64>,
+        #[serde(default)]
+        max: Option<usize>,
+        #[serde(default)]
+        dry_run: bool,
+    }
+    let args: Args = serde_json::from_value(args)?;
+    let cfg = core::ingest_queue::DrainConfig {
+        debounce: std::time::Duration::from_secs(args.debounce_secs.unwrap_or(120)),
+        max_per_run: args.max,
+        dry_run: args.dry_run,
+    };
+    let report = core::ingest_queue::drain(&ctx.vault, ctx.llm_provider.as_ref(), cfg)
+        .await
+        .map_err(|e| ToolError::Failed(format!("drain: {e}")))?;
+    serde_json::to_string_pretty(&report)
+        .map_err(|e| ToolError::Failed(format!("serialize drain report: {e}")))
+}
+
+fn queue_status_tool(ctx: &ServerContext) -> Result<String, ToolError> {
+    let stats = core::ingest_queue::queue_stats(&ctx.vault)
+        .map_err(|e| ToolError::Failed(format!("queue_stats: {e}")))?;
+    serde_json::to_string_pretty(&stats)
+        .map_err(|e| ToolError::Failed(format!("serialize queue stats: {e}")))
 }
 
 // ---------- helpers ----------
@@ -877,6 +965,7 @@ mod tests {
                 body: body.into(),
             }],
             log_entry: format!("ingested {title}"),
+            redundant: false,
         }
     }
 
@@ -929,8 +1018,7 @@ mod tests {
             "Preview",
             "## Section\n\nDry-run preview body.\n",
         );
-        let (_dir, ctx, source) =
-            make_test_context(&plan, "preview-source.md", "preview contents");
+        let (_dir, ctx, source) = make_test_context(&plan, "preview-source.md", "preview contents");
 
         let args = json!({"source": source.to_string_lossy(), "dry_run": true});
         let out = ingest_tool(args, &ctx)
@@ -972,8 +1060,7 @@ mod tests {
             "Repeat",
             "## Body\n\nIdentical body across both ingests.\n",
         );
-        let (_dir, ctx, source) =
-            make_test_context(&plan, "repeat-source-1.md", "first-source");
+        let (_dir, ctx, source) = make_test_context(&plan, "repeat-source-1.md", "first-source");
 
         // First ingest: create + embed.
         let args1 = json!({"source": source.to_string_lossy(), "dry_run": false});
@@ -992,8 +1079,9 @@ mod tests {
         // changes `Page::content_hash`, which is part of the embeddings
         // cache key — so reindex must re-embed.
         plan.pages[0].action = IngestAction::Update;
-        let llm2: Arc<dyn scriptorium_core::llm::LlmProvider> =
-            Arc::new(MockProvider::constant(serde_json::to_string(&plan).unwrap()));
+        let llm2: Arc<dyn scriptorium_core::llm::LlmProvider> = Arc::new(MockProvider::constant(
+            serde_json::to_string(&plan).unwrap(),
+        ));
         let ctx2 = ServerContext {
             vault: ctx.vault.clone(),
             llm_provider: llm2,

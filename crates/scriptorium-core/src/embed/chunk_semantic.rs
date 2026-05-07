@@ -80,7 +80,10 @@ async fn try_semantic(
         }
 
         // Batch-embed all sentences.
-        let texts: Vec<String> = sentences.iter().map(std::string::ToString::to_string).collect();
+        let texts: Vec<String> = sentences
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         let embeddings = embed_provider
             .embed(&texts)
             .await
@@ -262,7 +265,11 @@ fn percentile(values: &[f32], p: f32) -> f32 {
     }
     let mut sorted: Vec<f32> = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     let idx = ((p * sorted.len() as f32).floor() as usize).min(sorted.len() - 1);
     sorted[idx]
 }
@@ -318,7 +325,10 @@ mod tests {
         );
         // The boundary should be near index 5 (the low point).
         let near_dip = boundaries.iter().any(|&b| (4..=7).contains(&b));
-        assert!(near_dip, "boundary should be near the similarity dip at index 5; got {boundaries:?}");
+        assert!(
+            near_dip,
+            "boundary should be near the similarity dip at index 5; got {boundaries:?}"
+        );
     }
 
     #[tokio::test]
@@ -326,7 +336,10 @@ mod tests {
         let mock = MockProvider::constant("");
         let body = "Just one sentence. And two.";
         let chunks = chunk_page_semantic(body, 1000, &mock, "m").await.unwrap();
-        assert!(!chunks.is_empty(), "should produce chunks via recursive fallback");
+        assert!(
+            !chunks.is_empty(),
+            "should produce chunks via recursive fallback"
+        );
     }
 
     #[tokio::test]
@@ -353,8 +366,12 @@ mod tests {
                     Third about dogs. Fourth about dogs.\n";
         let chunks = chunk_page_semantic(body, 1000, &mock, "m").await.unwrap();
         assert!(chunks.len() >= 2, "should have chunks from both sections");
-        let has_topic_a = chunks.iter().any(|c| c.heading.as_deref() == Some("Topic A"));
-        let has_topic_b = chunks.iter().any(|c| c.heading.as_deref() == Some("Topic B"));
+        let has_topic_a = chunks
+            .iter()
+            .any(|c| c.heading.as_deref() == Some("Topic A"));
+        let has_topic_b = chunks
+            .iter()
+            .any(|c| c.heading.as_deref() == Some("Topic B"));
         assert!(has_topic_a, "should have Topic A heading");
         assert!(has_topic_b, "should have Topic B heading");
     }

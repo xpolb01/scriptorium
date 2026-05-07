@@ -12,11 +12,12 @@
 use std::sync::Arc;
 
 use scriptorium_core::llm::LlmProvider;
+use scriptorium_core::telemetry::propagation::TraceContext;
 use scriptorium_core::Vault;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 use crate::tools::{ToolError, ToolRegistry};
 
@@ -86,38 +87,54 @@ pub async fn serve_stdio(context: ServerContext) -> anyhow::Result<()> {
         version = SERVER_VERSION,
         "mcp stdio: starting"
     );
-    let registry = ToolRegistry::new();
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin).lines();
-    let mut stdout = tokio::io::stdout();
 
-    while let Some(line) = reader.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        debug!(raw = %line, "mcp <-");
-        let parsed: Result<JsonRpcRequest, _> = serde_json::from_str(&line);
-        let response = match parsed {
-            Err(e) => {
-                warn!(error = %e, "mcp parse error");
-                Some(error_response(
-                    Value::Null,
-                    error_codes::PARSE_ERROR,
-                    format!("parse error: {e}"),
-                ))
+    let session_id = TraceContext::new_root(None, None);
+    let session_span = tracing::info_span!(
+        "mcp.session",
+        "session.id" = %session_id.trace_id,
+        transport = "stdio",
+        otel.kind = "server"
+    );
+
+    async {
+        tracing::info!("mcp.session.start");
+
+        let registry = ToolRegistry::new();
+        let stdin = tokio::io::stdin();
+        let mut reader = BufReader::new(stdin).lines();
+        let mut stdout = tokio::io::stdout();
+
+        while let Some(line) = reader.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
             }
-            Ok(req) => handle_request(req, &context, &registry).await,
-        };
-        if let Some(resp) = response {
-            let serialized = serde_json::to_string(&resp)?;
-            debug!(raw = %serialized, "mcp ->");
-            stdout.write_all(serialized.as_bytes()).await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
+            debug!(raw = %line, "mcp <-");
+            let parsed: Result<JsonRpcRequest, _> = serde_json::from_str(&line);
+            let response = match parsed {
+                Err(e) => {
+                    warn!(error = %e, "mcp parse error");
+                    Some(error_response(
+                        Value::Null,
+                        error_codes::PARSE_ERROR,
+                        format!("parse error: {e}"),
+                    ))
+                }
+                Ok(req) => handle_request(req, &context, &registry).await,
+            };
+            if let Some(resp) = response {
+                let serialized = serde_json::to_string(&resp)?;
+                debug!(raw = %serialized, "mcp ->");
+                stdout.write_all(serialized.as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
         }
+        tracing::info!(otel.status = "ok", "mcp.session.end");
+        info!("mcp stdio: stdin closed, exiting");
+        Ok(())
     }
-    info!("mcp stdio: stdin closed, exiting");
-    Ok(())
+    .instrument(session_span)
+    .await
 }
 
 async fn handle_request(
@@ -150,18 +167,41 @@ async fn dispatch(
     context: &ServerContext,
     registry: &ToolRegistry,
 ) -> Result<Value, JsonRpcError> {
-    match req.method.as_str() {
-        "initialize" => Ok(initialize_result()),
-        "notifications/initialized" | "initialized" => Ok(Value::Null),
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": registry.describe_all() })),
-        "tools/call" => tools_call(req, context, registry).await,
-        other => Err(JsonRpcError {
-            code: error_codes::METHOD_NOT_FOUND,
-            message: format!("method not found: {other}"),
-            data: None,
-        }),
+    let rpc_method = req.method.as_str();
+    let rpc_request_id = match &req.id {
+        Some(id) => format!("{}", id),
+        None => "null".to_string(),
+    };
+    let request_span = tracing::info_span!(
+        "mcp.request",
+        "rpc.method" = %rpc_method,
+        "rpc.request_id" = %rpc_request_id,
+        otel.kind = "server"
+    );
+
+    async {
+        let result = match req.method.as_str() {
+            "initialize" => Ok(initialize_result()),
+            "notifications/initialized" | "initialized" => Ok(Value::Null),
+            "ping" => Ok(json!({})),
+            "tools/list" => Ok(json!({ "tools": registry.describe_all() })),
+            "tools/call" => tools_call(req, context, registry).await,
+            other => Err(JsonRpcError {
+                code: error_codes::METHOD_NOT_FOUND,
+                message: format!("method not found: {other}"),
+                data: None,
+            }),
+        };
+
+        match &result {
+            Ok(_) => tracing::info!(otel.status = "ok", "mcp.request.end"),
+            Err(e) => tracing::error!(otel.status = "error", error = %e.message, "mcp.request.end"),
+        }
+
+        result
     }
+    .instrument(request_span)
+    .await
 }
 
 fn initialize_result() -> Value {
@@ -198,33 +238,83 @@ async fn tools_call(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let result = registry.invoke(&name, arguments, context).await;
-    match result {
-        Ok(text) => Ok(json!({
-            "content": [{"type": "text", "text": text}],
-            "isError": false,
-        })),
-        Err(ToolError::NotFound(name)) => Err(JsonRpcError {
-            code: error_codes::METHOD_NOT_FOUND,
-            message: format!("no such tool: {name}"),
-            data: None,
-        }),
-        Err(ToolError::InvalidArgs(msg)) => Err(JsonRpcError {
-            code: error_codes::INVALID_PARAMS,
-            message: msg,
-            data: None,
-        }),
-        Err(ToolError::Failed(msg)) => {
-            // Tool failures are returned as isError content so the client
-            // can display them, while non-tool errors (invalid params,
-            // method not found) become JSON-RPC errors.
-            error!(tool = %name, error = %msg, "tool failed");
-            Ok(json!({
-                "content": [{"type": "text", "text": msg}],
-                "isError": true,
-            }))
+    let tool_full_name: &str = name.as_str();
+    let tool_name: &str = tool_full_name
+        .strip_prefix("scriptorium_")
+        .unwrap_or(tool_full_name);
+    let span = tracing::info_span!(
+        "mcp.tool",
+        tool_name = %tool_name,
+        tool_full_name = %tool_full_name,
+        otel.kind = "server",
+    );
+
+    async move {
+        // Cap the params preview so we don't log unbounded payloads.
+        let params_json = serde_json::to_string(&req.params).unwrap_or_default();
+        let (params_preview, _trunc_meta) = scriptorium_core::telemetry::payload::cap_body(
+            &params_json,
+            &scriptorium_core::telemetry::envelope::DEFAULT_PAYLOAD_CAP,
+        );
+        tracing::info!(params = %params_preview, "mcp.tool.start");
+
+        let t0 = std::time::Instant::now();
+        let result = registry.invoke(&name, arguments, context).await;
+        let duration_ms = t0.elapsed().as_millis() as u64;
+
+        match &result {
+            Ok(text) => {
+                tracing::info!(
+                    result_size = text.len(),
+                    duration_ms = duration_ms,
+                    otel.status = "ok",
+                    "mcp.tool.end",
+                );
+            }
+            Err(e) => {
+                let msg = match e {
+                    ToolError::NotFound(n) => format!("not found: {n}"),
+                    ToolError::InvalidArgs(m) => format!("invalid args: {m}"),
+                    ToolError::Failed(m) => format!("failed: {m}"),
+                };
+                tracing::error!(
+                    error = %msg,
+                    duration_ms = duration_ms,
+                    otel.status = "error",
+                    "mcp.tool.end",
+                );
+            }
+        }
+
+        match result {
+            Ok(text) => Ok(json!({
+                "content": [{"type": "text", "text": text}],
+                "isError": false,
+            })),
+            Err(ToolError::NotFound(name)) => Err(JsonRpcError {
+                code: error_codes::METHOD_NOT_FOUND,
+                message: format!("no such tool: {name}"),
+                data: None,
+            }),
+            Err(ToolError::InvalidArgs(msg)) => Err(JsonRpcError {
+                code: error_codes::INVALID_PARAMS,
+                message: msg,
+                data: None,
+            }),
+            Err(ToolError::Failed(msg)) => {
+                // Tool failures are returned as isError content so the client
+                // can display them, while non-tool errors (invalid params,
+                // method not found) become JSON-RPC errors.
+                error!(tool = %name, error = %msg, "tool failed");
+                Ok(json!({
+                    "content": [{"type": "text", "text": msg}],
+                    "isError": true,
+                }))
+            }
         }
     }
+    .instrument(span)
+    .await
 }
 
 fn error_response(id: Value, code: i32, message: String) -> JsonRpcResponse {

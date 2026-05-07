@@ -1,0 +1,6 @@
+{
+  "session_id": "ses_abc123xyz789def",
+  "transcript_path": "/Users/bogdan/.claude/sessions/ses_abc123xyz789def/transcript.md",
+  "cwd": "/Users/bogdan/Work/PersonalProjects/scriptorium",
+  "hook_event_name": "UserPromptSubmit"
+}

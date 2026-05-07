@@ -68,6 +68,10 @@ pub struct IngestReport {
     /// Preview of the change set if this was a dry run. Empty on a real
     /// commit.
     pub dry_run_diff: Vec<crate::vault::ChangeSummary>,
+    /// True if the LLM judged the source redundant relative to existing
+    /// pages. The source was archived and a `[skip] redundant` log line
+    /// added, but no wiki pages were created or updated.
+    pub redundant: bool,
 }
 
 /// Run the full ingest pipeline for a single source file.
@@ -207,9 +211,7 @@ pub async fn ingest_with_retrieval(
         {
             let normalized = normalize_stem(&page.path);
             if !normalized.is_empty() {
-                map.entry(normalized)
-                    .or_default()
-                    .push(page.path.clone());
+                map.entry(normalized).or_default().push(page.path.clone());
             }
         }
         // Sort path vectors for deterministic output
@@ -256,8 +258,9 @@ pub async fn ingest_with_retrieval(
         &response.model,
         &response.usage,
     );
-    let mut plan: IngestPlan = match serde_json::from_str::<IngestPlan>(&response.text) {
-        Ok(plan) => plan,
+    let salvaged = crate::llm::extract_json_payload(&response.text);
+    let raw: crate::llm::prompts::IngestPlanRaw = match serde_json::from_str(&salvaged) {
+        Ok(r) => r,
         Err(parse_err) => {
             // Persist the full context so the bug is debuggable after the
             // fact. Don't let a failure to write the failure record mask
@@ -284,9 +287,7 @@ pub async fn ingest_with_retrieval(
                     skill: "ingest".into(),
                     learning_type: crate::learnings::LearningType::Pitfall,
                     key: format!("parse-fail-{label}"),
-                    insight: format!(
-                        "Ingest parse failed on '{label}': {parse_err}"
-                    ),
+                    insight: format!("Ingest parse failed on '{label}': {parse_err}"),
                     confidence: 6,
                     source: crate::learnings::LearningSource::Observed,
                     tags: vec!["ingest".into(), "parse-error".into()],
@@ -301,7 +302,42 @@ pub async fn ingest_with_retrieval(
         }
     };
 
-    // 5b. Guard against stem collisions before processing.
+    let plan_redundant = raw.redundant;
+    let raw_pages_empty = raw.pages.is_empty();
+    let mut plan: IngestPlan = IngestPlan::try_from(raw)
+        .map_err(|e| Error::Other(anyhow::anyhow!("ingest plan conversion: {e}")))?;
+
+    if plan_redundant {
+        if !raw_pages_empty {
+            return Err(Error::Other(anyhow::anyhow!(
+                "ingest plan has redundant=true but non-empty pages"
+            )));
+        }
+        let mut tx = vault.begin();
+        tx.put_file(&interned, source_text.clone())?;
+        tx.append(
+            Utf8Path::new("log.md"),
+            &format!("\n[skip] redundant — {interned}\n"),
+        )?;
+        let commit_id = tx.commit(&format!("[ingest:skip] {interned}"))?;
+        if let Some(hooks) = &options.hooks {
+            crate::hooks::post_ingest(hooks, source_path, &commit_id, &plan.summary, 0, 0).await;
+        }
+        return Ok(IngestReport {
+            source: interned,
+            commit_id,
+            created: 0,
+            updated: 0,
+            summary: plan.summary,
+            dry_run_diff: Vec::new(),
+            redundant: true,
+        });
+    }
+
+    for page in &mut plan.pages {
+        page.body = normalize_wikilinks(&page.body);
+    }
+
     guard_stem_collisions(&mut plan, &stem_to_path, &existing_paths)?;
 
     // 6. Translate the plan into a VaultTx. Reuse the scan we did for
@@ -391,6 +427,7 @@ pub async fn ingest_with_retrieval(
             updated,
             summary: plan.summary,
             dry_run_diff: diff,
+            redundant: false,
         });
     }
     let commit_message = format!("[ingest] {}", plan.summary);
@@ -416,7 +453,18 @@ pub async fn ingest_with_retrieval(
         updated,
         summary: plan.summary,
         dry_run_diff: Vec::new(),
+        redundant: false,
     })
+}
+
+fn normalize_wikilinks(body: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\[\[wiki/[^\]/|]+/([^\]/|]+?)(?:\.md)?(\|[^\]]+)?\]\]")
+            .expect("normalize_wikilinks regex is valid")
+    });
+    re.replace_all(body, "[[$1$2]]").into_owned()
 }
 
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
@@ -457,8 +505,10 @@ fn guard_stem_collisions(
                             action.path = existing_path;
                         }
                         n if n >= 2 => {
-                            let paths_list: Vec<String> =
-                                existing.iter().map(std::string::ToString::to_string).collect();
+                            let paths_list: Vec<String> = existing
+                                .iter()
+                                .map(std::string::ToString::to_string)
+                                .collect();
                             return Err(Error::Other(anyhow::anyhow!(
                                 "Ambiguous stem collision: stem '{}' matches {} existing pages: {}. Clean up duplicates before ingesting.",
                                 stem, n, paths_list.join(", ")
@@ -481,8 +531,10 @@ fn guard_stem_collisions(
                             action.path = existing_path;
                         }
                         Some(existing) if existing.len() >= 2 => {
-                            let paths_list: Vec<String> =
-                                existing.iter().map(std::string::ToString::to_string).collect();
+                            let paths_list: Vec<String> = existing
+                                .iter()
+                                .map(std::string::ToString::to_string)
+                                .collect();
                             return Err(Error::Other(anyhow::anyhow!(
                                 "Ambiguous stem collision: stem '{}' matches {} existing pages: {}. Clean up duplicates before ingesting.",
                                 stem, existing.len(), paths_list.join(", ")
@@ -918,6 +970,7 @@ mod tests {
             summary: "test plan".into(),
             pages,
             log_entry: "test log".into(),
+            redundant: false,
         }
     }
 
@@ -941,9 +994,10 @@ mod tests {
 
     #[test]
     fn guard_no_collisions_passes_through() {
-        let mut plan = make_plan(vec![
-            make_action(IngestAction::Create, "wiki/concepts/new-page.md"),
-        ]);
+        let mut plan = make_plan(vec![make_action(
+            IngestAction::Create,
+            "wiki/concepts/new-page.md",
+        )]);
         let result = guard_stem_collisions(&mut plan, &empty_stem_map(), &empty_existing());
         assert!(result.is_ok());
         assert_eq!(plan.pages[0].path, "wiki/concepts/new-page.md");
@@ -952,9 +1006,10 @@ mod tests {
 
     #[test]
     fn guard_create_single_match_converts_to_update() {
-        let mut plan = make_plan(vec![
-            make_action(IngestAction::Create, "wiki/concepts/Attention.md"),
-        ]);
+        let mut plan = make_plan(vec![make_action(
+            IngestAction::Create,
+            "wiki/concepts/Attention.md",
+        )]);
         let mut stem_map = empty_stem_map();
         stem_map.insert(
             "attention".into(),
@@ -968,9 +1023,10 @@ mod tests {
 
     #[test]
     fn guard_create_two_matches_errors() {
-        let mut plan = make_plan(vec![
-            make_action(IngestAction::Create, "wiki/concepts/Foo.md"),
-        ]);
+        let mut plan = make_plan(vec![make_action(
+            IngestAction::Create,
+            "wiki/concepts/Foo.md",
+        )]);
         let mut stem_map = empty_stem_map();
         stem_map.insert(
             "foo".into(),
@@ -988,9 +1044,10 @@ mod tests {
 
     #[test]
     fn guard_update_existing_path_passes_through() {
-        let mut plan = make_plan(vec![
-            make_action(IngestAction::Update, "wiki/concepts/attention.md"),
-        ]);
+        let mut plan = make_plan(vec![make_action(
+            IngestAction::Update,
+            "wiki/concepts/attention.md",
+        )]);
         let mut existing = empty_existing();
         existing.insert("wiki/concepts/attention.md".into());
         let result = guard_stem_collisions(&mut plan, &empty_stem_map(), &existing);
@@ -1000,9 +1057,10 @@ mod tests {
 
     #[test]
     fn guard_update_nonexistent_single_match_retargets() {
-        let mut plan = make_plan(vec![
-            make_action(IngestAction::Update, "wiki/concepts/Attention.md"),
-        ]);
+        let mut plan = make_plan(vec![make_action(
+            IngestAction::Update,
+            "wiki/concepts/Attention.md",
+        )]);
         let mut stem_map = empty_stem_map();
         stem_map.insert(
             "attention".into(),
@@ -1015,9 +1073,10 @@ mod tests {
 
     #[test]
     fn guard_update_nonexistent_two_matches_errors() {
-        let mut plan = make_plan(vec![
-            make_action(IngestAction::Update, "wiki/concepts/Foo.md"),
-        ]);
+        let mut plan = make_plan(vec![make_action(
+            IngestAction::Update,
+            "wiki/concepts/Foo.md",
+        )]);
         let mut stem_map = empty_stem_map();
         stem_map.insert(
             "foo".into(),
@@ -1046,9 +1105,10 @@ mod tests {
 
     #[test]
     fn guard_invalid_path_no_wiki_prefix_errors() {
-        let mut plan = make_plan(vec![
-            make_action(IngestAction::Create, "pages/concepts/foo.md"),
-        ]);
+        let mut plan = make_plan(vec![make_action(
+            IngestAction::Create,
+            "pages/concepts/foo.md",
+        )]);
         let result = guard_stem_collisions(&mut plan, &empty_stem_map(), &empty_existing());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1057,9 +1117,10 @@ mod tests {
 
     #[test]
     fn guard_path_traversal_errors() {
-        let mut plan = make_plan(vec![
-            make_action(IngestAction::Create, "wiki/../etc/passwd.md"),
-        ]);
+        let mut plan = make_plan(vec![make_action(
+            IngestAction::Create,
+            "wiki/../etc/passwd.md",
+        )]);
         let result = guard_stem_collisions(&mut plan, &empty_stem_map(), &empty_existing());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();

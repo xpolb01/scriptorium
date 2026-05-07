@@ -19,6 +19,34 @@ pub struct Config {
     pub paths: PathsConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
+    #[serde(default)]
+    pub meridian: MeridianConfig,
+}
+
+/// Optional local Anthropic-compatible proxy. When `enabled` and
+/// `[llm].provider = "claude"`, scriptorium probes the configured URL at
+/// startup; if reachable, Claude requests are routed through the proxy via
+/// the OpenAI-compatible chat endpoint instead of `api.anthropic.com`.
+/// Falls back to direct Anthropic when the probe fails — never fails closed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeridianConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_meridian_url")]
+    pub url: String,
+}
+
+impl Default for MeridianConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: default_meridian_url(),
+        }
+    }
+}
+
+fn default_meridian_url() -> String {
+    "http://127.0.0.1:3456".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

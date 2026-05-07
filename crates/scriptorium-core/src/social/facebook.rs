@@ -217,33 +217,42 @@ fn fix_encoding(s: &str) -> String {
 /// Format a unix timestamp (seconds) as `YYYY-MM-DD`.
 fn ts_to_date(ts: i64) -> String {
     Utc.timestamp_opt(ts, 0)
-        .single().map_or_else(|| "unknown".into(), |dt| dt.format("%Y-%m-%d").to_string())
+        .single()
+        .map_or_else(|| "unknown".into(), |dt| dt.format("%Y-%m-%d").to_string())
 }
 
 /// Format a unix timestamp (milliseconds) as `YYYY-MM-DD HH:MM`.
 fn ts_ms_to_datetime(ts_ms: i64) -> String {
-    Utc.timestamp_millis_opt(ts_ms)
-        .single().map_or_else(|| "unknown".into(), |dt| dt.format("%Y-%m-%d %H:%M").to_string())
+    Utc.timestamp_millis_opt(ts_ms).single().map_or_else(
+        || "unknown".into(),
+        |dt| dt.format("%Y-%m-%d %H:%M").to_string(),
+    )
 }
 
 /// Format a unix timestamp (milliseconds) as year (i32).
 fn ts_ms_to_year(ts_ms: i64) -> i32 {
-    Utc.timestamp_millis_opt(ts_ms)
-        .single()
-        .map_or(0, |dt| dt.format("%Y").to_string().parse::<i32>().unwrap_or(0))
+    Utc.timestamp_millis_opt(ts_ms).single().map_or(0, |dt| {
+        dt.format("%Y").to_string().parse::<i32>().unwrap_or(0)
+    })
 }
 
 /// Format a unix timestamp (seconds) as year (i32).
 fn ts_to_year(ts: i64) -> i32 {
-    Utc.timestamp_opt(ts, 0)
-        .single()
-        .map_or(0, |dt| dt.format("%Y").to_string().parse::<i32>().unwrap_or(0))
+    Utc.timestamp_opt(ts, 0).single().map_or(0, |dt| {
+        dt.format("%Y").to_string().parse::<i32>().unwrap_or(0)
+    })
 }
 
 /// Create a safe filename slug from a string.
 fn slugify(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .to_lowercase()
         .replace("--", "-")
@@ -276,9 +285,7 @@ fn find_json_root(dirs: &[PathBuf]) -> Result<PathBuf> {
             "security_and_login_information",
             "personal_information",
         ];
-        let has_markers = markers
-            .iter()
-            .any(|m| dir.join(m).is_dir());
+        let has_markers = markers.iter().any(|m| dir.join(m).is_dir());
         if has_markers {
             return Ok(dir.clone());
         }
@@ -295,16 +302,12 @@ fn find_json_root(dirs: &[PathBuf]) -> Result<PathBuf> {
 }
 
 fn has_json_files(dir: &Path) -> bool {
-    fs::read_dir(dir)
-        .ok()
-        .is_some_and(|entries| {
-            entries
-                .filter_map(std::result::Result::ok)
-                .any(|e| {
-                    e.path().extension().is_some_and(|ext| ext == "json")
-                        || e.file_type().is_ok_and(|ft| ft.is_dir())
-                })
+    fs::read_dir(dir).ok().is_some_and(|entries| {
+        entries.filter_map(std::result::Result::ok).any(|e| {
+            e.path().extension().is_some_and(|ext| ext == "json")
+                || e.file_type().is_ok_and(|ft| ft.is_dir())
         })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -614,11 +617,7 @@ struct GroupEntry {
 const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
 
 #[allow(clippy::too_many_lines)]
-fn process_messages(
-    json_root: &Path,
-    out_dir: &Path,
-    dry_run: bool,
-) -> Result<CategoryReport> {
+fn process_messages(json_root: &Path, out_dir: &Path, dry_run: bool) -> Result<CategoryReport> {
     let msg_root = json_root.join("your_facebook_activity").join("messages");
     if !msg_root.is_dir() {
         return Ok(CategoryReport {
@@ -774,11 +773,7 @@ fn format_conversation(
     // Header
     let _ = writeln!(out, "# Conversation: {display_name}");
     let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "**Participants:** {}",
-        participants.join(", ")
-    );
+    let _ = writeln!(out, "**Participants:** {}", participants.join(", "));
     let _ = writeln!(
         out,
         "**Messages:** {} | **Period:** {date_range}",
@@ -973,11 +968,7 @@ fn format_conversation_refs(
 }
 
 #[allow(clippy::too_many_lines)]
-fn process_posts(
-    json_root: &Path,
-    out_dir: &Path,
-    dry_run: bool,
-) -> Result<CategoryReport> {
+fn process_posts(json_root: &Path, out_dir: &Path, dry_run: bool) -> Result<CategoryReport> {
     let posts_dir = json_root.join("your_facebook_activity").join("posts");
     if !posts_dir.is_dir() {
         return Ok(CategoryReport {
@@ -1102,11 +1093,7 @@ fn process_posts(
 }
 
 #[allow(clippy::too_many_lines)]
-fn process_comments(
-    json_root: &Path,
-    out_dir: &Path,
-    dry_run: bool,
-) -> Result<CategoryReport> {
+fn process_comments(json_root: &Path, out_dir: &Path, dry_run: bool) -> Result<CategoryReport> {
     let cr_dir = json_root
         .join("your_facebook_activity")
         .join("comments_and_reactions");
@@ -1249,11 +1236,7 @@ fn process_comments(
 }
 
 #[allow(clippy::too_many_lines)]
-fn process_friends(
-    json_root: &Path,
-    out_dir: &Path,
-    dry_run: bool,
-) -> Result<CategoryReport> {
+fn process_friends(json_root: &Path, out_dir: &Path, dry_run: bool) -> Result<CategoryReport> {
     let friends_dir = json_root.join("connections").join("friends");
     let followers_dir = json_root.join("connections").join("followers");
     let mut files_written = 0;
@@ -1334,9 +1317,7 @@ fn process_friends(
                                     continue;
                                 }
                                 items += entries.len();
-                                let slug = slugify(
-                                    &fname.replace(".json", ""),
-                                );
+                                let slug = slugify(&fname.replace(".json", ""));
                                 let mut out = String::new();
                                 let _ = writeln!(out, "---");
                                 let _ = writeln!(out, "source: facebook-export");
@@ -1352,8 +1333,7 @@ fn process_friends(
                                 let _ = writeln!(out);
 
                                 for entry in entries {
-                                    if let Some(name) = entry.get("name").and_then(|v| v.as_str())
-                                    {
+                                    if let Some(name) = entry.get("name").and_then(|v| v.as_str()) {
                                         let ts = entry
                                             .get("timestamp")
                                             .and_then(serde_json::Value::as_i64)
@@ -1385,11 +1365,7 @@ fn process_friends(
     })
 }
 
-fn process_search(
-    json_root: &Path,
-    out_dir: &Path,
-    dry_run: bool,
-) -> Result<CategoryReport> {
+fn process_search(json_root: &Path, out_dir: &Path, dry_run: bool) -> Result<CategoryReport> {
     let search_path = json_root
         .join("logged_information")
         .join("search")
@@ -1403,8 +1379,7 @@ fn process_search(
         });
     }
 
-    let raw = fs::read_to_string(&search_path)
-        .map_err(|e| Error::io(&search_path, e))?;
+    let raw = fs::read_to_string(&search_path).map_err(|e| Error::io(&search_path, e))?;
     let sf: SearchFile = serde_json::from_str(&raw)
         .map_err(|e| Error::Other(anyhow::anyhow!("parse search: {e}")))?;
 
@@ -1457,14 +1432,8 @@ fn process_search(
     })
 }
 
-fn process_events(
-    json_root: &Path,
-    out_dir: &Path,
-    dry_run: bool,
-) -> Result<CategoryReport> {
-    let events_dir = json_root
-        .join("your_facebook_activity")
-        .join("events");
+fn process_events(json_root: &Path, out_dir: &Path, dry_run: bool) -> Result<CategoryReport> {
+    let events_dir = json_root.join("your_facebook_activity").join("events");
     if !events_dir.is_dir() {
         return Ok(CategoryReport {
             category: "events".into(),
@@ -1499,11 +1468,7 @@ fn process_events(
                                     .and_then(serde_json::Value::as_i64)
                                     .unwrap_or(0);
                                 if !name.is_empty() || ts > 0 {
-                                    all_events.push((
-                                        name,
-                                        fname.clone(),
-                                        ts,
-                                    ));
+                                    all_events.push((name, fname.clone(), ts));
                                 }
                             }
                         }
@@ -1550,14 +1515,8 @@ fn process_events(
 }
 
 #[allow(clippy::too_many_lines)]
-fn process_groups(
-    json_root: &Path,
-    out_dir: &Path,
-    dry_run: bool,
-) -> Result<CategoryReport> {
-    let groups_dir = json_root
-        .join("your_facebook_activity")
-        .join("groups");
+fn process_groups(json_root: &Path, out_dir: &Path, dry_run: bool) -> Result<CategoryReport> {
+    let groups_dir = json_root.join("your_facebook_activity").join("groups");
     if !groups_dir.is_dir() {
         return Ok(CategoryReport {
             category: "groups".into(),
@@ -1649,10 +1608,8 @@ fn process_groups(
                                         .and_then(serde_json::Value::as_i64)
                                         .unwrap_or(0);
                                     let date = ts_to_date(ts);
-                                    let title = e
-                                        .get("title")
-                                        .and_then(|v| v.as_str())
-                                        .map(fix_encoding);
+                                    let title =
+                                        e.get("title").and_then(|v| v.as_str()).map(fix_encoding);
                                     let _ = writeln!(
                                         out,
                                         "**[{date}]** {}",
@@ -1665,9 +1622,8 @@ fn process_groups(
                                             if let Some(comment) =
                                                 d.get("comment").and_then(|v| v.as_object())
                                             {
-                                                if let Some(text) = comment
-                                                    .get("comment")
-                                                    .and_then(|v| v.as_str())
+                                                if let Some(text) =
+                                                    comment.get("comment").and_then(|v| v.as_str())
                                                 {
                                                     let _ =
                                                         writeln!(out, "> {}", fix_encoding(text));
@@ -1705,7 +1661,12 @@ fn read_dir_sorted(dir: &Path) -> Result<Vec<PathBuf>> {
         .map_err(|e| Error::io(dir, e))?
         .filter_map(|e: std::result::Result<fs::DirEntry, _>| e.ok())
         .map(|e: fs::DirEntry| e.path())
-        .filter(|p: &PathBuf| !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.'))
+        .filter(|p: &PathBuf| {
+            !p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with('.')
+        })
         .collect();
     entries.sort();
     Ok(entries)

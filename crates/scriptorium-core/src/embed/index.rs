@@ -13,7 +13,9 @@
 
 use tracing::debug;
 
-use super::{chunk_page, chunk_page_recursive, chunk_page_semantic, Chunk, EmbeddingRow, EmbeddingsStore};
+use super::{
+    chunk_page, chunk_page_recursive, chunk_page_semantic, Chunk, EmbeddingRow, EmbeddingsStore,
+};
 use crate::config::ChunkStrategy;
 use crate::error::{Error, Result};
 use crate::llm::LlmProvider;

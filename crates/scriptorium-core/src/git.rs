@@ -238,14 +238,20 @@ mod tests {
         // Inspect the resulting commit's tree. It MUST contain the new
         // file at `nested/deep/page.md`; an empty commit fails the test.
         let repo = Repository::open(dir.path()).unwrap();
-        let commit = repo.find_commit(git2::Oid::from_str(&oid).unwrap()).unwrap();
+        let commit = repo
+            .find_commit(git2::Oid::from_str(&oid).unwrap())
+            .unwrap();
         let tree = commit.tree().unwrap();
 
         // Walk the tree down to nested/deep/page.md.
         let nested_entry = tree
             .get_name("nested")
             .expect("commit tree should contain `nested/` subtree after staging a file in it");
-        let nested_tree = nested_entry.to_object(&repo).unwrap().peel_to_tree().unwrap();
+        let nested_tree = nested_entry
+            .to_object(&repo)
+            .unwrap()
+            .peel_to_tree()
+            .unwrap();
         let deep_entry = nested_tree
             .get_name("deep")
             .expect("commit tree should contain `nested/deep/` subtree");
@@ -294,16 +300,18 @@ mod tests {
 
         let oid = commit_paths(dir.path(), &paths, "add three").unwrap();
         let repo = Repository::open(dir.path()).unwrap();
-        let commit = repo.find_commit(git2::Oid::from_str(&oid).unwrap()).unwrap();
+        let commit = repo
+            .find_commit(git2::Oid::from_str(&oid).unwrap())
+            .unwrap();
 
         // Every file must appear in the commit tree.
         for (subdir, name, _) in &targets {
             let mut current = commit.tree().unwrap();
             for part in subdir.split('/') {
                 let next_oid = {
-                    let entry = current.get_name(part).unwrap_or_else(|| {
-                        panic!("missing subtree `{part}` (parent of `{name}`)")
-                    });
+                    let entry = current
+                        .get_name(part)
+                        .unwrap_or_else(|| panic!("missing subtree `{part}` (parent of `{name}`)"));
                     entry.id()
                 };
                 current = repo.find_tree(next_oid).unwrap();
@@ -364,7 +372,9 @@ mod tests {
 
         // Step 5: the resulting commit tree MUST contain wiki/notes/bar.md.
         let repo = Repository::open(root).unwrap();
-        let commit = repo.find_commit(git2::Oid::from_str(&oid).unwrap()).unwrap();
+        let commit = repo
+            .find_commit(git2::Oid::from_str(&oid).unwrap())
+            .unwrap();
         let parent = commit.parent(0).unwrap();
         assert_ne!(
             commit.tree_id(),
@@ -435,7 +445,9 @@ mod tests {
         let oid = commit_paths(&root, &[PathBuf::from("./log.md")], "append log").unwrap();
 
         let repo = Repository::open(&root).unwrap();
-        let commit = repo.find_commit(git2::Oid::from_str(&oid).unwrap()).unwrap();
+        let commit = repo
+            .find_commit(git2::Oid::from_str(&oid).unwrap())
+            .unwrap();
         let parent = commit.parent(0).unwrap();
         assert_ne!(
             commit.tree_id(),
@@ -447,7 +459,9 @@ mod tests {
         let blob = repo
             .find_blob(tree.get_name("log.md").expect("log.md").id())
             .unwrap();
-        assert!(std::str::from_utf8(blob.content()).unwrap().contains("Appended"));
+        assert!(std::str::from_utf8(blob.content())
+            .unwrap()
+            .contains("Appended"));
     }
 
     /// Same bug, same call site, but with a brand-new file under a
@@ -478,7 +492,9 @@ mod tests {
         .unwrap();
 
         let repo = Repository::open(&root).unwrap();
-        let commit = repo.find_commit(git2::Oid::from_str(&oid).unwrap()).unwrap();
+        let commit = repo
+            .find_commit(git2::Oid::from_str(&oid).unwrap())
+            .unwrap();
         assert_ne!(
             commit.tree_id(),
             commit.parent(0).unwrap().tree_id(),
@@ -535,7 +551,9 @@ mod tests {
         let oid = commit_paths(root, &[log_md.clone()], "append to log").unwrap();
 
         let repo = Repository::open(root).unwrap();
-        let commit = repo.find_commit(git2::Oid::from_str(&oid).unwrap()).unwrap();
+        let commit = repo
+            .find_commit(git2::Oid::from_str(&oid).unwrap())
+            .unwrap();
         let parent = commit.parent(0).unwrap();
 
         assert_ne!(

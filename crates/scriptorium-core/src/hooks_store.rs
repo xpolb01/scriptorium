@@ -352,11 +352,24 @@ impl HooksStore {
     }
 
     fn init(conn: Connection, db_path: Option<PathBuf>) -> Result<Self> {
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")
+            .map_err(wrap_sql)?;
+
+        let existing_kind: Option<String> = conn
+            .query_row(
+                "SELECT type FROM sqlite_master WHERE name = 'hook_events'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(wrap_sql)?;
+
+        if matches!(existing_kind.as_deref(), Some("view")) {
+            return Ok(Self { conn, db_path });
+        }
+
         conn.execute_batch(
             r"
-            PRAGMA journal_mode = WAL;
-            PRAGMA busy_timeout = 5000;
-
             CREATE TABLE IF NOT EXISTS hook_events (
                 id                      INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts                      TEXT    NOT NULL,
@@ -417,8 +430,11 @@ impl HooksStore {
 
     /// Insert a hook event with `SQLITE_BUSY` retry (3 retries, 100ms backoff).
     ///
-    /// Fails on duplicate `raw_json_hash` (use [`insert_event_idempotent`]
+    /// Fails on duplicate `raw_json_hash` (use [`Self::insert_event_idempotent`]
     /// for silent dedup).
+    #[deprecated(
+        note = "prefer telemetry::TelemetryStore::insert_log; legacy path now routes through the hook_events VIEW shim (migration 002)"
+    )]
     pub fn insert_event(&self, event: &HookEvent) -> Result<()> {
         let mut last_err = None;
         for attempt in 0..=BUSY_RETRIES {
@@ -482,6 +498,9 @@ impl HooksStore {
     }
 
     /// Insert or silently ignore if `raw_json_hash` already exists.
+    #[deprecated(
+        note = "prefer telemetry::TelemetryStore::insert_log; legacy path now routes through the hook_events VIEW shim (migration 002)"
+    )]
     pub fn insert_event_idempotent(&self, event: &HookEvent) -> Result<()> {
         self.conn
             .execute(
@@ -862,7 +881,7 @@ impl HooksStore {
         Ok(report)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, deprecated)]
     fn do_import_lines(
         &self,
         reader: BufReader<File>,
@@ -1008,6 +1027,7 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<HookEvent> {
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

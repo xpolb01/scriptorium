@@ -311,6 +311,94 @@
         }
         .tab-error.visible { display: block; }
 
+        
+        /* Chips */
+        .source-chips {
+            display: flex;
+            gap: 0.5rem;
+        }
+        .chip {
+            background-color: var(--bg-color);
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            padding: 0.25rem 0.75rem;
+            border-radius: 16px;
+            cursor: pointer;
+            font-size: 0.875rem;
+            transition: all 0.2s;
+        }
+        .chip:hover {
+            border-color: var(--text-muted);
+            color: var(--text-main);
+        }
+        .chip.active {
+            border-color: var(--accent);
+            color: var(--text-main);
+        }
+        .chip.active[data-source="hook"] { background-color: rgba(245, 158, 11, 0.1); border-color: #f59e0b; color: #f59e0b; }
+        .chip.active[data-source="cli"] { background-color: rgba(6, 182, 212, 0.1); border-color: #06b6d4; color: #06b6d4; }
+        .chip.active[data-source="mcp"] { background-color: rgba(236, 72, 153, 0.1); border-color: #ec4899; color: #ec4899; }
+        .chip.active[data-source="all"] { background-color: rgba(107, 114, 128, 0.1); border-color: #6b7280; color: #c9d1d9; }
+
+        /* Timeline row colors */
+        tr.timeline-hook { border-left: 3px solid #f59e0b; }
+        tr.timeline-cli { border-left: 3px solid #06b6d4; }
+        tr.timeline-mcp { border-left: 3px solid #ec4899; }
+        tr.timeline-core { border-left: 3px solid #6b7280; }
+
+        .clickable-trace {
+            color: var(--accent);
+            cursor: pointer;
+            text-decoration: underline;
+        }
+
+        .failure-high {
+            color: var(--red);
+            background-color: rgba(218, 54, 51, 0.1);
+        }
+
+        /* Modal */
+        .modal-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.6);
+            display: none; justify-content: center; align-items: center;
+            z-index: 1000;
+        }
+        .modal-overlay.active { display: flex; }
+        .modal-content {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            width: 80%; max-width: 900px; max-height: 85vh;
+            display: flex; flex-direction: column;
+        }
+        .modal-header {
+            padding: 1rem; border-bottom: 1px solid var(--border);
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .modal-header h3 { margin: 0; display: flex; align-items: center; gap: 0.5rem; }
+        #traceModalBody { padding: 1rem; overflow-y: auto; flex: 1; }
+        
+        .span-row {
+            display: flex; gap: 0.5rem; align-items: center;
+            padding: 0.25rem 0; font-family: var(--font-mono); font-size: 0.875rem;
+        }
+        .span-status-ok { color: var(--green); }
+        .span-status-err { color: var(--red); }
+        .span-duration { color: var(--text-muted); }
+        
+        .log-item {
+            font-family: var(--font-mono); font-size: 0.8rem;
+            padding: 0.25rem 0; border-bottom: 1px dashed var(--border);
+        }
+
+        /* Sorting arrows */
+        th[data-sort] { cursor: pointer; user-select: none; }
+        th[data-sort]:hover { color: var(--text-main); }
+        th[data-sort]::after { content: ' 95'; opacity: 0.3; }
+        th[data-sort].sort-asc::after { content: ' 91'; opacity: 1; }
+        th[data-sort].sort-desc::after { content: ' 93'; opacity: 1; }
+
         /* Utilities */
         .lag-indicator {
             display: inline-flex;
@@ -381,7 +469,7 @@
                 <option value="604800000">Last 7 Days</option>
             </select>
             
-            <button id="refreshBtn">Refresh Now</button>
+            <button type="button" id="refreshBtn">Refresh Now</button>
         </div>
     </header>
 
@@ -389,6 +477,10 @@
         <div class="tab active" data-target="overview">Overview</div>
         <div class="tab" data-target="events">Events</div>
         <div class="tab" data-target="health">Health</div>
+        <div class="tab" data-target="timeline">Timeline</div>
+        <div class="tab" data-target="cli-cmds">CLI Commands</div>
+        <div class="tab" data-target="mcp-calls">MCP Calls</div>
+        <div class="tab" data-target="hook-activity">Hook Activity</div>
     </div>
 
     <!-- Overview Tab -->
@@ -493,6 +585,113 @@
         </div>
     </main>
 
+    <!-- Timeline Tab -->
+    <main id="timeline" class="content">
+        <div class="tab-error" id="error-timeline"></div>
+        <div style="margin-bottom: 1rem; display: flex; justify-content: space-between; align-items: center;">
+            <div class="source-chips" id="sourceChips">
+                <button type="button" class="chip active" data-source="all">All</button>
+                <button type="button" class="chip" data-source="hook">Hook</button>
+                <button type="button" class="chip" data-source="cli">CLI</button>
+                <button type="button" class="chip" data-source="mcp">MCP</button>
+            </div>
+            <div class="lag-indicator">
+                <div class="dot" id="timelineLiveDot"></div>
+                <span id="timelineLiveText">Live (Updated: -)</span>
+            </div>
+        </div>
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Source</th>
+                        <th>Kind</th>
+                        <th>Name / Message</th>
+                        <th>Trace ID</th>
+                    </tr>
+                </thead>
+                <tbody id="timelineTableBody"></tbody>
+            </table>
+        </div>
+    </main>
+
+    <!-- CLI Commands Tab -->
+    <main id="cli-cmds" class="content">
+        <div class="tab-error" id="error-cli-cmds"></div>
+        <div class="table-container">
+            <table class="sortable">
+                <thead>
+                    <tr>
+                        <th data-sort="name">Command</th>
+                        <th data-sort="count">Count</th>
+                        <th data-sort="avg">Avg (ms)</th>
+                        <th data-sort="p50">p50 (ms)</th>
+                        <th data-sort="p95">p95 (ms)</th>
+                        <th data-sort="fail">Failure Rate</th>
+                    </tr>
+                </thead>
+                <tbody id="cliTableBody"></tbody>
+            </table>
+        </div>
+    </main>
+
+    <!-- MCP Calls Tab -->
+    <main id="mcp-calls" class="content">
+        <div class="tab-error" id="error-mcp-calls"></div>
+        <div class="table-container">
+            <table class="sortable">
+                <thead>
+                    <tr>
+                        <th data-sort="name">Tool Name</th>
+                        <th data-sort="count">Count</th>
+                        <th data-sort="avg">Avg (ms)</th>
+                        <th data-sort="p50">p50 (ms)</th>
+                        <th data-sort="p95">p95 (ms)</th>
+                        <th data-sort="fail">Failure Rate</th>
+                    </tr>
+                </thead>
+                <tbody id="mcpTableBody"></tbody>
+            </table>
+        </div>
+    </main>
+
+    <!-- Hook Activity Tab -->
+    <main id="hook-activity" class="content">
+        <div class="tab-error" id="error-hook-activity"></div>
+        <div class="table-container">
+            <table class="sortable">
+                <thead>
+                    <tr>
+                        <th data-sort="name">Hook / Body Prefix</th>
+                        <th data-sort="count">Count</th>
+                        <th data-sort="avg">Avg (ms)</th>
+                        <th data-sort="p50">p50 (ms)</th>
+                        <th data-sort="p95">p95 (ms)</th>
+                        <th data-sort="fail">Failure Rate</th>
+                    </tr>
+                </thead>
+                <tbody id="hookTableBody"></tbody>
+            </table>
+        </div>
+    </main>
+
+    <!-- Trace Modal -->
+    <div id="traceModal" class="modal-overlay">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Trace: <span id="traceModalId" class="mono"></span> <button type="button" id="traceCopyBtn" class="chip">Copy</button></h3>
+                <button type="button" id="traceCloseBtn" class="chip">&times; Close</button>
+            </div>
+            <div id="traceModalBody">
+                <div id="traceSpanTree"></div>
+                <hr style="border-color: var(--border); margin: 1rem 0;">
+                <h4>Logs</h4>
+                <div id="traceLogsList"></div>
+            </div>
+        </div>
+    </div>
+
     <script>
         // State
         let currentTab = 'overview';
@@ -506,13 +705,307 @@
         const eventsLimitSelect = document.getElementById('eventsLimit');
         const lastUpdatedSpan = document.getElementById('lastUpdated');
 
+        
+        // T21: Source Filter Chips
+        let currentSources = [];
+        try {
+            const saved = localStorage.getItem('scriptorium_sources');
+            if (saved) currentSources = JSON.parse(saved);
+            else currentSources = ['all'];
+        } catch(e) { currentSources = ['all']; }
+
+        function initChips() {
+            const chips = document.querySelectorAll('.source-chips .chip');
+            chips.forEach(chip => {
+                chip.addEventListener('click', () => {
+                    const src = chip.dataset.source;
+                    if (src === 'all') {
+                        currentSources = ['all'];
+                    } else {
+                        currentSources = currentSources.filter(s => s !== 'all');
+                        if (currentSources.includes(src)) {
+                            currentSources = currentSources.filter(s => s !== src);
+                        } else {
+                            currentSources.push(src);
+                        }
+                        if (currentSources.length === 0) currentSources = ['all'];
+                    }
+                    localStorage.setItem('scriptorium_sources', JSON.stringify(currentSources));
+                    updateChipsUI();
+                    fetchTimeline();
+                });
+            });
+            updateChipsUI();
+        }
+
+        function updateChipsUI() {
+            const chips = document.querySelectorAll('.source-chips .chip');
+            chips.forEach(chip => {
+                if (currentSources.includes('all') && chip.dataset.source === 'all') {
+                    chip.classList.add('active');
+                } else if (!currentSources.includes('all') && currentSources.includes(chip.dataset.source)) {
+                    chip.classList.add('active');
+                } else {
+                    chip.classList.remove('active');
+                }
+            });
+        }
+
+        async function fetchTimeline() {
+            const sources = currentSources.includes('all') ? '' : currentSources.join(',');
+            try {
+                const data = await fetchAPI(`/api/timeline?sources=${sources}&limit=100`);
+                renderTimeline(data);
+                clearTabError('timeline');
+                document.getElementById('timelineLiveText').textContent = `Live (Updated: ${new Date().toLocaleTimeString()})`;
+            } catch (e) {
+                showTabError('timeline', 'Failed to load: ' + e.message);
+            }
+        }
+
+        function renderTimeline(data) {
+            const tbody = document.getElementById('timelineTableBody');
+            tbody.replaceChildren();
+            if (!data.items || !data.items.length) {
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">No items found</td></tr>';
+                return;
+            }
+            data.items.forEach(item => {
+                const d = new Date(item.time_unix_nano / 1000000);
+                const tr = document.createElement('tr');
+                tr.className = 'timeline-' + (item.source || 'core');
+                
+                let name = '';
+                let traceId = '';
+                if (item.kind === 'log' && item.log) {
+                    name = item.log.body || '';
+                    traceId = item.log.trace_id || '';
+                } else if (item.kind === 'span_start' && item.span) {
+                    name = `[SPAN] ${item.span.name}`;
+                    traceId = item.span.trace_id || '';
+                }
+
+                tr.innerHTML = `
+                    <td class="mono">${d.toLocaleString()}</td>
+                    <td>${item.source || '-'}</td>
+                    <td>${item.kind}</td>
+                    <td>${name.substring(0, 100)}</td>
+                    <td class="mono clickable-trace" data-trace-id="${traceId}">${traceId || '-'}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            tbody.querySelectorAll('.clickable-trace').forEach(el => {
+                el.addEventListener('click', () => {
+                    const tid = el.dataset.traceId;
+                    if (tid && tid !== '-') openTraceModal(tid);
+                });
+            });
+        }
+
+        // T22: Summary Sections
+        const summarySortStates = {
+            'cli-cmds': { col: 'count', dir: -1 },
+            'mcp-calls': { col: 'count', dir: -1 },
+            'hook-activity': { col: 'count', dir: -1 }
+        };
+
+        function setupSorting(tabId, fetchFn) {
+            document.querySelectorAll(`#${tabId} th[data-sort]`).forEach(th => {
+                th.addEventListener('click', () => {
+                    const col = th.dataset.sort;
+                    const state = summarySortStates[tabId];
+                    if (state.col === col) {
+                        state.dir *= -1;
+                    } else {
+                        state.col = col;
+                        state.dir = -1; // Default desc
+                    }
+                    
+                    document.querySelectorAll(`#${tabId} th`).forEach(h => {
+                        h.classList.remove('sort-asc', 'sort-desc');
+                    });
+                    th.classList.add(state.dir === 1 ? 'sort-asc' : 'sort-desc');
+                    
+                    fetchFn();
+                });
+            });
+        }
+
+        async function fetchSummaryTab(endpoint, tabId, tbodyId) {
+            const windowMs = timeWindowSelect.value;
+            try {
+                const data = await fetchAPI(`${endpoint}?window=${windowMs}`);
+                const items = data.items || data || []; // Handle array or {items:[]}
+                
+                const sortState = summarySortStates[tabId];
+                items.sort((a, b) => {
+                    let va = a[sortState.col] || 0;
+                    let vb = b[sortState.col] || 0;
+                    if (sortState.col === 'name') {
+                        va = a.name || a.tool_name || a.hook_prefix || '';
+                        vb = b.name || b.tool_name || b.hook_prefix || '';
+                        return va.localeCompare(vb) * sortState.dir;
+                    }
+                    if (sortState.col === 'fail') {
+                        va = (a.error_count || 0) / (a.count || 1);
+                        vb = (b.error_count || 0) / (b.count || 1);
+                    }
+                    return (va > vb ? 1 : va < vb ? -1 : 0) * sortState.dir;
+                });
+
+                renderSummaryTable(items, tbodyId);
+                clearTabError(tabId);
+            } catch(e) {
+                showTabError(tabId, 'Failed to load: ' + e.message);
+            }
+        }
+
+        function renderSummaryTable(items, tbodyId) {
+            const tbody = document.getElementById(tbodyId);
+            tbody.replaceChildren();
+            if (!items.length) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-muted)">No data in selected window</td></tr>';
+                return;
+            }
+            
+            items.forEach(item => {
+                const tr = document.createElement('tr');
+                const name = item.name || item.tool_name || item.hook_prefix || '-';
+                const count = item.count || 0;
+                const errCount = item.error_count || 0;
+                const failRate = count > 0 ? (errCount / count) : 0;
+                const failClass = failRate > 0.1 ? 'failure-high' : '';
+                
+                tr.innerHTML = `
+                    <td class="mono">${name}</td>
+                    <td class="mono">${count}</td>
+                    <td class="mono">${Math.round(item.avg_duration_ms || 0)}</td>
+                    <td class="mono">${Math.round(item.p50_duration_ms || 0)}</td>
+                    <td class="mono">${Math.round(item.p95_duration_ms || 0)}</td>
+                    <td class="mono ${failClass}">${(failRate * 100).toFixed(1)}%</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        // T23: Trace Modal
+        const traceModal = document.getElementById('traceModal');
+        const traceCloseBtn = document.getElementById('traceCloseBtn');
+        const traceCopyBtn = document.getElementById('traceCopyBtn');
+        const traceModalId = document.getElementById('traceModalId');
+
+        traceCloseBtn.addEventListener('click', () => traceModal.classList.remove('active'));
+        window.addEventListener('keydown', (e) => { if (e.key === 'Escape') traceModal.classList.remove('active'); });
+        traceCopyBtn.addEventListener('click', () => {
+            navigator.clipboard.writeText(traceModalId.textContent);
+            traceCopyBtn.textContent = 'Copied!';
+            setTimeout(() => traceCopyBtn.textContent = 'Copy', 2000);
+        });
+
+        async function openTraceModal(traceId) {
+            traceModalId.textContent = traceId;
+            traceModal.classList.add('active');
+            const treeEl = document.getElementById('traceSpanTree');
+            const logsEl = document.getElementById('traceLogsList');
+            treeEl.innerHTML = '<div class="spinner"></div>';
+            logsEl.innerHTML = '';
+
+            try {
+                const data = await fetchAPI(`/api/traces/${traceId}`);
+                renderTraceModal(data);
+            } catch(e) {
+                treeEl.innerHTML = `<div style="color:var(--red)">Error: ${e.message}</div>`;
+            }
+        }
+
+        function renderTraceModal(data) {
+            const treeEl = document.getElementById('traceSpanTree');
+            const logsEl = document.getElementById('traceLogsList');
+            treeEl.innerHTML = '';
+            logsEl.innerHTML = '';
+
+            const spans = data.spans || [];
+            if (!spans.length) {
+                treeEl.innerHTML = '<div style="color:var(--text-muted)">No spans found for this trace.</div>';
+            } else {
+                // Build simple tree
+                const rootSpans = spans.filter(s => !s.parent_span_id);
+                const spanMap = {};
+                spans.forEach(s => {
+                    s.children = [];
+                    spanMap[s.span_id] = s;
+                });
+                spans.forEach(s => {
+                    if (s.parent_span_id && spanMap[s.parent_span_id]) {
+                        spanMap[s.parent_span_id].children.push(s);
+                    }
+                });
+
+                const renderNode = (span, depth = 0) => {
+                    if (depth > 10) {
+                        const el = document.createElement('div');
+                        el.style.marginLeft = `${depth * 20}px`;
+                        el.textContent = '... (max depth exceeded)';
+                        treeEl.appendChild(el);
+                        return;
+                    }
+                    const row = document.createElement('div');
+                    row.className = 'span-row';
+                    row.style.marginLeft = `${depth * 20}px`;
+                    
+                    const duration = span.end_time_unix_nano 
+                        ? Math.round((span.end_time_unix_nano - span.start_time_unix_nano) / 1000000) + 'ms'
+                        : '???ms';
+                    
+                    const isError = span.status_code === 2; // Assuming 2 is Error in OTel
+                    const statusClass = isError ? 'span-status-err' : 'span-status-ok';
+                    
+                    row.innerHTML = `
+                        <span class="chip" data-source="${span.source || 'all'}" style="font-size:0.7rem;padding:0.1rem 0.4rem">${span.source || 'core'}</span>
+                        <span class="${statusClass}">●</span>
+                        <b data-span-name="true">${span.name}</b>
+                        <span class="span-duration">${duration}</span>
+                    `;
+                    treeEl.appendChild(row);
+                    span.children.forEach(c => { renderNode(c, depth + 1); });
+                }
+                
+                const rootsToRender = rootSpans.length > 0 ? rootSpans : spans; // fallback if no roots found (dangling)
+                const rendered = new Set();
+                
+                const renderNodeSafe = (span, depth) => {
+                    if (rendered.has(span.span_id)) return;
+                    rendered.add(span.span_id);
+                    renderNode(span, depth);
+                }
+                rootsToRender.forEach(r => { renderNodeSafe(r, 0); });
+            }
+
+            const logs = data.logs || [];
+            if (!logs.length) {
+                logsEl.innerHTML = '<div style="color:var(--text-muted)">No logs.</div>';
+            } else {
+                logs.forEach(l => {
+                    const row = document.createElement('div');
+                    row.className = 'log-item';
+                    row.textContent = `[${new Date(l.time_unix_nano/1000000).toISOString()}] ${l.severity_text || 'INFO'} - ${l.body}`;
+                    logsEl.appendChild(row);
+                });
+            }
+        }
+
         // Initialization
         function init() {
+                        initChips();
+            setupSorting('cli-cmds', () => fetchSummaryTab('/api/cli/summary', 'cli-cmds', 'cliTableBody'));
+            setupSorting('mcp-calls', () => fetchSummaryTab('/api/mcp/summary', 'mcp-calls', 'mcpTableBody'));
+            setupSorting('hook-activity', () => fetchSummaryTab('/api/hook/summary', 'hook-activity', 'hookTableBody'));
             // Tab switching
             document.querySelectorAll('.tab').forEach(tab => {
                 tab.addEventListener('click', () => {
-                    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                    document.querySelectorAll('.content').forEach(c => c.classList.remove('active'));
+                    document.querySelectorAll('.tab').forEach(t => { t.classList.remove('active'); });
+                    document.querySelectorAll('.content').forEach(c => { c.classList.remove('active'); });
                     
                     tab.classList.add('active');
                     currentTab = tab.dataset.target;
@@ -572,6 +1065,14 @@
                     await fetchEvents();
                 } else if (currentTab === 'health') {
                     await fetchHealth();
+                } else if (currentTab === 'timeline') {
+                    await fetchTimeline();
+                } else if (currentTab === 'cli-cmds') {
+                    await fetchSummaryTab('/api/cli/summary', 'cli-cmds', 'cliTableBody');
+                } else if (currentTab === 'mcp-calls') {
+                    await fetchSummaryTab('/api/mcp/summary', 'mcp-calls', 'mcpTableBody');
+                } else if (currentTab === 'hook-activity') {
+                    await fetchSummaryTab('/api/hook/summary', 'hook-activity', 'hookTableBody');
                 }
                 
                 const now = new Date();

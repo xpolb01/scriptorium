@@ -1,0 +1,7 @@
+{
+  "session_id": "ses_child_456",
+  "parent_session_id": "ses_parent_123",
+  "agent_type": "explore",
+  "source": "TaskTool",
+  "tool_use_id": "toolu_01abc123xyz"
+}
