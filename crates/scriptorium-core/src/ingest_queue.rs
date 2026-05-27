@@ -358,6 +358,15 @@ pub async fn drain(
                     continue;
                 }
                 let _ = fs::remove_file(&marker_path);
+                // Session source files are redundant after ingest — the
+                // interned copy in sources/articles/ is canonical in git.
+                // Canonicalize to handle symlinks (e.g. /tmp → /private/tmp).
+                let sessions_dir = vault.root().join("sources/sessions");
+                if let Ok(canonical) = sessions_dir.as_std_path().canonicalize() {
+                    if marker.source.starts_with(&canonical) {
+                        let _ = fs::remove_file(&marker.source);
+                    }
+                }
                 report.ingested += 1;
                 if ingest_report.redundant {
                     report.redundant_skips += 1;
@@ -1008,6 +1017,44 @@ mod tests {
         let repo = git2::Repository::open(dir.path()).unwrap();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert!(head.message().unwrap().contains("drain dedup test"));
+    }
+
+    #[tokio::test]
+    async fn drain_cleans_up_session_source() {
+        let (dir, vault) = make_ingest_vault();
+        let sessions_dir = dir.path().join("sources").join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let src = write_source(&sessions_dir, "2026-05-27-session-abcd1234.md", "unique body for cleanup test\n");
+
+        enqueue(&vault, &src, Some("cleanup-test")).unwrap();
+        assert!(src.exists(), "source should exist before drain");
+
+        let cfg = DrainConfig {
+            debounce: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let report = drain(&vault, &ingest_plan_mock(), cfg).await.unwrap();
+        assert_eq!(report.ingested, 1);
+        assert!(!src.exists(), "session source should be deleted after drain ingest");
+    }
+
+    #[tokio::test]
+    async fn drain_preserves_non_session_source() {
+        let (dir, vault) = make_ingest_vault();
+        let src = write_source(
+            dir.path().join("sources/articles").as_path(),
+            "manual-source.md",
+            "manual body\n",
+        );
+
+        enqueue(&vault, &src, None).unwrap();
+        let cfg = DrainConfig {
+            debounce: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let report = drain(&vault, &ingest_plan_mock(), cfg).await.unwrap();
+        assert_eq!(report.ingested, 1);
+        assert!(src.exists(), "non-session source should NOT be deleted");
     }
 
     #[tokio::test]
