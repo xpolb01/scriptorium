@@ -2332,6 +2332,23 @@ fn build_chat_provider(kind: ProviderKind, cfg: &Config) -> Result<Arc<dyn LlmPr
             OpenAiProvider::new(openai_cfg).map_err(|e| miette!("meridian init: {e}"))?,
         ));
     }
+    // When routing Claude directly (no meridian proxy), honour the vault's
+    // configured timeout instead of ClaudeConfig::from_env()'s hardcoded 120s.
+    // Large update-existing-page synthesis over Anthropic's API can exceed two
+    // minutes; the hardcoded ceiling caused the request to be cut off mid-call,
+    // leaving the MCP transport blocked until the reqwest client aborted.
+    if matches!(kind, ProviderKind::Claude) {
+        let mut claude_cfg =
+            ClaudeConfig::from_env().map_err(|e| miette!("claude config: {e}"))?;
+        claude_cfg.timeout = std::time::Duration::from_secs(cfg.llm.timeout_secs);
+        tracing::debug!(
+            timeout_secs = cfg.llm.timeout_secs,
+            "direct claude: using vault timeout_secs"
+        );
+        return Ok(Arc::new(
+            ClaudeProvider::new(claude_cfg).map_err(|e| miette!("claude init: {e}"))?,
+        ));
+    }
     build_provider(kind)
 }
 
