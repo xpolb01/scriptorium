@@ -551,13 +551,20 @@ pub fn queue_health_check(vault: &Vault, stuck_threshold: Duration) -> DoctorChe
     }
 
     let meta = vault.meta_dir().into_std_path_buf();
-    let lock_held = meta.join(DRAIN_LOCK_FILE).exists();
+    // Probe the fd_lock: try to acquire a write lock non-blocking. If we can
+    // acquire it, the drain is idle (no other process holds the lock). If the
+    // acquire fails, a drain is actively running. The lock FILE itself is a
+    // permanent sentinel that persists across drain runs — checking existence
+    // is not a reliable indicator of whether a drain is in progress.
+    let lock_active = probe_drain_lock_active(&meta);
     let pid = read_drain_pidfile(&meta).ok().flatten();
-    if lock_held {
+    if lock_active {
         match pid {
             Some(p) if !pid_alive(p) => {
+                // fd_lock says held but pid is dead — shouldn't happen on POSIX
+                // (OS releases locks on exit), but report it.
                 status = CheckStatus::Fail;
-                messages.push(format!("drain.lock present but pid {p} is not alive"));
+                messages.push(format!("drain.lock held but pid {p} is not alive"));
             }
             Some(p) => {
                 if let Some(last_run) = last_drain_stats_ts(vault) {
@@ -579,7 +586,7 @@ pub fn queue_health_check(vault: &Vault, stuck_threshold: Duration) -> DoctorChe
             None => {
                 if status == CheckStatus::Ok {
                     status = CheckStatus::Warn;
-                    messages.push("drain.lock present without drain.pid".into());
+                    messages.push("drain.lock held but drain.pid missing".into());
                 }
             }
         }
@@ -689,6 +696,44 @@ fn try_drain_lock<T, F: FnOnce() -> Result<T>>(meta: &Path, f: F) -> Result<Opti
         Err(_) => Ok(None),
     };
     outcome
+}
+
+/// Returns `true` if the drain fd_lock is actively held by another process.
+///
+/// Attempts a non-blocking `try_write()` on the lock file. On success we
+/// immediately release the lock (the guard drops at end of scope) and return
+/// `false` — no active drain. On failure someone else holds the lock and we
+/// return `true`.
+///
+/// This is more reliable than checking whether the lock FILE exists: the
+/// sentinel file is created once and never removed, so `path.exists()` is
+/// always `true` and cannot distinguish "drain in progress" from "drain has
+/// run at least once".
+fn probe_drain_lock_active(meta: &Path) -> bool {
+    let lock_path = meta.join(DRAIN_LOCK_FILE);
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        // Can't open the file — assume not locked; caller will surface IO issues separately.
+        Err(_) => return false,
+    };
+    // Use a local block so the guard (which borrows rwlock) drops before rwlock
+    // does, satisfying the borrow checker.
+    let mut rwlock = FdRwLock::new(file);
+    let held_by_other = {
+        // try_write: Ok  → we got the lock → drain is idle
+        //            Err → someone else holds it → drain is active
+        match rwlock.try_write() {
+            Ok(_guard) => false, // guard drops at end of this block
+            Err(_) => true,
+        }
+    };
+    held_by_other
 }
 
 fn write_drain_pidfile(meta: &Path) -> Result<()> {
@@ -1209,14 +1254,19 @@ mod tests {
     }
 
     #[test]
-    fn queue_health_fail_on_dead_pidfile() {
+    fn queue_health_ok_on_dead_pidfile() {
+        // A drain.lock file with a dead pid is the NORMAL post-drain state:
+        // the sentinel file persists but the OS released the fd_lock when the
+        // drain process exited. The probe acquires the lock successfully →
+        // lock_active = false → no FAIL. Reporting a FAIL here caused false
+        // positives in the live vault whenever the launchd drain completed.
         let (_dir, vault) = make_test_vault();
         let meta = vault.meta_dir().into_std_path_buf();
         fs::create_dir_all(&meta).unwrap();
         fs::write(meta.join(DRAIN_LOCK_FILE), b"").unwrap();
         fs::write(meta.join(DRAIN_PID_FILE), format!("{}\n", u32::MAX)).unwrap();
         let check = queue_health_check(&vault, Duration::from_secs(3600));
-        assert_eq!(check.status, crate::doctor::CheckStatus::Fail);
-        assert!(check.message.contains("not alive"));
+        // Lock file exists but is not actually held — idle is the correct status.
+        assert_eq!(check.status, crate::doctor::CheckStatus::Ok);
     }
 }

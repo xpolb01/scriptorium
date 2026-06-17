@@ -58,7 +58,7 @@ impl Provider {
 
     fn default_model(self) -> &'static str {
         match self {
-            Self::Claude => "claude-opus-4-6",
+            Self::Claude => "claude-opus-4-8",
             Self::OpenAi => "gpt-4o-mini",
             Self::Gemini => "gemini-2.5-pro",
             Self::Ollama => "llama3.1",

@@ -23,7 +23,7 @@ use serde_json::json;
 use super::retry::{with_retry, Retry};
 use super::{CompletionRequest, CompletionResponse, LlmError, LlmProvider, Role, Usage};
 
-const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_MODEL: &str = "claude-opus-4-8";
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
 const CONTEXT_WINDOW: usize = 200_000;
@@ -126,8 +126,17 @@ impl LlmProvider for ClaudeProvider {
             }],
             "messages": messages,
         });
+        // Anthropic removed the sampling parameters (`temperature`, `top_p`,
+        // `top_k`) starting with Opus 4.7: sending any of them to Opus 4.7,
+        // 4.8, Fable 5, or Mythos 5 returns HTTP 400. Only attach `temperature`
+        // for models that still accept it (Opus 4.6 and earlier, all Sonnet,
+        // all Haiku). On the newer models, prompting + strict tool-use already
+        // pin the structured output, so dropping the low temperatures the
+        // ingest/query paths request is behavior-preserving in practice.
         if let Some(temp) = req.temperature {
-            body["temperature"] = json!(temp);
+            if model_accepts_sampling_params(&self.config.model) {
+                body["temperature"] = json!(temp);
+            }
         }
 
         // Structured output: wrap the requested schema in a single "tool" and
@@ -236,6 +245,20 @@ fn classify(status: StatusCode, err: LlmError) -> Retry {
     } else {
         Retry::Permanent(err)
     }
+}
+
+/// Whether `model` accepts the `temperature` / `top_p` / `top_k` sampling
+/// parameters. Anthropic removed them starting with Opus 4.7 — sending any to
+/// Opus 4.7, Opus 4.8, Fable 5, or Mythos 5 returns HTTP 400. Older models
+/// (Opus 4.6 and earlier, all Sonnet, all Haiku) still accept them. The
+/// default model is `claude-opus-4-8`, so by default sampling params are
+/// omitted; the predicate keeps them working for anyone who pins an older
+/// model via config or `ANTHROPIC_MODEL`.
+fn model_accepts_sampling_params(model: &str) -> bool {
+    !(model.starts_with("claude-opus-4-7")
+        || model.starts_with("claude-opus-4-8")
+        || model.starts_with("claude-fable")
+        || model.starts_with("claude-mythos"))
 }
 
 fn extract_text(resp: &MessagesResponse) -> Result<String, LlmError> {
@@ -623,7 +646,7 @@ mod tests {
 
     /// Rebuild the request body the same way `complete()` does, so we can
     /// assert what actually goes on the wire without needing an HTTP mock.
-    fn build_request_body_for_test(req: &CompletionRequest) -> serde_json::Value {
+    fn build_request_body_for_test(model: &str, req: &CompletionRequest) -> serde_json::Value {
         let messages = req
             .messages
             .iter()
@@ -638,13 +661,15 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut body = json!({
-            "model": "claude-opus-4-6",
+            "model": model,
             "max_tokens": req.max_tokens,
             "system": req.system,
             "messages": messages,
         });
         if let Some(temp) = req.temperature {
-            body["temperature"] = json!(temp);
+            if model_accepts_sampling_params(model) {
+                body["temperature"] = json!(temp);
+            }
         }
         if let Some(schema) = req.response_schema.as_ref() {
             let tool_name = "emit_structured_response";
@@ -676,7 +701,7 @@ mod tests {
             temperature: Some(0.2),
             response_schema: Some(IngestPlan::schema()),
         };
-        let body = build_request_body_for_test(&req);
+        let body = build_request_body_for_test("claude-opus-4-6", &req);
         assert_eq!(body["tools"][0]["strict"], true);
         assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(
@@ -706,8 +731,48 @@ mod tests {
             temperature: None,
             response_schema: None,
         };
-        let body = build_request_body_for_test(&req);
+        let body = build_request_body_for_test("claude-opus-4-8", &req);
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn sampling_params_gated_by_model() {
+        // Sampling params were removed starting Opus 4.7.
+        assert!(!model_accepts_sampling_params("claude-opus-4-8"));
+        assert!(!model_accepts_sampling_params("claude-opus-4-7"));
+        assert!(!model_accepts_sampling_params("claude-fable-5"));
+        assert!(!model_accepts_sampling_params("claude-mythos-5"));
+        // Older Claude models still accept them.
+        assert!(model_accepts_sampling_params("claude-opus-4-6"));
+        assert!(model_accepts_sampling_params("claude-sonnet-4-6"));
+        assert!(model_accepts_sampling_params("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn temperature_omitted_for_opus_4_8_but_sent_for_older() {
+        use crate::llm::{CompletionRequest, Message, Role};
+        let req = CompletionRequest {
+            system: "system".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: "user".into(),
+            }],
+            max_tokens: 256,
+            temperature: Some(0.2),
+            response_schema: None,
+        };
+        // Opus 4.8 rejects `temperature` with HTTP 400 — it must not be sent.
+        let body_48 = build_request_body_for_test("claude-opus-4-8", &req);
+        assert!(
+            body_48.get("temperature").is_none(),
+            "temperature must be omitted for Opus 4.8"
+        );
+        // Opus 4.6 still accepts it — the field is preserved.
+        let body_46 = build_request_body_for_test("claude-opus-4-6", &req);
+        let temp = body_46["temperature"]
+            .as_f64()
+            .expect("temperature must be present for Opus 4.6");
+        assert!((temp - 0.2).abs() < 1e-6, "expected ~0.2, got {temp}");
     }
 }

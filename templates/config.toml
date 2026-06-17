@@ -4,7 +4,7 @@
 [llm]
 # One of: "claude", "openai", "gemini", "ollama", "mock"
 provider    = "claude"
-model       = "claude-opus-4-6"
+model       = "claude-opus-4-8"
 timeout_secs = 120
 
 [embeddings]
