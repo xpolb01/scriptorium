@@ -26,7 +26,6 @@ use super::{CompletionRequest, CompletionResponse, LlmError, LlmProvider, Role, 
 const DEFAULT_MODEL: &str = "claude-opus-4-8";
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
-const CONTEXT_WINDOW: usize = 200_000;
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 
 /// Config for constructing a [`ClaudeProvider`]. All fields are optional and
@@ -231,7 +230,7 @@ impl LlmProvider for ClaudeProvider {
     }
 
     fn context_window(&self) -> usize {
-        CONTEXT_WINDOW
+        context_window_for(&self.config.model)
     }
 
     fn embedding_dim(&self) -> usize {
@@ -259,6 +258,27 @@ fn model_accepts_sampling_params(model: &str) -> bool {
         || model.starts_with("claude-opus-4-8")
         || model.starts_with("claude-fable")
         || model.starts_with("claude-mythos"))
+}
+
+/// Input-token context window for `model`. Opus 4.6+, Sonnet 4.6, and
+/// Fable/Mythos ship a 1M window; Haiku 4.5 and older models are 200K. The
+/// budget callers derive from this is `context_window / 4`, so fall back to
+/// the smaller, safe value for anything unrecognized rather than risk
+/// over-packing a model's window.
+fn context_window_for(model: &str) -> usize {
+    const LARGE: usize = 1_000_000;
+    const SMALL: usize = 200_000;
+    if model.starts_with("claude-opus-4-6")
+        || model.starts_with("claude-opus-4-7")
+        || model.starts_with("claude-opus-4-8")
+        || model.starts_with("claude-sonnet-4-6")
+        || model.starts_with("claude-fable")
+        || model.starts_with("claude-mythos")
+    {
+        LARGE
+    } else {
+        SMALL
+    }
 }
 
 fn extract_text(resp: &MessagesResponse) -> Result<String, LlmError> {
@@ -747,6 +767,18 @@ mod tests {
         assert!(model_accepts_sampling_params("claude-opus-4-6"));
         assert!(model_accepts_sampling_params("claude-sonnet-4-6"));
         assert!(model_accepts_sampling_params("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn context_window_is_model_aware() {
+        // 1M-context models.
+        assert_eq!(context_window_for("claude-opus-4-8"), 1_000_000);
+        assert_eq!(context_window_for("claude-opus-4-6"), 1_000_000);
+        assert_eq!(context_window_for("claude-sonnet-4-6"), 1_000_000);
+        assert_eq!(context_window_for("claude-fable-5"), 1_000_000);
+        // 200K window — and the conservative fallback for anything older.
+        assert_eq!(context_window_for("claude-haiku-4-5"), 200_000);
+        assert_eq!(context_window_for("claude-opus-4-1"), 200_000);
     }
 
     #[test]

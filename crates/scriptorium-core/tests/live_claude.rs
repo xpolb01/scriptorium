@@ -120,6 +120,8 @@ fn metadata_is_sane() {
     };
 
     assert_eq!(provider.name(), "claude");
-    assert_eq!(provider.context_window(), 200_000);
+    // Default model is claude-opus-4-8 (1M context). A pinned 200K model
+    // (e.g. Haiku 4.5) would report 200_000 here instead.
+    assert_eq!(provider.context_window(), 1_000_000);
     assert_eq!(provider.embedding_dim(), 0);
 }
