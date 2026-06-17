@@ -100,7 +100,12 @@ pub fn record_usage(
 pub fn estimate_cost(provider: &str, model: &str, input: u64, output: u64) -> (f64, bool) {
     let (in_rate, out_rate) = match (provider, model) {
         // Anthropic Claude — https://www.anthropic.com/pricing
-        ("claude", m) if m.starts_with("claude-opus-4") => (15.0, 75.0),
+        // Opus 4.5 dropped Opus pricing to $5/$25; Opus 4.0/4.1 (and Opus 3)
+        // predate that and keep the original $15/$75. Carve the two legacy
+        // versions out before the generic `claude-opus-4` arm.
+        ("claude", m) if m.starts_with("claude-opus-4-0") => (15.0, 75.0),
+        ("claude", m) if m.starts_with("claude-opus-4-1") => (15.0, 75.0),
+        ("claude", m) if m.starts_with("claude-opus-4") => (5.0, 25.0),
         ("claude", m) if m.starts_with("claude-sonnet-4") => (3.0, 15.0),
         ("claude", m) if m.starts_with("claude-haiku-4") => (0.80, 4.0),
         ("claude", m) if m.starts_with("claude-opus-3") => (15.0, 75.0),
@@ -138,9 +143,18 @@ mod tests {
 
     #[test]
     fn estimate_cost_known_model() {
-        let (cost, known) = estimate_cost("claude", "claude-opus-4-6", 2_000_000, 500_000);
+        let (cost, known) = estimate_cost("claude", "claude-opus-4-8", 2_000_000, 500_000);
         assert!(known);
-        // 2M in @ $15/M + 0.5M out @ $75/M = 30 + 37.5 = 67.5
+        // Opus 4.5+ is $5/$25 per MTok: 2M in @ $5 + 0.5M out @ $25 = 10 + 12.5 = 22.5
+        assert!((cost - 22.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn estimate_cost_legacy_opus_keeps_old_pricing() {
+        // Opus 4.0/4.1 predate the price drop and stay at $15/$75 per MTok:
+        // 2M in @ $15 + 0.5M out @ $75 = 30 + 37.5 = 67.5
+        let (cost, known) = estimate_cost("claude", "claude-opus-4-1", 2_000_000, 500_000);
+        assert!(known);
         assert!((cost - 67.5).abs() < 0.01);
     }
 
