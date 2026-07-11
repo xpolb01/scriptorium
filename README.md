@@ -209,22 +209,63 @@ operations; post-hooks are fire-and-forget. Configured in
 |---------|-------------|
 | `init [PATH]` | Scaffold a fresh vault with templates + `git init` |
 | `setup` | Interactive wizard: providers, API keys (macOS Keychain), config |
-| `ingest <SOURCE>` | Ingest a local file or `--url` into the vault |
+| `ingest <SOURCE>` | Ingest a local file or `--url` into the vault (`--force` skips the near-duplicate gate) |
 | `bulk-ingest <DIR>` | Batch ingest a directory with checkpoint resume |
 | `query <QUESTION>` | Ask a question with hybrid retrieval and citations |
-| `reindex` | Rebuild the embeddings store (idempotent, hash-cached) |
+| `reindex [--rebuild]` | Rebuild the embeddings store (idempotent; `--rebuild` drops cached rows first) |
 | `lint [--fix]` | Run mechanical integrity checks, optionally auto-fix |
 | `doctor [--json]` | 8-point health check (no LLM required) |
 | `maintain [--fix]` | Full maintenance cycle: lint + stale + embeddings |
-| `bench [--init]` | Retrieval quality benchmarks (P@k, recall, MRR, NDCG) |
+| `bench [--init\|--judge\|--sweep]` | Retrieval benchmarks; `--judge` adds LLM-graded reference-free context precision, `--sweep` compares retrieval settings |
+| `audit [--page STEM]` | LLM fact-check of wiki pages against their own interned sources |
+| `consolidate [--apply]` | Find near-duplicate pages (embedding similarity); `--apply` merges each group |
+| `suggest-links <STEM>` | Related-page suggestions as candidate `[[wikilinks]]` |
+| `import-chat <FILE>` | Convert a Claude/ChatGPT conversations.json export into markdown sources |
 | `undo` | `git revert HEAD` — undo the last scriptorium commit |
 | `config` | Print the resolved vault configuration |
 | `serve` | Run the MCP server on stdio |
-| `watch` | Watch `sources/` and auto-ingest new files |
+| `watch` | Watch `sources/` and auto-ingest new files (md/txt/pdf/docx/html/…) |
 | `skill list\|show\|init` | Manage agent workflow skills |
 | `learn list\|search\|add\|prune` | Manage the self-learning journal |
 | `social facebook` | Import Facebook data exports |
 | `vault list\|add\|remove\|default\|show` | Multi-vault registry |
+
+## Source formats
+
+Ingest routes each source through the best available extractor: markdown
+and text natively; local HTML through the same Readability engine as URL
+ingest; **PDF via `pdftotext`** (poppler) when installed, falling back to
+the **`docling` CLI** (which also unlocks docx/pptx/xlsx/epub and OCR for
+scanned documents). External converters are feature-detected
+subprocesses — the scriptorium binary stays pure Rust. Raw bytes are
+interned unchanged under `sources/`; converted binaries additionally get
+a git-tracked `<source>.extracted.md` sibling used for audits and quote
+verification.
+
+## Retrieval quality & evaluation
+
+Beyond the hybrid baseline (vector + FTS5 + RRF + query expansion), the
+`[search]` config section adds opt-in refinements: MMR result
+diversification, recency boosting, HyDE query expansion, and a listwise
+LLM rerank of the fused candidates. `[embeddings] contextual = true`
+enables Anthropic-style contextual retrieval (situating headers prepended
+to chunks before embedding and FTS indexing).
+
+Answer quality is measurable, not just retrieval: `scriptorium audit`
+decomposes each page into atomic claims and verifies every claim against
+the page's own interned sources (curation faithfulness), and
+`bench --judge` grades retrieved chunks with reference-free context
+precision so benchmark cases no longer need hand-labeled expectations.
+
+## Provenance & lifecycle metadata
+
+Pages can carry optional, lint-verified frontmatter conventions:
+`source_quotes` (verbatim quote per source — mechanically checked to
+still appear in the source file), `supersedes` / `superseded_by`
+(lifecycle links; superseded pages are dropped from query context),
+`valid_from` / `valid_to` dates, and typed `relations`
+(`supports` / `contradicts` / `supersedes` / `part_of` / `see_also`).
+The ingest curator fills `source_quote` and `supersedes` automatically.
 
 Every command accepts `-C PATH` to target a vault other than `.`, and
 `--provider` to override the configured LLM.

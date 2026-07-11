@@ -1,4 +1,4 @@
-//! Chat-export importers: Claude and ChatGPT conversation exports →
+//! Chat-export importers: Claude and `ChatGPT` conversation exports →
 //! markdown source files.
 //!
 //! Both vendors ship a `conversations.json` in their data exports. This
@@ -8,7 +8,7 @@
 //! cited wiki pages like any other source.
 //!
 //! Format detection is per-conversation-shape, not filename: Claude
-//! exports carry `chat_messages`, ChatGPT exports carry `mapping`.
+//! exports carry `chat_messages`, `ChatGPT` exports carry `mapping`.
 
 use std::fmt::Write as _;
 
@@ -80,8 +80,7 @@ fn render_conversation(convo: &Value) -> Option<(String, String)> {
     let date = convo
         .get("created_at")
         .or_else(|| convo.get("create_time"))
-        .map(date_prefix)
-        .unwrap_or_else(|| "undated".into());
+        .map_or_else(|| "undated".into(), date_prefix);
 
     let turns = if convo.get("chat_messages").is_some() {
         claude_turns(convo)
@@ -140,7 +139,7 @@ fn claude_turns(convo: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
-/// ChatGPT export: `mapping: {id → {message: {author.role, content.parts,
+/// `ChatGPT` export: `mapping: {id → {message: {author.role, content.parts,
 /// create_time}}}`. Messages are sorted by `create_time`.
 fn chatgpt_turns(convo: &Value) -> Vec<(String, String)> {
     let Some(mapping) = convo.get("mapping").and_then(Value::as_object) else {
@@ -217,7 +216,7 @@ mod tests {
     fn chatgpt_export_sorts_by_time() {
         let convo = serde_json::json!({
             "title": "GPT Chat",
-            "create_time": 1751364000.0,
+            "create_time": 1_751_364_000.0,
             "mapping": {
                 "b": {"message": {"author": {"role": "assistant"},
                         "content": {"parts": ["answer"]}, "create_time": 2.0}},

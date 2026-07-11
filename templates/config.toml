@@ -13,6 +13,31 @@ timeout_secs = 120
 # (if you set [llm].provider = "gemini") and embeddings end-to-end.
 provider = "gemini"
 model    = "gemini-embedding-2-preview"
+# Chunking strategy: "heading", "recursive", or "semantic" (default).
+#chunk_strategy = "semantic"
+# Anthropic-style contextual retrieval: prepend an LLM-written situating
+# header to every chunk before embedding AND FTS indexing. One chat call
+# per page at (re)index time. Enabling this on an existing store needs a
+# one-time `scriptorium reindex --rebuild`.
+#contextual = false
+
+[search]
+# Query-time retrieval refinements. Everything here has a safe default.
+#
+# Maximal-Marginal-Relevance diversity for final result ordering
+# (λ·relevance − (1−λ)·redundancy). 1.0 disables the reorder.
+#mmr_lambda = 0.7
+# Boost recently-updated pages: score × (1 + weight · 0.5^(age/half_life)).
+# 0 disables (default).
+#recency_half_life_days = 0
+#recency_weight = 0.3
+# HyDE: also embed a hypothetical answer passage during query expansion.
+# Helps on well-covered topics; can mislead on out-of-vault questions.
+#hyde = false
+# Rerank the fused candidates with one listwise LLM call (the configured
+# chat provider — no extra service) before building the prompt context.
+#rerank = false
+#rerank_top_n = 12
 
 [git]
 auto_commit = true
