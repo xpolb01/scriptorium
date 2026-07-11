@@ -55,7 +55,10 @@ impl OpenAiConfig {
             model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
             embed_model: std::env::var("OPENAI_EMBED_MODEL")
                 .unwrap_or_else(|_| DEFAULT_EMBED_MODEL.to_string()),
-            embed_dim: DEFAULT_EMBED_DIM,
+            embed_dim: std::env::var("OPENAI_EMBED_DIM")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_EMBED_DIM),
             base_url: std::env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string()),
             timeout: Duration::from_secs(120),

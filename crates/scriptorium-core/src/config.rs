@@ -21,6 +21,68 @@ pub struct Config {
     pub hooks: HooksConfig,
     #[serde(default)]
     pub meridian: MeridianConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
+}
+
+/// Query-time retrieval options (`[search]` in `config.toml`). Everything
+/// here is a ranking/expansion refinement with a safe default; the base
+/// hybrid pipeline (vector + FTS5 + RRF) is not configurable away.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// Maximal-Marginal-Relevance balance for final result ordering:
+    /// `λ·relevance − (1−λ)·redundancy`. `1.0` disables the diversity
+    /// reorder entirely.
+    #[serde(default = "default_mmr_lambda")]
+    pub mmr_lambda: f32,
+    /// Half-life in days for recency boosting of retrieved pages. `0`
+    /// (default) disables the boost. Pages updated recently rank higher:
+    /// `score × (1 + recency_weight · 0.5^(age/half_life))`.
+    #[serde(default)]
+    pub recency_half_life_days: f32,
+    /// Strength of the recency boost at age zero. Ignored while
+    /// `recency_half_life_days` is 0.
+    #[serde(default = "default_recency_weight")]
+    pub recency_weight: f32,
+    /// Generate a `HyDE` (hypothetical document) variant during query
+    /// expansion: embed a short hypothetical answer alongside the query
+    /// rephrasings. Helps semantic alignment on well-covered topics; can
+    /// mislead on out-of-vault questions — hence opt-in.
+    #[serde(default)]
+    pub hyde: bool,
+    /// Rerank the fused candidates with one listwise LLM call before
+    /// building the prompt context. Uses the configured chat provider —
+    /// no extra service. Non-fatal: any failure keeps the fused order.
+    #[serde(default)]
+    pub rerank: bool,
+    /// How many top candidates are offered to the reranker.
+    #[serde(default = "default_rerank_top_n")]
+    pub rerank_top_n: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            mmr_lambda: default_mmr_lambda(),
+            recency_half_life_days: 0.0,
+            recency_weight: default_recency_weight(),
+            hyde: false,
+            rerank: false,
+            rerank_top_n: default_rerank_top_n(),
+        }
+    }
+}
+
+fn default_mmr_lambda() -> f32 {
+    0.7
+}
+
+fn default_recency_weight() -> f32 {
+    0.3
+}
+
+fn default_rerank_top_n() -> usize {
+    12
 }
 
 /// Optional local Anthropic-compatible proxy. When `enabled` and

@@ -19,6 +19,7 @@ pub mod dedup;
 pub mod expansion;
 pub mod fusion;
 pub mod ppr;
+pub mod rerank;
 
 use std::collections::HashMap;
 
@@ -37,6 +38,9 @@ pub struct HybridSearchOpts {
     pub top_k: usize,
     /// Enable multi-query expansion via LLM.
     pub expansion: bool,
+    /// Additionally embed a `HyDE` (hypothetical document) variant of the
+    /// query. Opt-in; see `SearchConfig::hyde`.
+    pub hyde: bool,
     /// Max results per query variant from vector search.
     pub vector_limit: usize,
     /// Max results from keyword search.
@@ -53,6 +57,7 @@ impl Default for HybridSearchOpts {
         Self {
             top_k: 5,
             expansion: true,
+            hyde: false,
             vector_limit: 20,
             keyword_limit: 20,
             graph_limit: 20,
@@ -91,11 +96,18 @@ pub async fn hybrid_search(
     opts: &HybridSearchOpts,
 ) -> Result<Vec<SearchHit>> {
     // 1. Expand the query (non-fatal — falls back to original).
-    let variants = if opts.expansion {
+    let mut variants = if opts.expansion {
         expansion::expand_query(expansion_provider, question, 2).await
     } else {
         vec![question.to_string()]
     };
+    // 1b. Optional HyDE variant: embed a hypothetical answer passage
+    // alongside the query phrasings (non-fatal).
+    if opts.hyde {
+        if let Some(hypothetical) = expansion::hyde_variant(expansion_provider, question).await {
+            variants.push(hypothetical);
+        }
+    }
 
     // 2. Embed all query variants.
     let embeddings = embed_provider
@@ -217,6 +229,7 @@ mod tests {
         let opts = HybridSearchOpts {
             top_k: 10,
             expansion: false, // disable expansion for determinism
+            hyde: false,
             vector_limit: 10,
             keyword_limit: 10,
             graph_limit: 10,
@@ -247,6 +260,7 @@ mod tests {
         let opts = HybridSearchOpts {
             top_k: 5,
             expansion: false,
+            hyde: false,
             vector_limit: 10,
             keyword_limit: 10,
             graph_limit: 10,

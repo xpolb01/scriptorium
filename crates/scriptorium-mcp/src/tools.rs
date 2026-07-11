@@ -462,6 +462,7 @@ async fn query_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolErro
         &ctx.embeddings_model,
         &args.question,
         args.top_k,
+        &ctx.search,
     )
     .await
     .map_err(|e| ToolError::Failed(format!("query: {e}")))?;
@@ -946,6 +947,7 @@ mod tests {
             llm_provider: llm,
             embed_provider: embed,
             embeddings_model: "mock-embed-test".into(),
+            search: scriptorium_core::config::SearchConfig::default(),
         };
 
         let source = dir.path().join("sources/articles").join(source_name);
@@ -1087,6 +1089,7 @@ mod tests {
             llm_provider: llm2,
             embed_provider: ctx.embed_provider.clone(),
             embeddings_model: ctx.embeddings_model.clone(),
+            search: scriptorium_core::config::SearchConfig::default(),
         };
         let source2 = ctx
             .vault

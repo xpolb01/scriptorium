@@ -397,6 +397,7 @@ async fn query_returns_cited_answer_via_mock() {
         "mock-1",
         "how does attention work?",
         5,
+        &scriptorium_core::config::SearchConfig::default(),
     )
     .await
     .unwrap();
@@ -449,6 +450,7 @@ async fn query_strips_citations_for_pages_not_retrieved() {
         "mock-1",
         "alphabet?",
         5,
+        &scriptorium_core::config::SearchConfig::default(),
     )
     .await
     .unwrap();

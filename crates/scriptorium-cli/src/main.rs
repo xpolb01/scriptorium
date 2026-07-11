@@ -857,6 +857,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         &cfg.embeddings.model,
                         &question,
                         top_k,
+                        &cfg.search,
                     )
                     .await
                     .into_diagnostic()?;
@@ -1448,6 +1449,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         llm_provider,
                         embed_provider,
                         embeddings_model: cfg.embeddings.model.clone(),
+                        search: cfg.search.clone(),
                     };
                     scriptorium_mcp::serve_stdio(context)
                         .await
@@ -2338,8 +2340,7 @@ fn build_chat_provider(kind: ProviderKind, cfg: &Config) -> Result<Arc<dyn LlmPr
     // minutes; the hardcoded ceiling caused the request to be cut off mid-call,
     // leaving the MCP transport blocked until the reqwest client aborted.
     if matches!(kind, ProviderKind::Claude) {
-        let mut claude_cfg =
-            ClaudeConfig::from_env().map_err(|e| miette!("claude config: {e}"))?;
+        let mut claude_cfg = ClaudeConfig::from_env().map_err(|e| miette!("claude config: {e}"))?;
         claude_cfg.timeout = std::time::Duration::from_secs(cfg.llm.timeout_secs);
         tracing::debug!(
             timeout_secs = cfg.llm.timeout_secs,

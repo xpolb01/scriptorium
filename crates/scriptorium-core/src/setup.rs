@@ -178,6 +178,7 @@ pub fn run_setup(
         paths: PathsConfig::default(),
         hooks: HooksConfig::default(),
         meridian: meridian.clone(),
+        search: crate::config::SearchConfig::default(),
     };
 
     let config_path = vault.meta_dir().join("config.toml");
