@@ -250,6 +250,17 @@ enum Command {
         provider: Option<ProviderKind>,
     },
 
+    /// Import a Claude or ChatGPT conversations.json export as markdown
+    /// transcripts under sources/ (default sources/chats), ready for
+    /// normal ingest.
+    ImportChat {
+        /// Path to the export file (conversations.json).
+        file: PathBuf,
+        /// Vault-relative output directory.
+        #[arg(long, default_value = "sources/chats")]
+        out_dir: String,
+    },
+
     /// Suggest related pages for a wiki page (embedding similarity over
     /// the existing store) as candidate [[wikilinks]], marking ones the
     /// page already links to.
@@ -726,6 +737,7 @@ fn command_name_for_span(cmd: &Command) -> &'static str {
         Command::Bench { .. } => "bench",
         Command::Consolidate { .. } => "consolidate",
         Command::SuggestLinks { .. } => "suggest-links",
+        Command::ImportChat { .. } => "import-chat",
         Command::Audit { .. } => "audit",
         Command::Serve { .. } => "serve",
         Command::Watch { .. } => "watch",
@@ -1470,6 +1482,25 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                             println!("  Judged ctx-precision: {judged:.2} (LLM, reference-free)");
                         }
                         println!("  Health score:   {:.1}/10", report.health_score);
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::ImportChat { file, out_dir } => {
+                    let vault = open_vault(&vault_path)?;
+                    let text = std::fs::read_to_string(&file).into_diagnostic()?;
+                    let report =
+                        scriptorium_core::import_chat::import_chat_export(&vault, &text, &out_dir)
+                            .into_diagnostic()?;
+                    println!(
+                        "imported {} conversation(s), skipped {}",
+                        report.written.len(),
+                        report.skipped
+                    );
+                    for w in &report.written {
+                        println!("  {w}");
+                    }
+                    if !report.written.is_empty() {
+                        println!("\nNext: `scriptorium ingest <file>` or enqueue them.");
                     }
                     Ok(ExitCode::SUCCESS)
                 }

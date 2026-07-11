@@ -29,6 +29,7 @@ pub mod global_config;
 pub mod hooks;
 pub mod hooks_check;
 pub mod hooks_store;
+pub mod import_chat;
 pub mod index;
 pub mod ingest;
 pub mod ingest_queue;
