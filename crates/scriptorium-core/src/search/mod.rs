@@ -325,6 +325,7 @@ mod tests {
             keyword_limit: 10,
             graph_limit: 10,
             dedup: DedupConfig::default(),
+            hyde: false,
         };
 
         let results = hybrid_search(&store, &mock, &mock, "mock-1", "quantum", &pages, &opts)

@@ -79,20 +79,13 @@ pub async fn find_duplicate_groups(
     // Union-find over pairs above the threshold.
     let n = pages.len();
     let mut parent: Vec<usize> = (0..n).collect();
-    fn find(parent: &mut Vec<usize>, i: usize) -> usize {
-        if parent[i] != i {
-            let root = find(parent, parent[i]);
-            parent[i] = root;
-        }
-        parent[i]
-    }
     let mut pair_sim: Vec<(usize, usize, f32)> = Vec::new();
     for i in 0..n {
         for j in (i + 1)..n {
             let sim = cosine(&vectors[i], &vectors[j]);
             if sim >= threshold {
                 pair_sim.push((i, j, sim));
-                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                let (ri, rj) = (uf_find(&mut parent, i), uf_find(&mut parent, j));
                 if ri != rj {
                     parent[ri] = rj;
                 }
@@ -103,7 +96,7 @@ pub async fn find_duplicate_groups(
     let mut groups: std::collections::HashMap<usize, (Vec<usize>, f32)> =
         std::collections::HashMap::new();
     for (i, j, sim) in pair_sim {
-        let root = find(&mut parent, i);
+        let root = uf_find(&mut parent, i);
         let entry = groups.entry(root).or_insert_with(|| (Vec::new(), 1.0));
         for m in [i, j] {
             if !entry.0.contains(&m) {
@@ -289,6 +282,15 @@ async fn merge_bodies(chat: &dyn LlmProvider, survivor: &Page, others: &[&Page])
         return Err(Error::Other(anyhow::anyhow!("merge produced empty body")));
     }
     Ok(parsed.merged_body)
+}
+
+/// Path-compressing union-find lookup.
+fn uf_find(parent: &mut Vec<usize>, i: usize) -> usize {
+    if parent[i] != i {
+        let root = uf_find(parent, parent[i]);
+        parent[i] = root;
+    }
+    parent[i]
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {

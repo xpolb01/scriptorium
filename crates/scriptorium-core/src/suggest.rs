@@ -84,13 +84,13 @@ pub async fn suggest_links(
         .pages
         .iter()
         .filter_map(|p| {
-            let score = *best.get(&p.frontmatter.id)?;
+            let sim = *best.get(&p.frontmatter.id)?;
             let stem = p.path.file_stem()?.to_string();
             Some(LinkSuggestion {
                 already_linked: outgoing.contains(&stem),
                 title: p.frontmatter.title.clone(),
                 stem,
-                score,
+                score: sim,
             })
         })
         .collect();
