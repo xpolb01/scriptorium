@@ -104,7 +104,19 @@ pub struct IngestOptions {
     pub dry_run: bool,
     /// Lifecycle hooks to fire at key points. `None` = no hooks.
     pub hooks: Option<crate::hooks::HooksConfig>,
+    /// Ingest even when the source is a near-duplicate of one already in
+    /// `sources/` (the deterministic pre-LLM gate is skipped).
+    pub force: bool,
 }
+
+/// Shingle-Jaccard similarity above which an incoming source is treated
+/// as a near-duplicate of an existing one and skipped before any LLM
+/// call. Exact re-ingests are already idempotent via hash interning;
+/// this catches re-exports and lightly-edited copies.
+const NEAR_DUP_THRESHOLD: f32 = 0.92;
+
+/// Sources larger than this are not compared (cost guard).
+const NEAR_DUP_MAX_BYTES: u64 = 512 * 1024;
 
 /// Run the ingest pipeline with configurable options. See [`ingest`] for the
 /// default path and [`IngestOptions`] for the knobs.
@@ -134,10 +146,32 @@ pub async fn ingest_with_retrieval(
     embed_provider: Option<&dyn LlmProvider>,
     embed_model: Option<&str>,
 ) -> Result<IngestReport> {
-    // 1. Read source text.
+    // 1. Read the source and extract text (routes PDFs/Office/HTML through
+    //    the best available extractor; plain UTF-8 for md/txt as before).
     let raw = fs::read(source_path).map_err(|e| Error::io(source_path.to_path_buf(), e))?;
-    let source_text = String::from_utf8(raw.clone())
-        .map_err(|e| Error::Other(anyhow::anyhow!("source is not UTF-8: {e}")))?;
+    let extracted = crate::extract::extract_source_text(source_path, &raw)?;
+    let source_text = extracted.text;
+
+    // 1b. Deterministic near-duplicate gate: if an existing interned source
+    //     is a near-copy of this one, skip before spending any LLM tokens.
+    //     Short notes are exempt — tiny texts collide too easily on
+    //     shingles, and re-curating them is cheap anyway.
+    if !options.force && source_text.split_whitespace().count() >= 40 {
+        if let Some((existing, sim)) = find_near_duplicate_source(vault, &source_text) {
+            return Ok(IngestReport {
+                source: existing.clone(),
+                commit_id: "skipped-near-duplicate".into(),
+                created: 0,
+                updated: 0,
+                summary: format!(
+                    "skipped: near-duplicate of {existing} (similarity {sim:.2}); \
+                     re-run with force to ingest anyway"
+                ),
+                dry_run_diff: Vec::new(),
+                redundant: true,
+            });
+        }
+    }
 
     // 2. Intern into `sources/`.
     let interned = intern_source(vault, source_path, &raw)?;
@@ -682,6 +716,46 @@ fn select_relevant_pages<'a>(pages: &'a [Page], source_text: &str, top_n: usize)
 /// Copy a source file into `sources/<category>/<hash_prefix>-<slug>.<ext>`
 /// inside the vault if it is not already there. Returns the vault-relative
 /// path of the interned copy.
+/// Scan `sources/` for a near-duplicate of `text`. Returns the first
+/// existing source above [`NEAR_DUP_THRESHOLD`] with its similarity.
+/// Only readable UTF-8 sources under the size cap are compared.
+fn find_near_duplicate_source(vault: &Vault, text: &str) -> Option<(Utf8PathBuf, f32)> {
+    let sources_root = vault.root().join("sources");
+    let mut stack = vec![sources_root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(dir.as_std_path()) else {
+            continue;
+        };
+        for entry in entries.filter_map(std::result::Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Ok(utf8) = Utf8PathBuf::from_path_buf(path) {
+                    stack.push(utf8);
+                }
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.len() > NEAR_DUP_MAX_BYTES {
+                continue;
+            }
+            let Ok(existing_text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let sim = crate::extract::shingle_jaccard(text, &existing_text);
+            if sim >= NEAR_DUP_THRESHOLD {
+                let rel = path
+                    .strip_prefix(vault.root().as_std_path())
+                    .unwrap_or(&path)
+                    .to_path_buf();
+                if let Ok(utf8) = Utf8PathBuf::from_path_buf(rel) {
+                    return Some((utf8, sim));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn intern_source(vault: &Vault, source_path: &Path, bytes: &[u8]) -> Result<Utf8PathBuf> {
     let hash = sha256_hex(bytes);
     let hash_prefix = &hash[..12];

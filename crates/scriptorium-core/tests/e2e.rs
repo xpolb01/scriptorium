@@ -301,6 +301,7 @@ async fn ingest_dry_run_stages_but_does_not_commit() {
         ingest::IngestOptions {
             dry_run: true,
             hooks: None,
+            force: false,
         },
     )
     .await

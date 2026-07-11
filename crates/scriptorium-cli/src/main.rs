@@ -83,6 +83,10 @@ enum Command {
         /// would do before you trust it.
         #[arg(long)]
         dry_run: bool,
+        /// Ingest even when the source is a near-duplicate of one already
+        /// interned (skips the deterministic pre-LLM duplicate gate).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Ask a question against the vault.
@@ -794,6 +798,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     provider,
                     model,
                     dry_run,
+                    force,
                 } => {
                     let vault = open_vault(&vault_path)?;
                     let cfg = load_config(&vault);
@@ -814,6 +819,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         ingest::IngestOptions {
                             dry_run,
                             hooks: Some(cfg.hooks.clone()),
+                            force,
                         },
                     )
                     .await

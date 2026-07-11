@@ -131,7 +131,8 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "source":  {"type": "string", "description": "Absolute path to a local source file. Mutually exclusive with `url`; exactly one of `source` or `url` is required."},
                     "url":     {"type": "string", "description": "URL to fetch and ingest as if it were a local file. Mutually exclusive with `source`; exactly one of `source` or `url` is required."},
-                    "dry_run": {"type": "boolean", "default": false, "description": "If true, stage the ingest, return the diff, and do not commit."}
+                    "dry_run": {"type": "boolean", "default": false, "description": "If true, stage the ingest, return the diff, and do not commit."},
+                    "force":   {"type": "boolean", "default": false, "description": "Ingest even when the source is a near-duplicate of an already-interned source."}
                 }
             }),
         },
@@ -352,6 +353,10 @@ struct IngestArgs {
     url: Option<String>,
     #[serde(default)]
     dry_run: bool,
+    /// Ingest even when the source is a near-duplicate of one already
+    /// interned.
+    #[serde(default)]
+    force: bool,
 }
 
 async fn ingest_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError> {
@@ -389,6 +394,7 @@ async fn ingest_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolErr
         ingest::IngestOptions {
             dry_run: args.dry_run,
             hooks: None,
+            force: args.force,
         },
     )
     .await
