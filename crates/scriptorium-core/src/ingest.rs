@@ -574,11 +574,19 @@ fn unlink_unresolvable(body: &str, valid_stems: &std::collections::HashSet<Strin
             .expect("unlink_unresolvable regex is valid")
     });
     re.replace_all(body, |caps: &regex::Captures<'_>| {
-        let target = caps.get(1).map_or("", |m| m.as_str()).trim();
+        // Trim whitespace and stray trailing backslashes — LLMs sometimes
+        // emit `[[target\]]` as an escaping artifact (observed live).
+        let target = caps
+            .get(1)
+            .map_or("", |m| m.as_str())
+            .trim()
+            .trim_end_matches('\\');
         let display = caps.get(4).map_or(target, |m| m.as_str());
         if valid_stems.contains(&target.to_lowercase()) {
-            caps.get(0)
-                .map_or_else(String::new, |m| m.as_str().to_string())
+            match caps.get(4) {
+                Some(alias) => format!("[[{target}|{}]]", alias.as_str()),
+                None => format!("[[{target}]]"),
+            }
         } else {
             display.to_string()
         }
@@ -1190,6 +1198,15 @@ mod tests {
         let body = "See [[real-page]] and [[ghost-page]] and [[ghost|Ghost Label]].";
         let out = unlink_unresolvable(body, &valid);
         assert_eq!(out, "See [[real-page]] and ghost-page and Ghost Label.");
+    }
+
+    #[test]
+    fn unlink_unresolvable_repairs_trailing_backslash() {
+        let mut valid = std::collections::HashSet::new();
+        valid.insert("palantir".to_string());
+        let body = r"See [[palantir\]] for context.";
+        let out = unlink_unresolvable(body, &valid);
+        assert_eq!(out, "See [[palantir]] for context.");
     }
 
     #[test]
