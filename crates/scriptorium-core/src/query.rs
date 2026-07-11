@@ -126,6 +126,18 @@ pub async fn query(
     ordered_pages.sort_by(|a, b| b.1.total_cmp(&a.1));
     let mut relevant_refs: Vec<&Page> = ordered_pages.iter().map(|(p, _)| *p).collect();
 
+    // Superseded pages carry stale truth by definition — drop them from the
+    // context unless nothing current survives (their replacement is usually
+    // in the set via wikilinks/backlinks anyway).
+    let current: Vec<&Page> = relevant_refs
+        .iter()
+        .copied()
+        .filter(|p| !p.frontmatter.extra.contains_key("superseded_by"))
+        .collect();
+    if !current.is_empty() {
+        relevant_refs = current;
+    }
+
     // 5b. Optional listwise LLM rerank of the top candidates. Best-effort:
     // failure keeps the fused order. Reordering here changes which pages
     // lead the prompt context (and what the model reads first).

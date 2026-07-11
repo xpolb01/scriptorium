@@ -17,6 +17,7 @@ pub mod frontmatter;
 pub mod missing_tags;
 pub mod orphans;
 pub mod page_structure;
+pub mod provenance;
 pub mod stale;
 
 use camino::Utf8PathBuf;
@@ -129,6 +130,7 @@ pub fn run(vault: &Vault) -> Result<LintReport> {
     issues.extend(stale::check(vault, &scan.pages));
     issues.extend(missing_tags::check(&scan.pages));
     issues.extend(page_structure::check(&scan.pages));
+    issues.extend(provenance::check(vault, &scan.pages));
     // Stable sort by severity then path then rule so diffs of `lint` output
     // between runs are clean.
     issues.sort_by(|a, b| {

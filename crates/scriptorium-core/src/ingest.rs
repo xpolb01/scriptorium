@@ -150,6 +150,7 @@ pub async fn ingest_with_retrieval(
     //    the best available extractor; plain UTF-8 for md/txt as before).
     let raw = fs::read(source_path).map_err(|e| Error::io(source_path.to_path_buf(), e))?;
     let extracted = crate::extract::extract_source_text(source_path, &raw)?;
+    let converter = extracted.converter;
     let source_text = extracted.text;
 
     // 1b. Deterministic near-duplicate gate: if an existing interned source
@@ -348,7 +349,12 @@ pub async fn ingest_with_retrieval(
             )));
         }
         let mut tx = vault.begin();
-        tx.put_file(&interned, source_text.clone())?;
+        if converter.is_none() {
+            tx.put_file(&interned, source_text.clone())?;
+        } else {
+            let sibling = Utf8PathBuf::from(format!("{interned}.extracted.md"));
+            tx.put_file(&sibling, source_text.clone())?;
+        }
         tx.append(
             Utf8Path::new("log.md"),
             &format!("\n[skip] redundant — {interned}\n"),
@@ -394,12 +400,43 @@ pub async fn ingest_with_retrieval(
     // is idempotent: re-ingesting the same source writes the same bytes
     // to the same content-hash-prefixed path, so staging it again is a
     // no-op from git's perspective (same blob oid).
-    tx.put_file(&interned, source_text.clone())?;
+    if converter.is_none() {
+        tx.put_file(&interned, source_text.clone())?;
+    } else {
+        let sibling = Utf8PathBuf::from(format!("{interned}.extracted.md"));
+        tx.put_file(&sibling, source_text.clone())?;
+    }
+
+    // Pages superseded by this plan get a `superseded_by` marker (their
+    // content is untouched; retrieval down-ranks them and lint checks the
+    // back-reference).
+    let mut superseded_writes: Vec<Page> = Vec::new();
+    for action in &plan.pages {
+        let new_stem = Utf8PathBuf::from(&action.path)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string();
+        for target_stem in &action.supersedes {
+            if let Some(target) = scan
+                .pages
+                .iter()
+                .find(|p| p.path.file_stem() == Some(target_stem.as_str()))
+            {
+                let mut t = target.clone();
+                t.frontmatter.updated = Utc::now();
+                t.frontmatter.extra.insert(
+                    "superseded_by".into(),
+                    serde_yml::Value::String(new_stem.clone()),
+                );
+                superseded_writes.push(t);
+            }
+        }
+    }
 
     for action in &plan.pages {
         let path = Utf8PathBuf::from(&action.path);
         let existing = scan.pages.iter().find(|p| p.path == path);
-        let page = if let (IngestAction::Update, Some(existing)) = (action.action, existing) {
+        let mut page = if let (IngestAction::Update, Some(existing)) = (action.action, existing) {
             let mut next = existing.clone();
             next.frontmatter.updated = Utc::now();
             next.frontmatter.tags.clone_from(&action.tags);
@@ -421,6 +458,7 @@ pub async fn ingest_with_retrieval(
                 body: action.body.clone(),
             }
         };
+        apply_provenance_extras(&mut page, action, &source_ref);
         tx.write_page(&page)?;
         // Mirror the staged write into future_pages so the index render
         // below sees the post-ingest state.
@@ -428,6 +466,19 @@ pub async fn ingest_with_retrieval(
             future_pages[idx] = page;
         } else {
             future_pages.push(page);
+        }
+    }
+
+    // 6b. Stage superseded_by markers (skip pages the plan itself wrote —
+    //     the plan's version wins).
+    for spage in superseded_writes {
+        let planned = plan.pages.iter().any(|a| a.path == spage.path.as_str());
+        if planned {
+            continue;
+        }
+        tx.write_page(&spage)?;
+        if let Some(idx) = future_pages.iter().position(|p| p.path == spage.path) {
+            future_pages[idx] = spage;
         }
     }
 
@@ -716,6 +767,46 @@ fn select_relevant_pages<'a>(pages: &'a [Page], source_text: &str, top_n: usize)
 /// Copy a source file into `sources/<category>/<hash_prefix>-<slug>.<ext>`
 /// inside the vault if it is not already there. Returns the vault-relative
 /// path of the interned copy.
+/// Record span-level provenance and lifecycle metadata from a plan action
+/// onto a page's frontmatter `extra` map:
+/// - `source_quotes`: map of interned-source path → short verbatim quote
+///   supporting the page (lint verifies the quote appears in the source);
+/// - `supersedes`: stems of pages this page replaces.
+fn apply_provenance_extras(
+    page: &mut Page,
+    action: &crate::llm::prompts::IngestPageAction,
+    source_ref: &str,
+) {
+    if let Some(quote) = action
+        .source_quote
+        .as_ref()
+        .map(|q| q.trim())
+        .filter(|q| !q.is_empty())
+    {
+        let entry = page
+            .frontmatter
+            .extra
+            .entry("source_quotes".to_string())
+            .or_insert_with(|| serde_yml::Value::Mapping(serde_yml::Mapping::new()));
+        if let serde_yml::Value::Mapping(map) = entry {
+            map.insert(
+                serde_yml::Value::String(source_ref.to_string()),
+                serde_yml::Value::String(quote.to_string()),
+            );
+        }
+    }
+    if !action.supersedes.is_empty() {
+        let stems: Vec<serde_yml::Value> = action
+            .supersedes
+            .iter()
+            .map(|s| serde_yml::Value::String(s.clone()))
+            .collect();
+        page.frontmatter
+            .extra
+            .insert("supersedes".to_string(), serde_yml::Value::Sequence(stems));
+    }
+}
+
 /// Scan `sources/` for a near-duplicate of `text`. Returns the first
 /// existing source above [`NEAR_DUP_THRESHOLD`] with its similarity.
 /// Only readable UTF-8 sources under the size cap are compared.
@@ -1055,6 +1146,8 @@ mod tests {
             title: "Test".into(),
             tags: vec![],
             body: "body".into(),
+            source_quote: None,
+            supersedes: vec![],
         }
     }
 

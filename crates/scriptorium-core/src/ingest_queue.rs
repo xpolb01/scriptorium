@@ -1010,6 +1010,8 @@ mod tests {
                 title: "Dedup Target".into(),
                 tags: vec![],
                 body: "Body without wikilinks.\n".into(),
+                source_quote: None,
+                supersedes: vec![],
             }],
             log_entry: "drain ingest".into(),
             redundant: false,

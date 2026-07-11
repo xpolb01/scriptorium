@@ -173,7 +173,17 @@ pub async fn curation_audit(
     let mut missing = Vec::new();
     for source in &page.frontmatter.sources {
         let path = vault.root().join(source);
-        match std::fs::read_to_string(path.as_std_path()) {
+        // Binary sources (PDFs etc.) have an extracted-text sibling written
+        // at ingest time — audit against that.
+        let read = std::fs::read_to_string(path.as_std_path()).or_else(|_| {
+            std::fs::read_to_string(
+                vault
+                    .root()
+                    .join(format!("{source}.extracted.md"))
+                    .as_std_path(),
+            )
+        });
+        match read {
             Ok(text) => {
                 let _ = writeln!(context, "=== {source} ===");
                 context.push_str(&text);

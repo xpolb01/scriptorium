@@ -1053,6 +1053,8 @@ mod tests {
                 title: title.into(),
                 tags: vec!["test".into()],
                 body: body.into(),
+                source_quote: None,
+                supersedes: vec![],
             }],
             log_entry: format!("ingested {title}"),
             redundant: false,
