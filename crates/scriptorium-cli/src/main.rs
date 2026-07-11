@@ -83,6 +83,10 @@ enum Command {
         /// would do before you trust it.
         #[arg(long)]
         dry_run: bool,
+        /// Ingest even when the source is a near-duplicate of one already
+        /// interned (skips the deterministic pre-LLM duplicate gate).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Ask a question against the vault.
@@ -102,6 +106,11 @@ enum Command {
         /// Override the provider declared in config.
         #[arg(long, value_enum)]
         provider: Option<ProviderKind>,
+        /// Drop all cached embedding rows first and re-embed everything.
+        /// Required once after changing the chunk strategy or enabling
+        /// `[embeddings] contextual`.
+        #[arg(long)]
+        rebuild: bool,
     },
 
     /// Run mechanical lint rules and print the report.
@@ -227,6 +236,77 @@ enum Command {
         /// Scaffold an empty benchmarks.json if none exists.
         #[arg(long)]
         init: bool,
+        /// Additionally grade each case's retrieved chunks with the chat
+        /// LLM (reference-free context precision — works without
+        /// hand-labeled `expected` stems).
+        #[arg(long)]
+        judge: bool,
+        /// Run the suite across a small retrieval-parameter grid
+        /// (expansion × MMR) and print a comparison table.
+        #[arg(long, conflicts_with = "judge")]
+        sweep: bool,
+        /// Override the provider declared in config.
+        #[arg(long, value_enum)]
+        provider: Option<ProviderKind>,
+    },
+
+    /// Import a Claude or ChatGPT conversations.json export as markdown
+    /// transcripts under sources/ (default sources/chats), ready for
+    /// normal ingest.
+    ImportChat {
+        /// Path to the export file (conversations.json).
+        file: PathBuf,
+        /// Vault-relative output directory.
+        #[arg(long, default_value = "sources/chats")]
+        out_dir: String,
+    },
+
+    /// Suggest related pages for a wiki page (embedding similarity over
+    /// the existing store) as candidate [[wikilinks]], marking ones the
+    /// page already links to.
+    SuggestLinks {
+        /// Stem of the subject page (e.g. `attention`).
+        stem: String,
+        /// Maximum suggestions.
+        #[arg(long, default_value_t = 8)]
+        top: usize,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Find near-duplicate wiki pages (batched embedding similarity) and,
+    /// with --apply, merge each group into its longest member; absorbed
+    /// pages become `Merged into [[survivor]]` redirect stubs. Dry-run by
+    /// default; one commit per applied run (`scriptorium undo` reverts).
+    Consolidate {
+        /// Cosine-similarity threshold for grouping (0–1).
+        #[arg(long, default_value_t = 0.90)]
+        threshold: f32,
+        /// Actually merge (default is report-only).
+        #[arg(long)]
+        apply: bool,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Override the provider declared in config.
+        #[arg(long, value_enum)]
+        provider: Option<ProviderKind>,
+    },
+
+    /// Audit wiki pages against their own interned sources: an LLM judge
+    /// decomposes each page into claims and verifies every claim against
+    /// the sources the page cites. Catches curation-time hallucination.
+    Audit {
+        /// Audit only the page with this stem (e.g. `attention`).
+        #[arg(long)]
+        page: Option<String>,
+        /// Audit at most N pages (most recently updated first).
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
         /// Override the provider declared in config.
         #[arg(long, value_enum)]
         provider: Option<ProviderKind>,
@@ -655,6 +735,10 @@ fn command_name_for_span(cmd: &Command) -> &'static str {
         Command::Skill(_) => "skill",
         Command::Learn(_) => "learn",
         Command::Bench { .. } => "bench",
+        Command::Consolidate { .. } => "consolidate",
+        Command::SuggestLinks { .. } => "suggest-links",
+        Command::ImportChat { .. } => "import-chat",
+        Command::Audit { .. } => "audit",
         Command::Serve { .. } => "serve",
         Command::Watch { .. } => "watch",
         Command::Social(_) => "social",
@@ -766,6 +850,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     provider,
                     model,
                     dry_run,
+                    force,
                 } => {
                     let vault = open_vault(&vault_path)?;
                     let cfg = load_config(&vault);
@@ -786,6 +871,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         ingest::IngestOptions {
                             dry_run,
                             hooks: Some(cfg.hooks.clone()),
+                            force,
                         },
                     )
                     .await
@@ -857,6 +943,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         &cfg.embeddings.model,
                         &question,
                         top_k,
+                        &cfg.search,
                     )
                     .await
                     .into_diagnostic()?;
@@ -869,7 +956,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     }
                     Ok(ExitCode::SUCCESS)
                 }
-                Command::Reindex { provider } => {
+                Command::Reindex { provider, rebuild } => {
                     let vault = open_vault(&vault_path)?;
                     let cfg = load_config(&vault);
                     // reindex uses the embeddings provider, not the chat provider.
@@ -877,11 +964,19 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     let embed_provider =
                         build_provider(provider.unwrap_or_else(|| embed_provider_from(&cfg)))?;
                     let store = open_store(&vault)?;
-                    let report = core::reindex::reindex_all(
+                    // Contextual retrieval needs the chat provider at index time.
+                    let contextual_chat = if cfg.embeddings.contextual {
+                        Some(build_chat_provider(provider_from(&cfg), &cfg)?)
+                    } else {
+                        None
+                    };
+                    let report = core::reindex::reindex_all_with(
                         &vault,
                         &store,
                         embed_provider.as_ref(),
                         &cfg.embeddings.model,
+                        contextual_chat.as_deref(),
+                        rebuild,
                     )
                     .await
                     .into_diagnostic()?;
@@ -1273,6 +1368,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 Command::Bench {
                     json,
                     init,
+                    judge,
+                    sweep,
                     provider,
                 } => {
                     let vault = open_vault(&vault_path)?;
@@ -1299,15 +1396,55 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     let llm =
                         build_chat_provider(provider.unwrap_or_else(|| provider_from(&cfg)), &cfg)?;
                     let embed = build_provider(embed_provider_from(&cfg))?;
-                    let report = scriptorium_core::bench::run_benchmarks(
-                        &vault,
-                        &store,
-                        embed.as_ref(),
-                        llm.as_ref(),
-                        &cfg.embeddings.model,
-                    )
-                    .await
-                    .into_diagnostic()?;
+                    if sweep {
+                        let grid = scriptorium_core::bench::default_sweep_grid();
+                        let rows = scriptorium_core::bench::sweep(
+                            &vault,
+                            &store,
+                            embed.as_ref(),
+                            llm.as_ref(),
+                            &cfg.embeddings.model,
+                            grid,
+                        )
+                        .await
+                        .into_diagnostic()?;
+                        println!("Retrieval Parameter Sweep");
+                        println!("=========================");
+                        for (point, report) in &rows {
+                            println!(
+                                "  {:<26} P={:.2} R={:.2} NDCG={:.2} MRR={:.2} health={:.1}",
+                                point.label,
+                                report.mean_precision,
+                                report.mean_recall,
+                                report.mean_ndcg,
+                                report.mean_mrr,
+                                report.health_score,
+                            );
+                        }
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    let report = if judge {
+                        scriptorium_core::bench::run_benchmarks_judged(
+                            &vault,
+                            &store,
+                            embed.as_ref(),
+                            llm.as_ref(),
+                            llm.as_ref(),
+                            &cfg.embeddings.model,
+                        )
+                        .await
+                        .into_diagnostic()?
+                    } else {
+                        scriptorium_core::bench::run_benchmarks(
+                            &vault,
+                            &store,
+                            embed.as_ref(),
+                            llm.as_ref(),
+                            &cfg.embeddings.model,
+                        )
+                        .await
+                        .into_diagnostic()?
+                    };
                     if json {
                         println!(
                             "{}",
@@ -1341,7 +1478,217 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         println!("  Mean NDCG:      {:.2}", report.mean_ndcg);
                         println!("  Coverage:       {:.0}%", report.coverage * 100.0);
                         println!("  Stale ratio:    {:.0}%", report.stale_ratio * 100.0);
+                        if let Some(judged) = report.mean_judged_precision {
+                            println!("  Judged ctx-precision: {judged:.2} (LLM, reference-free)");
+                        }
                         println!("  Health score:   {:.1}/10", report.health_score);
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::ImportChat { file, out_dir } => {
+                    let vault = open_vault(&vault_path)?;
+                    let text = std::fs::read_to_string(&file).into_diagnostic()?;
+                    let report =
+                        scriptorium_core::import_chat::import_chat_export(&vault, &text, &out_dir)
+                            .into_diagnostic()?;
+                    println!(
+                        "imported {} conversation(s), skipped {}",
+                        report.written.len(),
+                        report.skipped
+                    );
+                    for w in &report.written {
+                        println!("  {w}");
+                    }
+                    if !report.written.is_empty() {
+                        println!("\nNext: `scriptorium ingest <file>` or enqueue them.");
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::SuggestLinks { stem, top, json } => {
+                    let vault = open_vault(&vault_path)?;
+                    let cfg = load_config(&vault);
+                    let embed = build_provider(embed_provider_from(&cfg))?;
+                    let store = open_store(&vault)?;
+                    let suggestions = scriptorium_core::suggest::suggest_links(
+                        &vault,
+                        &store,
+                        embed.as_ref(),
+                        &cfg.embeddings.model,
+                        &stem,
+                        top,
+                    )
+                    .await
+                    .into_diagnostic()?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&suggestions)
+                                .map_err(|e| miette!("json: {e}"))?
+                        );
+                    } else if suggestions.is_empty() {
+                        println!("No related pages found for '{stem}'.");
+                    } else {
+                        println!("Related pages for '{stem}':");
+                        for s in &suggestions {
+                            println!(
+                                "  [[{}]]  {:.2}  {}{}",
+                                s.stem,
+                                s.score,
+                                s.title,
+                                if s.already_linked {
+                                    "  (already linked)"
+                                } else {
+                                    ""
+                                }
+                            );
+                        }
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Consolidate {
+                    threshold,
+                    apply,
+                    json,
+                    provider,
+                } => {
+                    let vault = open_vault(&vault_path)?;
+                    let cfg = load_config(&vault);
+                    let chat =
+                        build_chat_provider(provider.unwrap_or_else(|| provider_from(&cfg)), &cfg)?;
+                    let embed = build_provider(embed_provider_from(&cfg))?;
+                    let report = scriptorium_core::consolidate::consolidate(
+                        &vault,
+                        chat.as_ref(),
+                        embed.as_ref(),
+                        threshold,
+                        apply,
+                    )
+                    .await
+                    .into_diagnostic()?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report)
+                                .map_err(|e| miette!("json: {e}"))?
+                        );
+                    } else if report.groups.is_empty() {
+                        println!("No near-duplicate page groups at threshold {threshold:.2}.");
+                    } else {
+                        println!("Near-duplicate groups (threshold {threshold:.2}):");
+                        for g in &report.groups {
+                            println!(
+                                "  [{}] min-similarity {:.2}",
+                                g.stems.join(", "),
+                                g.min_similarity
+                            );
+                        }
+                        if apply {
+                            println!(
+                                "\nmerged {} page(s){}",
+                                report.merged,
+                                report
+                                    .commit_id
+                                    .as_deref()
+                                    .map(|c| format!(", commit {c}"))
+                                    .unwrap_or_default()
+                            );
+                        } else {
+                            println!("\nDry run — re-run with --apply to merge.");
+                        }
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Audit {
+                    page,
+                    limit,
+                    json,
+                    provider,
+                } => {
+                    let vault = open_vault(&vault_path)?;
+                    let cfg = load_config(&vault);
+                    let llm =
+                        build_chat_provider(provider.unwrap_or_else(|| provider_from(&cfg)), &cfg)?;
+                    let scan = vault.scan().into_diagnostic()?;
+                    let mut pages: Vec<&scriptorium_core::Page> = match &page {
+                        Some(stem) => scan
+                            .pages
+                            .iter()
+                            .filter(|p| p.path.file_stem() == Some(stem.as_str()))
+                            .collect(),
+                        None => {
+                            let mut all: Vec<_> = scan
+                                .pages
+                                .iter()
+                                .filter(|p| !p.frontmatter.sources.is_empty())
+                                .collect();
+                            all.sort_by(|a, b| b.frontmatter.updated.cmp(&a.frontmatter.updated));
+                            all
+                        }
+                    };
+                    pages.truncate(limit.max(1));
+                    if pages.is_empty() {
+                        println!("No matching pages with sources to audit.");
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    let mut all_reports = Vec::new();
+                    let mut any_unsupported = false;
+                    let mut audit_errors = 0usize;
+                    for p in &pages {
+                        let stem = p.path.file_stem().unwrap_or("?").to_string();
+                        match scriptorium_core::eval::curation_audit(&vault, llm.as_ref(), p).await
+                        {
+                            Ok((report, missing)) => {
+                                if json {
+                                    all_reports.push(serde_json::json!({
+                                        "page": stem,
+                                        "score": report.score,
+                                        "claims": report.claims,
+                                        "missing_sources": missing,
+                                    }));
+                                } else {
+                                    println!(
+                                        "{stem}: {:.0}% supported ({}/{} claims)",
+                                        report.score * 100.0,
+                                        report.supported(),
+                                        report.claims.len()
+                                    );
+                                    for c in report.unsupported() {
+                                        any_unsupported = true;
+                                        println!("    UNSUPPORTED: {}", c.claim);
+                                    }
+                                    if !missing.is_empty() {
+                                        println!(
+                                            "    (unreadable sources: {})",
+                                            missing.join(", ")
+                                        );
+                                    }
+                                }
+                                if report.score < 1.0 {
+                                    any_unsupported = true;
+                                }
+                            }
+                            Err(e) => {
+                                audit_errors += 1;
+                                if json {
+                                    all_reports.push(serde_json::json!({
+                                        "page": stem, "error": e.to_string(),
+                                    }));
+                                } else {
+                                    println!("{stem}: audit failed — {e}");
+                                }
+                            }
+                        }
+                    }
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&all_reports)
+                                .map_err(|e| miette!("json: {e}"))?
+                        );
+                    } else if audit_errors == pages.len() {
+                        println!("\nNo pages could be audited.");
+                    } else if !any_unsupported && audit_errors == 0 {
+                        println!("\nAll audited claims are supported by their sources.");
                     }
                     Ok(ExitCode::SUCCESS)
                 }
@@ -1448,6 +1795,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         llm_provider,
                         embed_provider,
                         embeddings_model: cfg.embeddings.model.clone(),
+                        search: cfg.search.clone(),
                     };
                     scriptorium_mcp::serve_stdio(context)
                         .await
@@ -2338,8 +2686,7 @@ fn build_chat_provider(kind: ProviderKind, cfg: &Config) -> Result<Arc<dyn LlmPr
     // minutes; the hardcoded ceiling caused the request to be cut off mid-call,
     // leaving the MCP transport blocked until the reqwest client aborted.
     if matches!(kind, ProviderKind::Claude) {
-        let mut claude_cfg =
-            ClaudeConfig::from_env().map_err(|e| miette!("claude config: {e}"))?;
+        let mut claude_cfg = ClaudeConfig::from_env().map_err(|e| miette!("claude config: {e}"))?;
         claude_cfg.timeout = std::time::Duration::from_secs(cfg.llm.timeout_secs);
         tracing::debug!(
             timeout_secs = cfg.llm.timeout_secs,

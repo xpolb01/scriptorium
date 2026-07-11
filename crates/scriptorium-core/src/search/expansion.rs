@@ -61,6 +61,47 @@ pub async fn expand_query(
     }
 }
 
+/// Generate a `HyDE` (Hypothetical Document Embeddings) variant: a short
+/// passage written as if it were the wiki text that answers the question.
+/// Embedding this pseudo-document often lands closer to the real answer
+/// chunks than the question itself does.
+///
+/// Non-fatal: returns `None` on any LLM or parse failure. Callers append
+/// the variant to the embedding list; it must never replace the original
+/// query.
+pub async fn hyde_variant(provider: &dyn LlmProvider, question: &str) -> Option<String> {
+    let req = CompletionRequest {
+        system: "You write hypothetical reference passages for retrieval. \
+                 Given a question, write the short encyclopedia-style passage \
+                 (2-4 sentences) that would answer it. State facts plainly as \
+                 if they were true; do not hedge, do not mention the question."
+            .to_string(),
+        messages: vec![Message {
+            role: Role::User,
+            content: question.to_string(),
+        }],
+        max_tokens: 220,
+        temperature: Some(0.3),
+        response_schema: None,
+    };
+    match provider.complete(req).await {
+        Ok(resp) => {
+            let text = resp.text.trim().to_string();
+            if text.is_empty() {
+                debug!("hyde variant empty, skipping");
+                None
+            } else {
+                debug!(chars = text.len(), "hyde variant generated");
+                Some(text)
+            }
+        }
+        Err(e) => {
+            debug!(error = %e, "hyde variant failed, skipping");
+            None
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ExpansionResponse {
     alternative_queries: Vec<String>,

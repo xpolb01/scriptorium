@@ -29,6 +29,10 @@ pub struct DedupConfig {
     pub max_type_ratio: f32,
     /// Maximum chunks per page in the final result set.
     pub max_per_page: usize,
+    /// Maximal-Marginal-Relevance balance between relevance and diversity
+    /// for the final ordering: `λ·relevance − (1−λ)·redundancy`. `1.0`
+    /// disables the reorder (pure relevance ranking).
+    pub mmr_lambda: f32,
 }
 
 impl Default for DedupConfig {
@@ -37,17 +41,61 @@ impl Default for DedupConfig {
             jaccard_threshold: 0.85,
             max_type_ratio: 0.60,
             max_per_page: 2,
+            mmr_lambda: 0.7,
         }
     }
 }
 
-/// Run all four dedup layers in sequence. Input should be sorted by score
+/// Run all dedup layers in sequence. Input should be sorted by score
 /// descending (as returned by [`super::fusion::rrf_fuse`]).
 pub fn dedup_pipeline(results: Vec<SearchHit>, config: &DedupConfig) -> Vec<SearchHit> {
     let r = merge_duplicates(results);
     let r = filter_jaccard(r, config.jaccard_threshold);
     let r = enforce_type_diversity(r, config.max_type_ratio);
-    cap_per_page(r, config.max_per_page)
+    let r = cap_per_page(r, config.max_per_page);
+    mmr_reorder(r, config.mmr_lambda)
+}
+
+/// Final layer: Maximal Marginal Relevance. Greedily reorders so that each
+/// next result balances retrieval score against redundancy with what has
+/// already been selected (word-set Jaccard as the redundancy measure). The
+/// hard Jaccard filter above removes near-duplicates; MMR additionally
+/// spreads the *moderately* overlapping survivors so the top of the list
+/// covers more distinct material.
+fn mmr_reorder(results: Vec<SearchHit>, lambda: f32) -> Vec<SearchHit> {
+    if lambda >= 1.0 || results.len() <= 2 {
+        return results;
+    }
+    // Min-max normalize scores so they are comparable with Jaccard [0,1].
+    let (min, max) = results
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), h| {
+            (lo.min(h.score), hi.max(h.score))
+        });
+    let range = (max - min).max(f32::EPSILON);
+    let norm = |s: f32| (s - min) / range;
+
+    let mut remaining = results;
+    let mut selected: Vec<SearchHit> = Vec::with_capacity(remaining.len());
+    // Highest-scored hit always goes first.
+    selected.push(remaining.remove(0));
+    while !remaining.is_empty() {
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (i, cand) in remaining.iter().enumerate() {
+            let redundancy = selected
+                .iter()
+                .map(|s| jaccard(&cand.chunk_text, &s.chunk_text))
+                .fold(0.0f32, f32::max);
+            let val = lambda * norm(cand.score) - (1.0 - lambda) * redundancy;
+            if val > best_val {
+                best_val = val;
+                best_idx = i;
+            }
+        }
+        selected.push(remaining.remove(best_idx));
+    }
+    selected
 }
 
 /// Layer 1: merge identical `(page_id, chunk_idx)` pairs, keeping the
@@ -269,5 +317,51 @@ mod tests {
         ];
         let capped = cap_per_page(results, 2);
         assert_eq!(capped.len(), 2);
+    }
+
+    #[test]
+    fn mmr_disabled_at_lambda_one_keeps_score_order() {
+        let (a, b, c) = (PageId::new(), PageId::new(), PageId::new());
+        let results = vec![
+            hit(a, 0, "solar panels convert sunlight into electricity", 0.9),
+            hit(b, 0, "solar panels convert sunlight into power output", 0.8),
+            hit(c, 0, "medieval manuscripts were copied by monks", 0.7),
+        ];
+        let ordered = mmr_reorder(results, 1.0);
+        assert_eq!(ordered[0].page_id, a);
+        assert_eq!(ordered[1].page_id, b);
+        assert_eq!(ordered[2].page_id, c);
+    }
+
+    #[test]
+    fn mmr_promotes_diverse_hit_over_redundant_one() {
+        let (a, b, c) = (PageId::new(), PageId::new(), PageId::new());
+        // b overlaps heavily with a (but below the 0.85 hard filter);
+        // c is unrelated and slightly lower-scored than b.
+        let results = vec![
+            hit(a, 0, "solar panels convert sunlight into electricity", 0.9),
+            hit(
+                b,
+                0,
+                "solar panels convert sunlight into usable current",
+                0.85,
+            ),
+            hit(c, 0, "medieval manuscripts were copied by monks", 0.8),
+        ];
+        let ordered = mmr_reorder(results, 0.5);
+        assert_eq!(ordered[0].page_id, a, "top hit unchanged");
+        assert_eq!(
+            ordered[1].page_id, c,
+            "diverse hit should outrank the redundant one"
+        );
+        assert_eq!(ordered[2].page_id, b);
+    }
+
+    #[test]
+    fn mmr_handles_tiny_inputs() {
+        assert!(mmr_reorder(Vec::new(), 0.5).is_empty());
+        let id = PageId::new();
+        let one = mmr_reorder(vec![hit(id, 0, "only", 1.0)], 0.5);
+        assert_eq!(one.len(), 1);
     }
 }

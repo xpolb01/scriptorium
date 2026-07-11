@@ -129,9 +129,28 @@ fn is_ingestable_source(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
         return false;
     };
+    // Everything the extract router can handle (binary formats included) —
+    // extraction failures surface as ingest errors, not watcher crashes.
+    // `.extracted.md` siblings of converted binaries are our own writes.
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".extracted.md"))
+    {
+        return false;
+    }
     matches!(
         ext.to_ascii_lowercase().as_str(),
-        "md" | "markdown" | "txt" | "text"
+        "md" | "markdown"
+            | "txt"
+            | "text"
+            | "pdf"
+            | "docx"
+            | "pptx"
+            | "xlsx"
+            | "epub"
+            | "html"
+            | "htm"
     )
 }
 
@@ -150,9 +169,22 @@ mod tests {
         std::fs::write(&txt, "body").unwrap();
         assert!(is_ingestable_source(&txt));
 
+        // Binary formats route through the extract router since the
+        // format-router change — the watcher accepts them now.
         let pdf = dir.path().join("baz.pdf");
         std::fs::write(&pdf, "body").unwrap();
-        assert!(!is_ingestable_source(&pdf));
+        assert!(is_ingestable_source(&pdf));
+
+        // Extracted-text siblings of converted binaries are our own
+        // writes and must not re-trigger ingest.
+        let sibling = dir.path().join("baz.pdf.extracted.md");
+        std::fs::write(&sibling, "body").unwrap();
+        assert!(!is_ingestable_source(&sibling));
+
+        // Unknown binary formats stay rejected.
+        let zip = dir.path().join("qux.zip");
+        std::fs::write(&zip, "body").unwrap();
+        assert!(!is_ingestable_source(&zip));
 
         // Non-existent path is not ingestable.
         assert!(!is_ingestable_source(&dir.path().join("missing.md")));

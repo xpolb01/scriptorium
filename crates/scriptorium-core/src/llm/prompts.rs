@@ -124,6 +124,16 @@ pub struct IngestPageAction {
     pub tags: Vec<String>,
     /// Markdown body of the page (no frontmatter — the engine writes that).
     pub body: String,
+    /// Short verbatim quote from the source that best supports this page's
+    /// key claims. Stored as span-level provenance in the page frontmatter
+    /// and lint-checked against the source file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_quote: Option<String>,
+    /// Stems of existing pages this page supersedes (replaces as current
+    /// understanding). The engine records `supersedes` here and marks each
+    /// target page `superseded_by` this page's stem.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
 }
 
 /// Lenient wire shape for [`IngestPageAction`]. Accepts both the canonical
@@ -143,6 +153,10 @@ struct IngestPageActionRaw {
     body: String,
     #[serde(default)]
     frontmatter: Option<IngestPageFrontmatter>,
+    #[serde(default)]
+    source_quote: Option<String>,
+    #[serde(default)]
+    supersedes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -169,6 +183,8 @@ impl TryFrom<IngestPageActionRaw> for IngestPageAction {
             title,
             tags,
             body: r.body,
+            source_quote: r.source_quote,
+            supersedes: r.supersedes,
         })
     }
 }
@@ -386,6 +402,13 @@ pub fn ingest_prompt_with_learnings(
          Follow the vault schema below exactly. Never fabricate facts — cite \
          only what is in the source. Prefer updating an existing page over \
          creating a duplicate.\n\n\
+         For each page, set `source_quote` to a short verbatim quote from \
+         the source (<=40 words) that best supports the page's key claims — \
+         copy it exactly, it is verified mechanically. If a page REPLACES \
+         the current understanding held by existing pages (not merely adds \
+         to it), list those page stems in `supersedes`; the engine will \
+         mark them superseded. Use `supersedes` sparingly — updates in \
+         place are usually right.\n\n\
          If the retrieved pages already cover everything in the source — i.e. \
          the source contains no information not already present in the wiki — \
          set `redundant: true` and leave `pages` empty. The source will still \
@@ -422,7 +445,9 @@ pub fn ingest_prompt_with_learnings(
                \"path\": \"wiki/<type>/<stem>.md\",\n\
                \"title\": \"<human title>\",\n\
                \"tags\": [\"<type-tag>\", \"domain/<...>\", \"status/draft\"],\n\
-               \"body\": \"<markdown without frontmatter>\"\n\
+               \"body\": \"<markdown without frontmatter>\",\n\
+               \"source_quote\": \"<short verbatim quote from the source>\",\n\
+               \"supersedes\": [\"<stem>\", ...]  // usually []\n\
              }}\n\
            ],\n\
            \"log_entry\": \"<one line for log.md>\"\n\
@@ -553,6 +578,8 @@ mod tests {
                 title: "Attention".into(),
                 tags: vec!["concept".into()],
                 body: "body\n".into(),
+                source_quote: None,
+                supersedes: vec![],
             }],
             log_entry: "[2026-04-06] ingest | attention source".into(),
             redundant: false,
@@ -667,6 +694,8 @@ mod tests {
                 title: "A".into(),
                 tags: vec![],
                 body: "x".into(),
+                source_quote: None,
+                supersedes: vec![],
             }],
         );
         assert!(entry.contains("Cross-system survey"));

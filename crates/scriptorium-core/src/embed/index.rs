@@ -62,6 +62,27 @@ pub async fn embed_page(
     page: &Page,
     strategy: ChunkStrategy,
 ) -> Result<usize> {
+    embed_page_contextual(store, provider, model, page, strategy, None).await
+}
+
+/// Like [`embed_page`], with optional Anthropic-style contextual
+/// augmentation: when `chat` is provided, one LLM call per page writes a
+/// short "where this chunk sits in the document" header per chunk, and
+/// the header is prepended to the chunk text before embedding *and*
+/// before FTS indexing (both retrieval paths benefit).
+///
+/// Augmentation is strictly best-effort — any failure falls back to the
+/// plain chunks. Note the embeddings cache keys on the page content hash,
+/// so toggling contextual mode on requires a rebuild (`reindex --rebuild`)
+/// to take effect for already-embedded pages.
+pub async fn embed_page_contextual(
+    store: &EmbeddingsStore,
+    provider: &dyn LlmProvider,
+    model: &str,
+    page: &Page,
+    strategy: ChunkStrategy,
+    chat: Option<&dyn LlmProvider>,
+) -> Result<usize> {
     let hash = page.content_hash()?;
     if store.has_page_version(page.frontmatter.id, &hash, provider.name(), model)? {
         debug!(page = %page.path, "embed cache hit");
@@ -77,7 +98,28 @@ pub async fn embed_page(
     if chunks.is_empty() {
         return Ok(0);
     }
-    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+
+    // Optional contextual headers. Single-chunk pages need no situating.
+    let texts: Vec<String> = match chat {
+        Some(chat_provider) if chunks.len() >= 2 => {
+            match contextualize_chunks(chat_provider, &page.frontmatter.title, &chunks).await {
+                Some(contexts) => chunks
+                    .iter()
+                    .zip(contexts)
+                    .map(|(c, ctx)| {
+                        if ctx.trim().is_empty() {
+                            c.text.clone()
+                        } else {
+                            format!("{}\n\n{}", ctx.trim(), c.text)
+                        }
+                    })
+                    .collect(),
+                None => chunks.iter().map(|c| c.text.clone()).collect(),
+            }
+        }
+        _ => chunks.iter().map(|c| c.text.clone()).collect(),
+    };
+
     let vectors = provider
         .embed(&texts)
         .await
@@ -89,12 +131,12 @@ pub async fn embed_page(
             chunks.len()
         )));
     }
-    for (chunk, vector) in chunks.iter().zip(vectors.into_iter()) {
+    for ((chunk, vector), text) in chunks.iter().zip(vectors).zip(texts.iter()) {
         store.upsert(&EmbeddingRow {
             page_id: page.frontmatter.id,
             content_hash: hash.clone(),
             chunk_idx: chunk.idx,
-            chunk_text: chunk.text.clone(),
+            chunk_text: text.clone(),
             heading: chunk.heading.clone(),
             provider: provider.name().to_string(),
             model: model.to_string(),
@@ -102,6 +144,70 @@ pub async fn embed_page(
         })?;
     }
     Ok(chunks.len())
+}
+
+/// One LLM call producing a short situating context per chunk (Anthropic
+/// contextual-retrieval pattern). Returns `None` on any failure or count
+/// mismatch; the caller falls back to plain chunks.
+async fn contextualize_chunks(
+    chat: &dyn LlmProvider,
+    page_title: &str,
+    chunks: &[Chunk],
+) -> Option<Vec<String>> {
+    use crate::llm::{CompletionRequest, Message, Role};
+    #[derive(serde::Deserialize)]
+    struct Contexts {
+        contexts: Vec<String>,
+    }
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "contexts": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "One 1-2 sentence situating context per chunk, same order."
+            }
+        },
+        "required": ["contexts"],
+        "additionalProperties": false
+    });
+    let mut listing = String::new();
+    for (i, c) in chunks.iter().enumerate() {
+        use std::fmt::Write as _;
+        let preview: String = c.text.chars().take(600).collect();
+        let _ = writeln!(listing, "--- chunk {i} ---\n{preview}");
+    }
+    let req = CompletionRequest {
+        system: "For each chunk of the document, write a succinct 1-2 sentence \
+                 context situating it within the whole document (what it is \
+                 about, which entity/section it belongs to). The context is \
+                 prepended to the chunk to improve search retrieval. Return \
+                 JSON with exactly one context per chunk, in order."
+            .to_string(),
+        messages: vec![Message {
+            role: Role::User,
+            content: format!("Document: {page_title}\n\n{listing}"),
+        }],
+        // Generous budget — reasoning-heavy proxy routes spend completion
+        // tokens before the JSON (see eval::faithfulness).
+        max_tokens: 4096,
+        temperature: Some(0.0),
+        response_schema: Some(schema),
+    };
+    let resp = chat.complete(req).await.ok()?;
+    let payload = crate::llm::extract_json_payload(&resp.text);
+    let parsed: Contexts = serde_json::from_str(&payload).ok()?;
+    if parsed.contexts.len() == chunks.len() {
+        debug!(page = page_title, "contextual headers generated");
+        Some(parsed.contexts)
+    } else {
+        debug!(
+            got = parsed.contexts.len(),
+            want = chunks.len(),
+            "contextual header count mismatch, falling back"
+        );
+        None
+    }
 }
 
 /// Walk the vault and reconcile the embeddings store with the current
@@ -139,6 +245,19 @@ pub async fn reindex_with_strategy(
     model: &str,
     strategy: ChunkStrategy,
 ) -> Result<usize> {
+    reindex_contextual(vault, store, provider, model, strategy, None).await
+}
+
+/// Like [`reindex_with_strategy`], with optional contextual chunk
+/// augmentation via `chat` (see [`embed_page_contextual`]).
+pub async fn reindex_contextual(
+    vault: &Vault,
+    store: &EmbeddingsStore,
+    provider: &dyn LlmProvider,
+    model: &str,
+    strategy: ChunkStrategy,
+    chat: Option<&dyn LlmProvider>,
+) -> Result<usize> {
     let scan = vault.scan()?;
     let mut total = 0;
 
@@ -155,7 +274,7 @@ pub async fn reindex_with_strategy(
     // `has_page_version` to decide cache-hit/miss; for unchanged pages
     // this is an indexed lookup, no embedding work.
     for page in &scan.pages {
-        total += embed_page(store, provider, model, page, strategy).await?;
+        total += embed_page_contextual(store, provider, model, page, strategy, chat).await?;
     }
 
     // Phase 2: prune orphan rows. Any row whose (page_id, content_hash)

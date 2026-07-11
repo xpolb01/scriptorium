@@ -66,7 +66,7 @@ async fn try_semantic(
     let mut idx = 0usize;
 
     for section in &sections {
-        let sentences = split_sentences(&section.text);
+        let sentences = split_sentences_atomic(&section.text);
         if sentences.len() < MIN_SENTENCES {
             // Too few sentences — use recursive for this section.
             let recursive = chunk_page_recursive(&section.text, max_chars);
@@ -142,6 +142,24 @@ async fn try_semantic(
     }
 
     Ok(out)
+}
+
+/// Sentence units with atomic blocks (code fences, tables) kept whole:
+/// each atomic block becomes a single indivisible "sentence" so no topic
+/// boundary can land inside it.
+fn split_sentences_atomic(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for seg in super::atomic::segment_atomic(text) {
+        if seg.atomic {
+            let trimmed = seg.text.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed);
+            }
+        } else {
+            out.extend(split_sentences(seg.text));
+        }
+    }
+    out
 }
 
 /// Split text into sentences at `.!?` followed by whitespace.

@@ -38,6 +38,8 @@ pub struct ServerContext {
     pub llm_provider: Arc<dyn LlmProvider>,
     pub embed_provider: Arc<dyn LlmProvider>,
     pub embeddings_model: String,
+    /// Query-time retrieval options from `[search]` in `config.toml`.
+    pub search: scriptorium_core::config::SearchConfig,
 }
 
 /// JSON-RPC 2.0 request envelope. `id` is `None` for notifications.

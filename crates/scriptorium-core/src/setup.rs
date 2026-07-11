@@ -173,11 +173,13 @@ pub fn run_setup(
             provider: embed_provider.config_name().into(),
             model: embed_provider.default_embed_model().into(),
             chunk_strategy: ChunkStrategy::default(),
+            contextual: false,
         },
         git: GitConfig::default(),
         paths: PathsConfig::default(),
         hooks: HooksConfig::default(),
         meridian: meridian.clone(),
+        search: crate::config::SearchConfig::default(),
     };
 
     let config_path = vault.meta_dir().join("config.toml");

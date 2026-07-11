@@ -36,7 +36,16 @@ pub fn chunk_page_recursive(body: &str, max_chars: usize) -> Vec<Chunk> {
     let mut out = Vec::new();
     let mut idx = 0usize;
     for section in sections {
-        let pieces = recursive_split(&section.text, 0, max_chars);
+        // Atomic blocks (code fences, tables) pass through whole; only the
+        // prose between them enters the delimiter hierarchy.
+        let mut pieces = Vec::new();
+        for seg in super::atomic::segment_atomic(&section.text) {
+            if seg.atomic {
+                pieces.push(seg.text.to_string());
+            } else {
+                pieces.extend(recursive_split(seg.text, 0, max_chars));
+            }
+        }
         let merged = greedy_merge(&pieces, max_chars * 3 / 2);
         for text in merged {
             if !text.trim().is_empty() {
@@ -214,6 +223,43 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].heading.as_deref(), Some("Section A"));
         assert_eq!(chunks[1].heading.as_deref(), Some("Section B"));
+    }
+
+    #[test]
+    fn recursive_keeps_table_whole() {
+        use std::fmt::Write;
+        let mut body = String::from("Intro line one.\nIntro line two.\n\n| a | b |\n|---|---|\n");
+        for i in 0..12 {
+            let _ = writeln!(body, "| row_{i} | val_{i} |");
+        }
+        body.push_str("\nOutro sentence one. Outro sentence two.\n");
+        let chunks = chunk_page_recursive(&body, 80);
+        let with_rows: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.text.contains("| row_0 "))
+            .collect();
+        assert_eq!(with_rows.len(), 1);
+        assert!(
+            with_rows[0].text.contains("| row_11 "),
+            "table must not be split by the delimiter hierarchy"
+        );
+    }
+
+    #[test]
+    fn recursive_keeps_code_fence_whole() {
+        use std::fmt::Write;
+        let mut body = String::from("Some prose first.\n\n```python\n");
+        for i in 0..15 {
+            let _ = writeln!(body, "value_{i} = function_call({i})");
+        }
+        body.push_str("```\n\nAnd some prose after the block.\n");
+        let chunks = chunk_page_recursive(&body, 90);
+        let with_code: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.text.contains("value_0 = "))
+            .collect();
+        assert_eq!(with_code.len(), 1);
+        assert!(with_code[0].text.contains("value_14 = "));
     }
 
     #[test]

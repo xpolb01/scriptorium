@@ -65,6 +65,11 @@ pub struct BenchmarkResult {
     pub f1: f32,
     pub mrr: f32,
     pub ndcg: f32,
+    /// LLM-judged, reference-free context precision (only present when the
+    /// bench ran with a judge). Unlike `precision`, this needs no hand-
+    /// labeled `expected` stems.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judged_precision: Option<f32>,
 }
 
 /// Aggregate report over the full suite.
@@ -82,6 +87,69 @@ pub struct BenchmarkReport {
     pub coverage: f32,
     /// Stale page ratio (0.0–1.0) factored into health.
     pub stale_ratio: f32,
+    /// Mean LLM-judged context precision across cases (judge runs only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_judged_precision: Option<f32>,
+}
+
+/// One point in a retrieval parameter sweep.
+#[derive(Debug, Clone)]
+pub struct SweepPoint {
+    pub label: String,
+    pub expansion: bool,
+    pub mmr_lambda: f32,
+}
+
+/// The default sweep grid: expansion on/off × MMR on/off. Small on
+/// purpose — each point runs the whole suite (and expansion costs one
+/// LLM call per case).
+pub fn default_sweep_grid() -> Vec<SweepPoint> {
+    let mut grid = Vec::new();
+    for &expansion in &[false, true] {
+        for &mmr_lambda in &[1.0f32, 0.7] {
+            grid.push(SweepPoint {
+                label: format!(
+                    "expansion={} mmr={}",
+                    if expansion { "on" } else { "off" },
+                    if (mmr_lambda - 1.0).abs() < f32::EPSILON {
+                        "off"
+                    } else {
+                        "0.7"
+                    }
+                ),
+                expansion,
+                mmr_lambda,
+            });
+        }
+    }
+    grid
+}
+
+/// Run the benchmark suite once per sweep point, returning the labelled
+/// reports so retrieval settings can be compared on the same data.
+pub async fn sweep(
+    vault: &Vault,
+    store: &EmbeddingsStore,
+    embed_provider: &dyn LlmProvider,
+    llm_provider: &dyn LlmProvider,
+    model: &str,
+    grid: Vec<SweepPoint>,
+) -> Result<Vec<(SweepPoint, BenchmarkReport)>> {
+    let mut out = Vec::with_capacity(grid.len());
+    for point in grid {
+        let report = run_benchmarks_inner(
+            vault,
+            store,
+            embed_provider,
+            llm_provider,
+            model,
+            None,
+            Some(&point),
+        )
+        .await?;
+        out.push((point, report));
+    }
+    Ok(out)
 }
 
 /// Load the benchmark suite from `.scriptorium/benchmarks.json`.
@@ -121,16 +189,64 @@ pub async fn run_benchmarks(
     llm_provider: &dyn LlmProvider,
     model: &str,
 ) -> Result<BenchmarkReport> {
+    run_benchmarks_inner(
+        vault,
+        store,
+        embed_provider,
+        llm_provider,
+        model,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Run all benchmarks with an LLM judge grading each case's retrieved
+/// chunks for reference-free context precision (see
+/// [`crate::eval::judge_context_precision`]).
+pub async fn run_benchmarks_judged(
+    vault: &Vault,
+    store: &EmbeddingsStore,
+    embed_provider: &dyn LlmProvider,
+    llm_provider: &dyn LlmProvider,
+    judge_provider: &dyn LlmProvider,
+    model: &str,
+) -> Result<BenchmarkReport> {
+    run_benchmarks_inner(
+        vault,
+        store,
+        embed_provider,
+        llm_provider,
+        model,
+        Some(judge_provider),
+        None,
+    )
+    .await
+}
+
+async fn run_benchmarks_inner(
+    vault: &Vault,
+    store: &EmbeddingsStore,
+    embed_provider: &dyn LlmProvider,
+    llm_provider: &dyn LlmProvider,
+    model: &str,
+    judge_provider: Option<&dyn LlmProvider>,
+    point: Option<&SweepPoint>,
+) -> Result<BenchmarkReport> {
     let suite = load_suite(vault)?;
     let scan = vault.scan()?;
 
     let mut results = Vec::new();
     for case in &suite.benchmarks {
-        let opts = HybridSearchOpts {
+        let mut opts = HybridSearchOpts {
             top_k: case.k,
-            expansion: false, // Deterministic: no expansion during benchmarks.
+            expansion: false, // Deterministic by default: no expansion.
             ..HybridSearchOpts::with_top_k(case.k)
         };
+        if let Some(p) = point {
+            opts.expansion = p.expansion;
+            opts.dedup.mmr_lambda = p.mmr_lambda;
+        }
         let hits = search::hybrid_search(
             store,
             embed_provider,
@@ -142,24 +258,18 @@ pub async fn run_benchmarks(
         )
         .await?;
 
-        let retrieved_stems = extract_stems(&hits, &scan.pages);
-        let precision = precision_at_k(&retrieved_stems, &case.expected, case.k);
-        let recall = recall_score(&retrieved_stems, &case.expected);
-        let f1 = f1_score(precision, recall);
-        let mrr = mean_reciprocal_rank(&retrieved_stems, &case.expected);
-        let ndcg = ndcg_at_k(&retrieved_stems, &case.expected, case.k);
+        // Optional reference-free grading of the retrieved chunks.
+        // Best-effort: a judge failure leaves the field empty rather than
+        // failing the whole bench run.
+        let judged_precision = match judge_provider {
+            Some(judge) => crate::eval::judge_context_precision(judge, &case.query, &hits)
+                .await
+                .ok()
+                .and_then(|r| r.score),
+            None => None,
+        };
 
-        results.push(BenchmarkResult {
-            query: case.query.clone(),
-            expected: case.expected.clone(),
-            retrieved: retrieved_stems,
-            k: case.k,
-            precision,
-            recall,
-            f1,
-            mrr,
-            ndcg,
-        });
+        results.push(score_case(case, &hits, &scan.pages, judged_precision));
     }
 
     let (mean_precision, mean_recall, mean_f1, mean_mrr, mean_ndcg) = if results.is_empty() {
@@ -174,6 +284,14 @@ pub async fn run_benchmarks(
             results.iter().map(|r| r.mrr).sum::<f32>() / n,
             results.iter().map(|r| r.ndcg).sum::<f32>() / n,
         )
+    };
+
+    let judged: Vec<f32> = results.iter().filter_map(|r| r.judged_precision).collect();
+    #[allow(clippy::cast_precision_loss)]
+    let mean_judged_precision = if judged.is_empty() {
+        None
+    } else {
+        Some(judged.iter().sum::<f32>() / judged.len() as f32)
     };
 
     // Compute coverage and stale ratio from vault state.
@@ -219,7 +337,35 @@ pub async fn run_benchmarks(
         health_score,
         coverage,
         stale_ratio,
+        mean_judged_precision,
     })
+}
+
+/// Score one benchmark case against its retrieved hits.
+fn score_case(
+    case: &BenchmarkCase,
+    hits: &[SearchHit],
+    pages: &[Page],
+    judged_precision: Option<f32>,
+) -> BenchmarkResult {
+    let retrieved_stems = extract_stems(hits, pages);
+    let precision = precision_at_k(&retrieved_stems, &case.expected, case.k);
+    let recall = recall_score(&retrieved_stems, &case.expected);
+    let f1 = f1_score(precision, recall);
+    let mrr = mean_reciprocal_rank(&retrieved_stems, &case.expected);
+    let ndcg = ndcg_at_k(&retrieved_stems, &case.expected, case.k);
+    BenchmarkResult {
+        query: case.query.clone(),
+        expected: case.expected.clone(),
+        retrieved: retrieved_stems,
+        k: case.k,
+        precision,
+        recall,
+        f1,
+        mrr,
+        ndcg,
+        judged_precision,
+    }
 }
 
 /// Extract page stems from search hits using the already-scanned page set.

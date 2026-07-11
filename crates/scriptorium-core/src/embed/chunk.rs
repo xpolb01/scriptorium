@@ -53,22 +53,30 @@ pub(crate) struct Section {
 
 /// Split a body into heading-delimited sections. Reused by the recursive
 /// and semantic chunkers to preserve heading context.
+///
+/// Fence-aware: a `## `-looking line inside a fenced code block is content,
+/// not a section boundary.
 pub(crate) fn split_into_sections(body: &str) -> Vec<Section> {
     let mut sections: Vec<Section> = Vec::new();
     let mut current_heading: Option<String> = None;
     let mut current_text = String::new();
+    let mut in_fence = false;
 
     for line in body.split_inclusive('\n') {
-        if let Some(new_heading) = heading_text(line) {
-            if current_text.trim().is_empty() {
-                current_text.clear();
-            } else {
-                sections.push(Section {
-                    heading: current_heading.clone(),
-                    text: std::mem::take(&mut current_text),
-                });
+        if is_fence_delimiter(line) {
+            in_fence = !in_fence;
+        } else if !in_fence {
+            if let Some(new_heading) = heading_text(line) {
+                if current_text.trim().is_empty() {
+                    current_text.clear();
+                } else {
+                    sections.push(Section {
+                        heading: current_heading.clone(),
+                        text: std::mem::take(&mut current_text),
+                    });
+                }
+                current_heading = Some(new_heading);
             }
-            current_heading = Some(new_heading);
         }
         current_text.push_str(line);
     }
@@ -79,6 +87,11 @@ pub(crate) fn split_into_sections(body: &str) -> Vec<Section> {
         });
     }
     sections
+}
+
+fn is_fence_delimiter(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
 }
 
 pub(crate) fn heading_text(line: &str) -> Option<String> {
@@ -106,29 +119,51 @@ fn split_by_paragraph(text: &str, max_chars: usize) -> Vec<String> {
     if text.chars().count() <= max_chars {
         return vec![text.to_string()];
     }
+    // Indivisible packing units: atomic blocks (code fences, tables) whole;
+    // ordinary prose cut after each paragraph gap. The units are a contiguous
+    // cover of `text`, so greedy packing is lossless.
+    let mut units: Vec<(String, bool)> = Vec::new();
+    for seg in super::atomic::segment_atomic(text) {
+        if seg.atomic {
+            units.push((seg.text.to_string(), true));
+        } else {
+            let mut rest = seg.text;
+            while let Some(pos) = rest.find("\n\n") {
+                let cut = pos + 2;
+                units.push((rest[..cut].to_string(), false));
+                rest = &rest[cut..];
+            }
+            if !rest.is_empty() {
+                units.push((rest.to_string(), false));
+            }
+        }
+    }
+
     let mut out: Vec<String> = Vec::new();
     let mut buf = String::new();
-    for para in text.split("\n\n") {
-        let para_with_sep = if buf.is_empty() {
-            para.to_string()
-        } else {
-            format!("\n\n{para}")
-        };
-        if buf.chars().count() + para_with_sep.chars().count() > max_chars && !buf.is_empty() {
+    for (unit, atomic) in units {
+        let unit_len = unit.chars().count();
+        if unit_len > max_chars {
+            if !buf.is_empty() {
+                out.push(std::mem::take(&mut buf));
+            }
+            if atomic {
+                // Never split a table or code block, even over budget.
+                out.push(unit);
+            } else {
+                out.extend(split_by_chars(&unit, max_chars));
+            }
+            continue;
+        }
+        if !buf.is_empty() && buf.chars().count() + unit_len > max_chars {
             out.push(std::mem::take(&mut buf));
         }
-        buf.push_str(&para_with_sep);
-        if buf.chars().count() > max_chars {
-            // A single paragraph larger than the budget: split on chars.
-            for window in split_by_chars(&buf, max_chars) {
-                out.push(window);
-            }
-            buf.clear();
-        }
+        buf.push_str(&unit);
     }
     if !buf.is_empty() {
         out.push(buf);
     }
+    out.retain(|c| !c.trim().is_empty());
     out
 }
 
@@ -205,5 +240,55 @@ mod tests {
         let body = "# Title\n\nIntro.\n\n#### Deep\n\nstill grouped.\n";
         let chunks = chunk_page(body, 1000);
         assert_eq!(chunks.len(), 1, "no H2/H3 → one chunk");
+    }
+
+    #[test]
+    fn fake_heading_inside_fence_is_not_a_boundary() {
+        let body = "## Real\n\nProse.\n\n```md\n## fake heading in code\n```\n\nMore prose.\n";
+        let chunks = chunk_page(body, 1000);
+        assert_eq!(chunks.len(), 1, "fence content must not split sections");
+        assert_eq!(chunks[0].heading.as_deref(), Some("Real"));
+        assert!(chunks[0].text.contains("## fake heading in code"));
+    }
+
+    #[test]
+    fn table_is_never_split_across_chunks() {
+        // A table larger than the budget must stay in one chunk.
+        let mut body = String::from("## Data\n\nIntro paragraph.\n\n");
+        body.push_str("| col_a | col_b |\n|---|---|\n");
+        for i in 0..12 {
+            let _ = writeln!(body, "| value_{i} | detail_{i} |");
+        }
+        body.push_str("\nTrailing prose paragraph that adds more length.\n");
+        let chunks = chunk_page(&body, 120);
+        let with_rows: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.text.contains("| value_0 "))
+            .collect();
+        assert_eq!(with_rows.len(), 1);
+        assert!(
+            with_rows[0].text.contains("| value_11 "),
+            "first and last row must share a chunk; got: {:?}",
+            with_rows[0].text
+        );
+    }
+
+    #[test]
+    fn code_fence_is_never_split_across_chunks() {
+        let mut body = String::from("## Code\n\nIntro.\n\n```rust\n");
+        for i in 0..15 {
+            let _ = writeln!(body, "let variable_number_{i} = compute({i});");
+        }
+        body.push_str("```\n\nOutro paragraph.\n");
+        let chunks = chunk_page(&body, 100);
+        let with_code: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.text.contains("let variable_number_0 "))
+            .collect();
+        assert_eq!(with_code.len(), 1);
+        assert!(
+            with_code[0].text.contains("let variable_number_14 "),
+            "whole fence must stay together"
+        );
     }
 }

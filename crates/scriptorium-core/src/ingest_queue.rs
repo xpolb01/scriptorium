@@ -1010,6 +1010,8 @@ mod tests {
                 title: "Dedup Target".into(),
                 tags: vec![],
                 body: "Body without wikilinks.\n".into(),
+                source_quote: None,
+                supersedes: vec![],
             }],
             log_entry: "drain ingest".into(),
             redundant: false,
@@ -1069,7 +1071,11 @@ mod tests {
         let (dir, vault) = make_ingest_vault();
         let sessions_dir = dir.path().join("sources").join("sessions");
         fs::create_dir_all(&sessions_dir).unwrap();
-        let src = write_source(&sessions_dir, "2026-05-27-session-abcd1234.md", "unique body for cleanup test\n");
+        let src = write_source(
+            &sessions_dir,
+            "2026-05-27-session-abcd1234.md",
+            "unique body for cleanup test\n",
+        );
 
         enqueue(&vault, &src, Some("cleanup-test")).unwrap();
         assert!(src.exists(), "source should exist before drain");
@@ -1080,7 +1086,10 @@ mod tests {
         };
         let report = drain(&vault, &ingest_plan_mock(), cfg).await.unwrap();
         assert_eq!(report.ingested, 1);
-        assert!(!src.exists(), "session source should be deleted after drain ingest");
+        assert!(
+            !src.exists(),
+            "session source should be deleted after drain ingest"
+        );
     }
 
     #[tokio::test]

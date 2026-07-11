@@ -45,7 +45,32 @@ pub async fn reindex_all(
     embed_provider: &dyn LlmProvider,
     embed_model: &str,
 ) -> Result<ReindexReport> {
-    let embeddings_written = embed::reindex(vault, store, embed_provider, embed_model).await?;
+    reindex_all_with(vault, store, embed_provider, embed_model, None, false).await
+}
+
+/// Like [`reindex_all`], with the contextual-retrieval chat provider and
+/// an optional full rebuild (drop all cached rows first, so strategy or
+/// contextual-mode changes actually re-embed).
+pub async fn reindex_all_with(
+    vault: &Vault,
+    store: &EmbeddingsStore,
+    embed_provider: &dyn LlmProvider,
+    embed_model: &str,
+    contextual_chat: Option<&dyn LlmProvider>,
+    rebuild: bool,
+) -> Result<ReindexReport> {
+    if rebuild {
+        store.retain_page_versions(&[])?;
+    }
+    let embeddings_written = embed::reindex_contextual(
+        vault,
+        store,
+        embed_provider,
+        embed_model,
+        crate::config::ChunkStrategy::default(),
+        contextual_chat,
+    )
+    .await?;
 
     // Regenerate index.md if it differs from the on-disk version. This is a
     // standalone commit (the embed step doesn't touch git at all). We bypass

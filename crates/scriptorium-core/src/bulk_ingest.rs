@@ -133,6 +133,7 @@ pub async fn bulk_ingest_with_retrieval(
     let ingest_opts = ingest::IngestOptions {
         dry_run: options.dry_run,
         hooks: None, // bulk ingest doesn't fire per-file hooks
+        force: false,
     };
 
     for (i, file_path) in files.iter().enumerate() {
