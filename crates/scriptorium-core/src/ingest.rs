@@ -574,13 +574,15 @@ fn unlink_unresolvable(body: &str, valid_stems: &std::collections::HashSet<Strin
             .expect("unlink_unresolvable regex is valid")
     });
     re.replace_all(body, |caps: &regex::Captures<'_>| {
-        // Trim whitespace and stray trailing backslashes — LLMs sometimes
-        // emit `[[target\]]` as an escaping artifact (observed live).
+        // Repair common LLM link artifacts before validating (all observed
+        // live): stray trailing backslash escapes (`[[target\]]`) and `.md`
+        // extensions on the stem (`[[target.md]]`).
         let target = caps
             .get(1)
             .map_or("", |m| m.as_str())
             .trim()
             .trim_end_matches('\\');
+        let target = target.strip_suffix(".md").unwrap_or(target);
         let display = caps.get(4).map_or(target, |m| m.as_str());
         if valid_stems.contains(&target.to_lowercase()) {
             match caps.get(4) {
@@ -1207,6 +1209,14 @@ mod tests {
         let body = r"See [[palantir\]] for context.";
         let out = unlink_unresolvable(body, &valid);
         assert_eq!(out, "See [[palantir]] for context.");
+    }
+
+    #[test]
+    fn unlink_unresolvable_strips_md_extension() {
+        let mut valid = std::collections::HashSet::new();
+        valid.insert("openai".to_string());
+        let out = unlink_unresolvable("See [[openai.md]] and [[missing.md]].", &valid);
+        assert_eq!(out, "See [[openai]] and missing.");
     }
 
     #[test]
