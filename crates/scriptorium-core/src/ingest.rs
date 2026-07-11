@@ -355,6 +355,9 @@ pub async fn ingest_with_retrieval(
         } else {
             let sibling = Utf8PathBuf::from(format!("{interned}.extracted.md"));
             tx.put_file(&sibling, source_text.clone())?;
+            if let Ok(raw_text) = String::from_utf8(raw.clone()) {
+                tx.put_file(&interned, raw_text)?;
+            }
         }
         tx.append(
             Utf8Path::new("log.md"),
@@ -419,8 +422,14 @@ pub async fn ingest_with_retrieval(
     if converter.is_none() {
         tx.put_file(&interned, source_text.clone())?;
     } else {
+        // Converted sources: stage the extracted text as a sibling, and —
+        // when the raw source is itself valid UTF-8 (html) — stage the raw
+        // file too so the cited source is git-tracked, not just on disk.
         let sibling = Utf8PathBuf::from(format!("{interned}.extracted.md"));
         tx.put_file(&sibling, source_text.clone())?;
+        if let Ok(raw_text) = String::from_utf8(raw.clone()) {
+            tx.put_file(&interned, raw_text)?;
+        }
     }
 
     // Pages superseded by this plan get a `superseded_by` marker (their
