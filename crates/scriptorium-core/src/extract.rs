@@ -147,13 +147,7 @@ fn tool_on_path(name: &str) -> bool {
     // `--help`-probing is slow; `which`-style PATH scan is enough and
     // avoids running the tool at detection time.
     std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| {
-                let candidate = dir.join(name);
-                candidate.is_file()
-            })
-        })
-        .unwrap_or(false)
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
 }
 
 // ---------- near-duplicate detection (pre-LLM ingest gate) ----------

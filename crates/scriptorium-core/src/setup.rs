@@ -173,6 +173,7 @@ pub fn run_setup(
             provider: embed_provider.config_name().into(),
             model: embed_provider.default_embed_model().into(),
             chunk_strategy: ChunkStrategy::default(),
+            contextual: false,
         },
         git: GitConfig::default(),
         paths: PathsConfig::default(),

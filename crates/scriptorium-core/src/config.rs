@@ -160,6 +160,12 @@ pub struct EmbeddingsConfig {
     /// Chunking strategy. Defaults to "heading" (H2/H3 boundary splitting).
     #[serde(default)]
     pub chunk_strategy: ChunkStrategy,
+    /// Anthropic-style contextual retrieval: prepend an LLM-written
+    /// situating header to each chunk before embedding and FTS indexing.
+    /// Costs one chat call per page at (re)index time. Enabling this for
+    /// an existing store requires `scriptorium reindex --rebuild`.
+    #[serde(default)]
+    pub contextual: bool,
 }
 
 impl Default for EmbeddingsConfig {
@@ -168,6 +174,7 @@ impl Default for EmbeddingsConfig {
             provider: "mock".into(),
             model: "fixture".into(),
             chunk_strategy: ChunkStrategy::default(),
+            contextual: false,
         }
     }
 }

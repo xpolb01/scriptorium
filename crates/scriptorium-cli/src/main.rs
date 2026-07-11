@@ -106,6 +106,11 @@ enum Command {
         /// Override the provider declared in config.
         #[arg(long, value_enum)]
         provider: Option<ProviderKind>,
+        /// Drop all cached embedding rows first and re-embed everything.
+        /// Required once after changing the chunk strategy or enabling
+        /// `[embeddings] contextual`.
+        #[arg(long)]
+        rebuild: bool,
     },
 
     /// Run mechanical lint rules and print the report.
@@ -904,7 +909,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     }
                     Ok(ExitCode::SUCCESS)
                 }
-                Command::Reindex { provider } => {
+                Command::Reindex { provider, rebuild } => {
                     let vault = open_vault(&vault_path)?;
                     let cfg = load_config(&vault);
                     // reindex uses the embeddings provider, not the chat provider.
@@ -912,11 +917,19 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     let embed_provider =
                         build_provider(provider.unwrap_or_else(|| embed_provider_from(&cfg)))?;
                     let store = open_store(&vault)?;
-                    let report = core::reindex::reindex_all(
+                    // Contextual retrieval needs the chat provider at index time.
+                    let contextual_chat = if cfg.embeddings.contextual {
+                        Some(build_chat_provider(provider_from(&cfg), &cfg)?)
+                    } else {
+                        None
+                    };
+                    let report = core::reindex::reindex_all_with(
                         &vault,
                         &store,
                         embed_provider.as_ref(),
                         &cfg.embeddings.model,
+                        contextual_chat.as_deref(),
+                        rebuild,
                     )
                     .await
                     .into_diagnostic()?;
