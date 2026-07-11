@@ -18,6 +18,7 @@
 pub mod bench;
 pub mod bulk_ingest;
 pub mod config;
+pub mod consolidate;
 pub mod doctor;
 pub mod embed;
 pub mod error;

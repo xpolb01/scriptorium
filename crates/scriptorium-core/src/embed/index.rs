@@ -131,7 +131,7 @@ pub async fn embed_page_contextual(
             chunks.len()
         )));
     }
-    for ((chunk, vector), text) in chunks.iter().zip(vectors.into_iter()).zip(texts.iter()) {
+    for ((chunk, vector), text) in chunks.iter().zip(vectors).zip(texts.iter()) {
         store.upsert(&EmbeddingRow {
             page_id: page.frontmatter.id,
             content_hash: hash.clone(),
@@ -155,6 +155,10 @@ async fn contextualize_chunks(
     chunks: &[Chunk],
 ) -> Option<Vec<String>> {
     use crate::llm::{CompletionRequest, Message, Role};
+    #[derive(serde::Deserialize)]
+    struct Contexts {
+        contexts: Vec<String>,
+    }
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
@@ -190,10 +194,6 @@ async fn contextualize_chunks(
         temperature: Some(0.0),
         response_schema: Some(schema),
     };
-    #[derive(serde::Deserialize)]
-    struct Contexts {
-        contexts: Vec<String>,
-    }
     let resp = chat.complete(req).await.ok()?;
     let payload = crate::llm::extract_json_payload(&resp.text);
     let parsed: Contexts = serde_json::from_str(&payload).ok()?;

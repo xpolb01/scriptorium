@@ -250,6 +250,25 @@ enum Command {
         provider: Option<ProviderKind>,
     },
 
+    /// Find near-duplicate wiki pages (batched embedding similarity) and,
+    /// with --apply, merge each group into its longest member; absorbed
+    /// pages become `Merged into [[survivor]]` redirect stubs. Dry-run by
+    /// default; one commit per applied run (`scriptorium undo` reverts).
+    Consolidate {
+        /// Cosine-similarity threshold for grouping (0–1).
+        #[arg(long, default_value_t = 0.90)]
+        threshold: f32,
+        /// Actually merge (default is report-only).
+        #[arg(long)]
+        apply: bool,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Override the provider declared in config.
+        #[arg(long, value_enum)]
+        provider: Option<ProviderKind>,
+    },
+
     /// Audit wiki pages against their own interned sources: an LLM judge
     /// decomposes each page into claims and verifies every claim against
     /// the sources the page cites. Catches curation-time hallucination.
@@ -691,6 +710,7 @@ fn command_name_for_span(cmd: &Command) -> &'static str {
         Command::Skill(_) => "skill",
         Command::Learn(_) => "learn",
         Command::Bench { .. } => "bench",
+        Command::Consolidate { .. } => "consolidate",
         Command::Audit { .. } => "audit",
         Command::Serve { .. } => "serve",
         Command::Watch { .. } => "watch",
@@ -1435,6 +1455,59 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                             println!("  Judged ctx-precision: {judged:.2} (LLM, reference-free)");
                         }
                         println!("  Health score:   {:.1}/10", report.health_score);
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Consolidate {
+                    threshold,
+                    apply,
+                    json,
+                    provider,
+                } => {
+                    let vault = open_vault(&vault_path)?;
+                    let cfg = load_config(&vault);
+                    let chat =
+                        build_chat_provider(provider.unwrap_or_else(|| provider_from(&cfg)), &cfg)?;
+                    let embed = build_provider(embed_provider_from(&cfg))?;
+                    let report = scriptorium_core::consolidate::consolidate(
+                        &vault,
+                        chat.as_ref(),
+                        embed.as_ref(),
+                        threshold,
+                        apply,
+                    )
+                    .await
+                    .into_diagnostic()?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report)
+                                .map_err(|e| miette!("json: {e}"))?
+                        );
+                    } else if report.groups.is_empty() {
+                        println!("No near-duplicate page groups at threshold {threshold:.2}.");
+                    } else {
+                        println!("Near-duplicate groups (threshold {threshold:.2}):");
+                        for g in &report.groups {
+                            println!(
+                                "  [{}] min-similarity {:.2}",
+                                g.stems.join(", "),
+                                g.min_similarity
+                            );
+                        }
+                        if apply {
+                            println!(
+                                "\nmerged {} page(s){}",
+                                report.merged,
+                                report
+                                    .commit_id
+                                    .as_deref()
+                                    .map(|c| format!(", commit {c}"))
+                                    .unwrap_or_default()
+                            );
+                        } else {
+                            println!("\nDry run — re-run with --apply to merge.");
+                        }
                     }
                     Ok(ExitCode::SUCCESS)
                 }
