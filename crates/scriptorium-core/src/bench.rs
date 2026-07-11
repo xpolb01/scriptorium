@@ -269,25 +269,7 @@ async fn run_benchmarks_inner(
             None => None,
         };
 
-        let retrieved_stems = extract_stems(&hits, &scan.pages);
-        let precision = precision_at_k(&retrieved_stems, &case.expected, case.k);
-        let recall = recall_score(&retrieved_stems, &case.expected);
-        let f1 = f1_score(precision, recall);
-        let mrr = mean_reciprocal_rank(&retrieved_stems, &case.expected);
-        let ndcg = ndcg_at_k(&retrieved_stems, &case.expected, case.k);
-
-        results.push(BenchmarkResult {
-            query: case.query.clone(),
-            expected: case.expected.clone(),
-            retrieved: retrieved_stems,
-            k: case.k,
-            precision,
-            recall,
-            f1,
-            mrr,
-            ndcg,
-            judged_precision,
-        });
+        results.push(score_case(case, &hits, &scan.pages, judged_precision));
     }
 
     let (mean_precision, mean_recall, mean_f1, mean_mrr, mean_ndcg) = if results.is_empty() {
@@ -357,6 +339,33 @@ async fn run_benchmarks_inner(
         stale_ratio,
         mean_judged_precision,
     })
+}
+
+/// Score one benchmark case against its retrieved hits.
+fn score_case(
+    case: &BenchmarkCase,
+    hits: &[SearchHit],
+    pages: &[Page],
+    judged_precision: Option<f32>,
+) -> BenchmarkResult {
+    let retrieved_stems = extract_stems(hits, pages);
+    let precision = precision_at_k(&retrieved_stems, &case.expected, case.k);
+    let recall = recall_score(&retrieved_stems, &case.expected);
+    let f1 = f1_score(precision, recall);
+    let mrr = mean_reciprocal_rank(&retrieved_stems, &case.expected);
+    let ndcg = ndcg_at_k(&retrieved_stems, &case.expected, case.k);
+    BenchmarkResult {
+        query: case.query.clone(),
+        expected: case.expected.clone(),
+        retrieved: retrieved_stems,
+        k: case.k,
+        precision,
+        recall,
+        f1,
+        mrr,
+        ndcg,
+        judged_precision,
+    }
 }
 
 /// Extract page stems from search hits using the already-scanned page set.

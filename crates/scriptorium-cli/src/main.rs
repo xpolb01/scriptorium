@@ -1453,6 +1453,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     }
                     let mut all_reports = Vec::new();
                     let mut any_unsupported = false;
+                    let mut audit_errors = 0usize;
                     for p in &pages {
                         let stem = p.path.file_stem().unwrap_or("?").to_string();
                         match scriptorium_core::eval::curation_audit(&vault, llm.as_ref(), p).await
@@ -1488,6 +1489,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                                 }
                             }
                             Err(e) => {
+                                audit_errors += 1;
                                 if json {
                                     all_reports.push(serde_json::json!({
                                         "page": stem, "error": e.to_string(),
@@ -1504,7 +1506,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                             serde_json::to_string_pretty(&all_reports)
                                 .map_err(|e| miette!("json: {e}"))?
                         );
-                    } else if !any_unsupported {
+                    } else if audit_errors == pages.len() {
+                        println!("\nNo pages could be audited.");
+                    } else if !any_unsupported && audit_errors == 0 {
                         println!("\nAll audited claims are supported by their sources.");
                     }
                     Ok(ExitCode::SUCCESS)

@@ -12,11 +12,13 @@
 //!   cited ref *exists* in the retrieved set, not that it *supports* the
 //!   claim.
 
+use std::fmt::Write as _;
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::{Error, Result};
-use crate::llm::{complete_as, CompletionRequest, LlmProvider, Message, Role};
+use crate::llm::{CompletionRequest, LlmProvider, Message, Role};
 use crate::vault::{Page, Vault};
 
 /// Verdict for one atomic claim.
@@ -81,7 +83,7 @@ pub async fn judge_faithfulness(
         "required": ["claims"],
         "additionalProperties": false
     });
-    let req = CompletionRequest {
+    let build_req = |max_tokens: u32| CompletionRequest {
         system: "You are a strict fact-checking judge. Decompose the SUBJECT \
                  into its atomic factual claims (skip opinions, hedges, and \
                  meta-commentary). For each claim decide whether the CONTEXT \
@@ -94,14 +96,55 @@ pub async fn judge_faithfulness(
             role: Role::User,
             content: format!("CONTEXT:\n{context}\n\nSUBJECT:\n{subject}"),
         }],
-        max_tokens: 2048,
+        // Generous budget: proxies that route Claude via Vertex/Bedrock may
+        // spend completion tokens on internal reasoning before the JSON; a
+        // tight budget strangles the output into `{}` (observed live).
+        max_tokens,
         temperature: Some(0.0),
-        response_schema: Some(schema),
+        response_schema: Some(schema.clone()),
     };
-    let parsed: JudgeResponse = complete_as(provider, req)
+    let resp = provider
+        .complete(build_req(8192))
         .await
         .map_err(|e| Error::Other(anyhow::anyhow!("faithfulness judge: {e}")))?;
-    Ok(score_report(parsed.claims))
+    match parse_claims(&resp.text) {
+        Ok(claims) => Ok(score_report(claims)),
+        // Near-empty output almost always means the completion budget was
+        // eaten by proxy-side reasoning — retry once with a bigger budget.
+        Err(_) if resp.text.trim().len() < 10 => {
+            let resp = provider
+                .complete(build_req(16_384))
+                .await
+                .map_err(|e| Error::Other(anyhow::anyhow!("faithfulness judge (retry): {e}")))?;
+            let claims = parse_claims(&resp.text)?;
+            Ok(score_report(claims))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Parse the judge output, tolerating providers that return the bare
+/// claims array instead of the `{claims: [...]}` wrapper the schema asks
+/// for (observed with OpenAI-compatible proxies that pass the schema as a
+/// hint rather than enforcing it).
+fn parse_claims(text: &str) -> Result<Vec<ClaimVerdict>> {
+    let payload = crate::llm::extract_json_payload(text);
+    if let Ok(wrapper) = serde_json::from_str::<JudgeResponse>(&payload) {
+        return Ok(wrapper.claims);
+    }
+    // Fallback: outermost [...] span as a bare array.
+    let trimmed = text.trim();
+    if let (Some(start), Some(end)) = (trimmed.find('['), trimmed.rfind(']')) {
+        if end > start {
+            if let Ok(claims) = serde_json::from_str::<Vec<ClaimVerdict>>(&trimmed[start..=end]) {
+                return Ok(claims);
+            }
+        }
+    }
+    Err(Error::Other(anyhow::anyhow!(
+        "faithfulness judge returned unparseable output: {}",
+        text.chars().take(200).collect::<String>()
+    )))
 }
 
 fn score_report(claims: Vec<ClaimVerdict>) -> FaithfulnessReport {
@@ -132,7 +175,7 @@ pub async fn curation_audit(
         let path = vault.root().join(source);
         match std::fs::read_to_string(path.as_std_path()) {
             Ok(text) => {
-                context.push_str(&format!("=== {source} ===\n"));
+                let _ = writeln!(context, "=== {source} ===");
                 context.push_str(&text);
                 context.push('\n');
             }
@@ -158,7 +201,7 @@ pub async fn citation_audit(
 ) -> Result<FaithfulnessReport> {
     let mut context = String::new();
     for page in cited_pages {
-        context.push_str(&format!("=== [[{}]] ===\n", page.frontmatter.title));
+        let _ = writeln!(context, "=== [[{}]] ===", page.frontmatter.title);
         context.push_str(&page.body);
         context.push('\n');
     }
@@ -200,5 +243,26 @@ mod tests {
     async fn garbage_response_is_an_error() {
         let mock = MockProvider::constant("not json");
         assert!(judge_faithfulness(&mock, "s", "c").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bare_array_response_is_tolerated() {
+        // Some OpenAI-compatible proxies pass response_schema as a hint
+        // only; the model may return the claims array without the wrapper.
+        let mock = MockProvider::constant(
+            r#"[{"claim":"a","supported":true,"evidence":"a"},{"claim":"b","supported":false}]"#,
+        );
+        let report = judge_faithfulness(&mock, "s", "c").await.unwrap();
+        assert_eq!(report.claims.len(), 2);
+        assert!((report.score - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn fenced_bare_array_is_tolerated() {
+        let mock = MockProvider::constant(
+            "```json\n[{\"claim\":\"x\",\"supported\":true,\"evidence\":\"y\"}]\n```",
+        );
+        let report = judge_faithfulness(&mock, "s", "c").await.unwrap();
+        assert_eq!(report.claims.len(), 1);
     }
 }

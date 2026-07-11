@@ -72,7 +72,10 @@ pub async fn judge_context_precision(
             role: Role::User,
             content: format!("Question: {question}\n\nChunks:\n{listing}"),
         }],
-        max_tokens: 200,
+        // Output is a short index list, but proxies routing Claude through
+        // Vertex/Bedrock can burn completion tokens on internal reasoning
+        // first — keep real headroom (see eval::faithfulness).
+        max_tokens: 4096,
         temperature: Some(0.0),
         response_schema: Some(schema),
     };

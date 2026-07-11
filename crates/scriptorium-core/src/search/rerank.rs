@@ -72,7 +72,11 @@ pub async fn llm_rerank(
             role: Role::User,
             content: format!("Question: {question}\n\nCandidates:\n{listing}"),
         }],
-        max_tokens: 300,
+        // Short output, generous budget: through Vertex/Bedrock-routed
+        // proxies, completion tokens are spent on internal reasoning before
+        // the JSON appears; 300 tokens starves it and the rerank silently
+        // never fires (see eval::faithfulness for the observed failure).
+        max_tokens: 4096,
         temperature: Some(0.0),
         response_schema: Some(schema),
     };
