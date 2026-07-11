@@ -294,7 +294,7 @@ pub async fn ingest_with_retrieval(
         &response.usage,
     );
     let salvaged = crate::llm::extract_json_payload(&response.text);
-    let raw: crate::llm::prompts::IngestPlanRaw = match serde_json::from_str(&salvaged) {
+    let raw: crate::llm::prompts::IngestPlanRaw = match parse_plan_tolerant(&salvaged) {
         Ok(r) => r,
         Err(parse_err) => {
             // Persist the full context so the bug is debuggable after the
@@ -821,6 +821,30 @@ fn select_relevant_pages<'a>(pages: &'a [Page], source_text: &str, top_n: usize)
 /// Copy a source file into `sources/<category>/<hash_prefix>-<slug>.<ext>`
 /// inside the vault if it is not already there. Returns the vault-relative
 /// path of the interned copy.
+/// Parse an `IngestPlanRaw`, tolerating one tool-call-style envelope:
+/// some proxy routes return the plan wrapped in a tool-arguments shape —
+/// `{"input": {...}}` and `{"tool_input": {...}}` both observed live —
+/// instead of the bare object.
+fn parse_plan_tolerant(payload: &str) -> serde_json::Result<crate::llm::prompts::IngestPlanRaw> {
+    match serde_json::from_str(payload) {
+        Ok(plan) => Ok(plan),
+        Err(direct_err) => {
+            if let Ok(serde_json::Value::Object(map)) =
+                serde_json::from_str::<serde_json::Value>(payload)
+            {
+                for key in ["input", "tool_input", "arguments", "plan", "response"] {
+                    if let Some(inner @ serde_json::Value::Object(_)) = map.get(key) {
+                        if let Ok(plan) = serde_json::from_value(inner.clone()) {
+                            return Ok(plan);
+                        }
+                    }
+                }
+            }
+            Err(direct_err)
+        }
+    }
+}
+
 /// Record span-level provenance and lifecycle metadata from a plan action
 /// onto a page's frontmatter `extra` map:
 /// - `source_quotes`: map of interned-source path → short verbatim quote
@@ -1191,6 +1215,16 @@ mod tests {
             log_entry: "test log".into(),
             redundant: false,
         }
+    }
+
+    #[test]
+    fn parse_plan_tolerant_unwraps_input_envelope() {
+        let wrapped = r#"{"input":{"summary":"s","pages":[],"log_entry":"l","redundant":true}}"#;
+        let plan = parse_plan_tolerant(wrapped).expect("envelope unwrapped");
+        assert!(plan.redundant);
+        let bare = r#"{"summary":"s","pages":[],"log_entry":"l"}"#;
+        assert!(parse_plan_tolerant(bare).is_ok());
+        assert!(parse_plan_tolerant("{\"nope\":1}").is_err());
     }
 
     #[test]
