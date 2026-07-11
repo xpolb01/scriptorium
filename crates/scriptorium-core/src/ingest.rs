@@ -175,7 +175,8 @@ pub async fn ingest_with_retrieval(
     }
 
     // 2. Intern into `sources/`.
-    let interned = intern_source(vault, source_path, &raw)?;
+    let (interned, newly_interned) = intern_source(vault, source_path, &raw)?;
+    let mut intern_guard = InternGuard::new(vault, &interned, newly_interned);
 
     // 3. Load and render schema. Budget about 1/4 of the provider context.
     let schema = Schema::load(vault)?;
@@ -360,6 +361,7 @@ pub async fn ingest_with_retrieval(
             &format!("\n[skip] redundant — {interned}\n"),
         )?;
         let commit_id = tx.commit(&format!("[ingest:skip] {interned}"))?;
+        intern_guard.defuse();
         if let Some(hooks) = &options.hooks {
             crate::hooks::post_ingest(hooks, source_path, &commit_id, &plan.summary, 0, 0).await;
         }
@@ -517,6 +519,7 @@ pub async fn ingest_with_retrieval(
 
     // 8. Commit (or preview on dry-run).
     if options.dry_run {
+        intern_guard.defuse(); // dry-run intentionally keeps the interned source
         let diff = tx.diff();
         drop(tx); // explicit rollback; the Drop impl is a no-op anyway
         return Ok(IngestReport {
@@ -531,6 +534,7 @@ pub async fn ingest_with_retrieval(
     }
     let commit_message = format!("[ingest] {}", plan.summary);
     let commit_id = tx.commit(&commit_message)?;
+    intern_guard.defuse();
 
     // Post-ingest hook (fire-and-forget).
     if let Some(hooks) = &options.hooks {
@@ -925,7 +929,9 @@ fn find_near_duplicate_source(vault: &Vault, text: &str) -> Option<(Utf8PathBuf,
     None
 }
 
-fn intern_source(vault: &Vault, source_path: &Path, bytes: &[u8]) -> Result<Utf8PathBuf> {
+/// Returns the vault-relative interned path plus whether this call newly
+/// created the file (`false` = it already existed from a prior ingest).
+fn intern_source(vault: &Vault, source_path: &Path, bytes: &[u8]) -> Result<(Utf8PathBuf, bool)> {
     let hash = sha256_hex(bytes);
     let hash_prefix = &hash[..12];
     let ext = source_path
@@ -940,14 +946,48 @@ fn intern_source(vault: &Vault, source_path: &Path, bytes: &[u8]) -> Result<Utf8
     let slug = slugify(stem);
     let rel = Utf8PathBuf::from(format!("sources/{category}/{hash_prefix}-{slug}.{ext}"));
     let abs = vault.root().join(&rel);
-    if !abs.as_std_path().exists() {
+    let created = !abs.as_std_path().exists();
+    if created {
         if let Some(parent) = abs.as_std_path().parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::io(parent.to_path_buf(), e))?;
         }
         std::fs::write(abs.as_std_path(), bytes)
             .map_err(|e| Error::io(abs.clone().into_std_path_buf(), e))?;
     }
-    Ok(rel)
+    Ok((rel, created))
+}
+
+/// Removes a freshly-interned source when its ingest fails before commit.
+///
+/// Interning happens before the LLM call and the transaction; without this
+/// cleanup a failed ingest leaves an orphan under `sources/` that is (a)
+/// untracked by git and (b) poisonous to every retry path — bulk-ingest's
+/// interned-dedup skips the file and the near-duplicate gate matches the
+/// orphan at similarity 1.0. Armed only when this run created the file;
+/// call `defuse()` once the outcome (commit, redundant-skip, dry-run) owns
+/// the file.
+struct InternGuard {
+    abs: Option<std::path::PathBuf>,
+}
+
+impl InternGuard {
+    fn new(vault: &Vault, rel: &Utf8Path, created: bool) -> Self {
+        Self {
+            abs: created.then(|| vault.root().join(rel).into_std_path_buf()),
+        }
+    }
+
+    fn defuse(&mut self) {
+        self.abs = None;
+    }
+}
+
+impl Drop for InternGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.abs.take() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 fn category_for_ext(ext: &str) -> &'static str {
