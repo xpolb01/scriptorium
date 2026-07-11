@@ -44,6 +44,7 @@ pub mod search;
 pub mod setup;
 pub mod skills;
 pub mod social;
+pub mod suggest;
 pub mod telemetry;
 pub mod url_fetch;
 pub mod vault;

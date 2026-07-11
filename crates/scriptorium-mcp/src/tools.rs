@@ -51,6 +51,9 @@ struct ToolSpec {
     name: &'static str,
     description: &'static str,
     input_schema: Value,
+    /// MCP tool annotations: behavior hints for progressive client
+    /// discovery (readOnlyHint / destructiveHint / idempotentHint).
+    annotations: Value,
 }
 
 impl ToolRegistry {
@@ -68,6 +71,7 @@ impl ToolRegistry {
                     "name": t.name,
                     "description": t.description,
                     "inputSchema": t.input_schema,
+                    "annotations": t.annotations,
                 })
             })
             .collect()
@@ -96,6 +100,7 @@ impl ToolRegistry {
             "scriptorium_learn_search" => learn_search_tool(args, ctx),
             "scriptorium_learn_retrieve" => learn_retrieve_tool(args, ctx),
             "scriptorium_bench" => bench_tool(ctx).await,
+            "scriptorium_suggest_links" => suggest_links_tool(args, ctx).await,
             "scriptorium_ingest_enqueue" => enqueue_tool(args, ctx),
             "scriptorium_drain" => drain_tool(args, ctx).await,
             "scriptorium_queue_status" => queue_status_tool(ctx),
@@ -135,6 +140,7 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                     "force":   {"type": "boolean", "default": false, "description": "Ingest even when the source is a near-duplicate of an already-interned source."}
                 }
             }),
+            annotations: json!({"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false}),
         },
         ToolSpec {
             name: "scriptorium_query",
@@ -147,16 +153,19 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                 },
                 "required": ["question"]
             }),
+            annotations: json!({"readOnlyHint": true, "idempotentHint": true}),
         },
         ToolSpec {
             name: "scriptorium_lint",
             description: "Run mechanical lint rules and return the report.",
             input_schema: json!({"type": "object", "properties": {}}),
+            annotations: json!({"readOnlyHint": true, "idempotentHint": true}),
         },
         ToolSpec {
             name: "scriptorium_list_pages",
             description: "List all wiki pages with their titles, paths, and tags.",
             input_schema: json!({"type": "object", "properties": {}}),
+            annotations: json!({"readOnlyHint": true, "idempotentHint": true}),
         },
         ToolSpec {
             name: "scriptorium_read_page",
@@ -168,6 +177,7 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                 },
                 "required": ["path"]
             }),
+            annotations: json!({"readOnlyHint": true, "idempotentHint": true}),
         },
         ToolSpec {
             name: "scriptorium_write_page",
@@ -181,6 +191,7 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                 },
                 "required": ["path", "content"]
             }),
+            annotations: json!({"readOnlyHint": false, "destructiveHint": true, "idempotentHint": true}),
         },
         ToolSpec {
             name: "scriptorium_search",
@@ -193,6 +204,7 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                 },
                 "required": ["query"]
             }),
+            annotations: json!({"readOnlyHint": true, "idempotentHint": true}),
         },
         ToolSpec {
             name: "scriptorium_log_tail",
@@ -203,6 +215,7 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                     "n": {"type": "integer", "default": 20, "minimum": 1, "maximum": 200}
                 }
             }),
+            annotations: json!({"readOnlyHint": true, "idempotentHint": true}),
         },
         ToolSpec {
             name: "scriptorium_maintain",
@@ -219,6 +232,7 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                     }
                 }
             }),
+            annotations: json!({"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true}),
         },
         ToolSpec {
             name: "scriptorium_doctor",
@@ -229,6 +243,7 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {}
             }),
+            annotations: json!({"readOnlyHint": true, "idempotentHint": true}),
         },
         ToolSpec {
             name: "scriptorium_skill_list",
@@ -239,6 +254,7 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {}
             }),
+            annotations: json!({"readOnlyHint": true, "idempotentHint": true}),
         },
         ToolSpec {
             name: "scriptorium_skill_read",
@@ -254,6 +270,7 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                 },
                 "required": ["name"]
             }),
+            annotations: json!({"readOnlyHint": true, "idempotentHint": true}),
         },
         ToolSpec {
             name: "scriptorium_bench",
@@ -264,6 +281,7 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {}
             }),
+            annotations: json!({"readOnlyHint": true, "idempotentHint": true}),
         },
         ToolSpec {
             name: "scriptorium_learn_capture",
@@ -284,6 +302,7 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                 },
                 "required": ["skill", "type", "key", "insight"]
             }),
+            annotations: json!({"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false}),
         },
         ToolSpec {
             name: "scriptorium_learn_search",
@@ -295,6 +314,7 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                     "query": { "type": "string", "description": "Search keyword (empty = list recent)" }
                 }
             }),
+            annotations: json!({"readOnlyHint": true, "idempotentHint": true}),
         },
         ToolSpec {
             name: "scriptorium_learn_retrieve",
@@ -307,6 +327,7 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                     "limit": { "type": "integer", "default": 5, "minimum": 1, "maximum": 20 }
                 }
             }),
+            annotations: json!({"readOnlyHint": true, "idempotentHint": true}),
         },
         ToolSpec {
             name: "scriptorium_ingest_enqueue",
@@ -319,6 +340,7 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                 },
                 "required": ["source"]
             }),
+            annotations: json!({"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true}),
         },
         ToolSpec {
             name: "scriptorium_drain",
@@ -331,11 +353,26 @@ fn all_tool_specs() -> Vec<ToolSpec> {
                     "dry_run":       {"type": "boolean", "default": false}
                 }
             }),
+            annotations: json!({"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false}),
         },
         ToolSpec {
             name: "scriptorium_queue_status",
             description: "Return queue size, oldest marker age, drain.lock state.",
             input_schema: json!({"type": "object", "properties": {}}),
+            annotations: json!({"readOnlyHint": true, "idempotentHint": true}),
+        },
+        ToolSpec {
+            name: "scriptorium_suggest_links",
+            description: "Suggest related wiki pages for a page (embedding similarity) as candidate [[wikilinks]], marking targets the page already links to.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "stem":  {"type": "string", "description": "Stem of the subject page, e.g. `attention`."},
+                    "top_k": {"type": "integer", "default": 8, "minimum": 1, "maximum": 25}
+                },
+                "required": ["stem"]
+            }),
+            annotations: json!({"readOnlyHint": true, "idempotentHint": true}),
         },
     ]
 }
@@ -644,6 +681,51 @@ fn skill_list_tool(ctx: &ServerContext) -> Result<String, ToolError> {
     let skills = scriptorium_core::skills::list_skills(&ctx.vault)
         .map_err(|e| ToolError::Failed(format!("skills: {e}")))?;
     serde_json::to_string_pretty(&skills).map_err(|e| ToolError::Failed(format!("json: {e}")))
+}
+
+#[derive(Debug, Deserialize)]
+struct SuggestLinksArgs {
+    stem: String,
+    #[serde(default = "default_suggest_top_k")]
+    top_k: usize,
+}
+
+fn default_suggest_top_k() -> usize {
+    8
+}
+
+async fn suggest_links_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolError> {
+    let args: SuggestLinksArgs = serde_json::from_value(args)?;
+    let store = open_store(ctx)?;
+    let suggestions = core::suggest::suggest_links(
+        &ctx.vault,
+        &store,
+        ctx.embed_provider.as_ref(),
+        &ctx.embeddings_model,
+        &args.stem,
+        args.top_k,
+    )
+    .await
+    .map_err(|e| ToolError::Failed(format!("suggest_links: {e}")))?;
+    if suggestions.is_empty() {
+        return Ok(format!("No related pages found for '{}'.", args.stem));
+    }
+    let mut out = format!("Related pages for '{}':\n", args.stem);
+    for s in &suggestions {
+        let _ = writeln!(
+            out,
+            "  [[{}]]  {:.2}  {}{}",
+            s.stem,
+            s.score,
+            s.title,
+            if s.already_linked {
+                "  (already linked)"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(out)
 }
 
 async fn bench_tool(ctx: &ServerContext) -> Result<String, ToolError> {

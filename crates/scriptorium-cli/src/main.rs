@@ -250,6 +250,20 @@ enum Command {
         provider: Option<ProviderKind>,
     },
 
+    /// Suggest related pages for a wiki page (embedding similarity over
+    /// the existing store) as candidate [[wikilinks]], marking ones the
+    /// page already links to.
+    SuggestLinks {
+        /// Stem of the subject page (e.g. `attention`).
+        stem: String,
+        /// Maximum suggestions.
+        #[arg(long, default_value_t = 8)]
+        top: usize,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Find near-duplicate wiki pages (batched embedding similarity) and,
     /// with --apply, merge each group into its longest member; absorbed
     /// pages become `Merged into [[survivor]]` redirect stubs. Dry-run by
@@ -711,6 +725,7 @@ fn command_name_for_span(cmd: &Command) -> &'static str {
         Command::Learn(_) => "learn",
         Command::Bench { .. } => "bench",
         Command::Consolidate { .. } => "consolidate",
+        Command::SuggestLinks { .. } => "suggest-links",
         Command::Audit { .. } => "audit",
         Command::Serve { .. } => "serve",
         Command::Watch { .. } => "watch",
@@ -1455,6 +1470,47 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                             println!("  Judged ctx-precision: {judged:.2} (LLM, reference-free)");
                         }
                         println!("  Health score:   {:.1}/10", report.health_score);
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::SuggestLinks { stem, top, json } => {
+                    let vault = open_vault(&vault_path)?;
+                    let cfg = load_config(&vault);
+                    let embed = build_provider(embed_provider_from(&cfg))?;
+                    let store = open_store(&vault)?;
+                    let suggestions = scriptorium_core::suggest::suggest_links(
+                        &vault,
+                        &store,
+                        embed.as_ref(),
+                        &cfg.embeddings.model,
+                        &stem,
+                        top,
+                    )
+                    .await
+                    .into_diagnostic()?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&suggestions)
+                                .map_err(|e| miette!("json: {e}"))?
+                        );
+                    } else if suggestions.is_empty() {
+                        println!("No related pages found for '{stem}'.");
+                    } else {
+                        println!("Related pages for '{stem}':");
+                        for s in &suggestions {
+                            println!(
+                                "  [[{}]]  {:.2}  {}{}",
+                                s.stem,
+                                s.score,
+                                s.title,
+                                if s.already_linked {
+                                    "  (already linked)"
+                                } else {
+                                    ""
+                                }
+                            );
+                        }
                     }
                     Ok(ExitCode::SUCCESS)
                 }
