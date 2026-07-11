@@ -175,6 +175,9 @@ pub async fn ingest_with_retrieval(
     }
 
     // 2. Intern into `sources/`.
+    // Capture the raw bytes' UTF-8 form now — `raw` is shadowed by the
+    // parsed plan later, and converted-source staging needs the original.
+    let raw_utf8: Option<String> = std::str::from_utf8(&raw).ok().map(ToString::to_string);
     let (interned, newly_interned) = intern_source(vault, source_path, &raw)?;
     let mut intern_guard = InternGuard::new(vault, &interned, newly_interned);
 
@@ -355,7 +358,7 @@ pub async fn ingest_with_retrieval(
         } else {
             let sibling = Utf8PathBuf::from(format!("{interned}.extracted.md"));
             tx.put_file(&sibling, source_text.clone())?;
-            if let Ok(raw_text) = String::from_utf8(raw.clone()) {
+            if let Some(raw_text) = raw_utf8.clone() {
                 tx.put_file(&interned, raw_text)?;
             }
         }
@@ -427,7 +430,7 @@ pub async fn ingest_with_retrieval(
         // file too so the cited source is git-tracked, not just on disk.
         let sibling = Utf8PathBuf::from(format!("{interned}.extracted.md"));
         tx.put_file(&sibling, source_text.clone())?;
-        if let Ok(raw_text) = String::from_utf8(raw.clone()) {
+        if let Some(raw_text) = raw_utf8.clone() {
             tx.put_file(&interned, raw_text)?;
         }
     }
