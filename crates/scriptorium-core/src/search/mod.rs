@@ -1,28 +1,34 @@
-//! Hybrid search: vector + keyword + RRF fusion + dedup.
+//! Hybrid search: vector + keyword + graph + RRF fusion + dedup.
 //!
 //! This module orchestrates multiple retrieval strategies (embedding-based
-//! vector search, FTS5 keyword search, and optionally LLM-based query
-//! expansion) into a single ranked result set via Reciprocal Rank Fusion.
+//! vector search, FTS5 keyword search, Personalized `PageRank` over the
+//! wikilink graph, and optionally LLM-based query expansion) into a single
+//! ranked result set via Reciprocal Rank Fusion.
 //!
 //! The primary entry point is [`hybrid_search`], which:
 //! 1. Expands the query into alternative phrasings (optional, non-fatal).
 //! 2. Embeds all query variants and runs vector search for each.
 //! 3. Runs keyword search on the original query.
-//! 4. Fuses all result lists with RRF.
-//! 5. Deduplicates and diversifies the fused results.
+//! 4. Fuses the retrieval lists with RRF, then seeds Personalized
+//!    `PageRank` with the top fused pages and emits the multi-hop graph
+//!    ranking as one more list.
+//! 5. Fuses all lists (vector + keyword + graph) with RRF.
+//! 6. Deduplicates and diversifies the fused results.
 
 pub mod dedup;
 pub mod expansion;
 pub mod fusion;
+pub mod ppr;
 
 use std::collections::HashMap;
 
 use crate::embed::{EmbeddingsStore, SearchHit};
 use crate::error::{Error, Result};
 use crate::llm::LlmProvider;
-use crate::vault::{Page, PageId};
+use crate::vault::{LinkGraph, Page, PageId};
 
 pub use dedup::DedupConfig;
+pub use ppr::PprConfig;
 
 /// Options for [`hybrid_search`].
 #[derive(Debug, Clone)]
@@ -35,6 +41,9 @@ pub struct HybridSearchOpts {
     pub vector_limit: usize,
     /// Max results from keyword search.
     pub keyword_limit: usize,
+    /// Max results contributed by the link-graph (PPR) expansion list.
+    /// `0` disables graph expansion.
+    pub graph_limit: usize,
     /// Dedup configuration.
     pub dedup: DedupConfig,
 }
@@ -46,6 +55,7 @@ impl Default for HybridSearchOpts {
             expansion: true,
             vector_limit: 20,
             keyword_limit: 20,
+            graph_limit: 20,
             dedup: DedupConfig::default(),
         }
     }
@@ -58,17 +68,19 @@ impl HybridSearchOpts {
             top_k,
             vector_limit: top_k * 4,
             keyword_limit: top_k * 4,
+            graph_limit: top_k * 4,
             ..Default::default()
         }
     }
 }
 
-/// Run hybrid search: vector + keyword + RRF fusion + dedup.
+/// Run hybrid search: vector + keyword + graph + RRF fusion + dedup.
 ///
 /// `expansion_provider` is used for multi-query expansion (can be the same
 /// as `embed_provider` — it just needs `complete()`). `pages` is the
-/// current vault page set, used to populate `page_path` on results for
-/// type-diversity dedup.
+/// current vault page set, used to build the wikilink graph for PPR
+/// expansion and to populate `page_path` on results for type-diversity
+/// dedup. Pass an empty slice to skip graph expansion.
 pub async fn hybrid_search(
     store: &EmbeddingsStore,
     embed_provider: &dyn LlmProvider,
@@ -103,10 +115,32 @@ pub async fn hybrid_search(
         store.keyword_search(question, embed_provider.name(), model, opts.keyword_limit)?;
     all_lists.push(kw_hits);
 
-    // 5. RRF fusion.
+    // 5. Graph expansion: fuse the retrieval lists, seed Personalized
+    //    PageRank with the top fused pages, and add the multi-hop graph
+    //    ranking as one more list for the final fusion. Replaces the old
+    //    single-hop backlink expansion with weighted multi-hop propagation
+    //    (HippoRAG-style).
+    if opts.graph_limit > 0 && !pages.is_empty() {
+        let prelim = fusion::rrf_fuse(&all_lists);
+        if !prelim.is_empty() {
+            let graph = LinkGraph::build(pages);
+            let graph_list = ppr::graph_expansion_list(
+                &graph,
+                &prelim,
+                opts.top_k,
+                opts.graph_limit,
+                &PprConfig::default(),
+            );
+            if !graph_list.is_empty() {
+                all_lists.push(graph_list);
+            }
+        }
+    }
+
+    // 6. RRF fusion across vector + keyword + graph lists.
     let fused = fusion::rrf_fuse(&all_lists);
 
-    // 6. Annotate with page_path for type-diversity dedup.
+    // 7. Annotate with page_path for type-diversity dedup.
     let page_paths = build_page_path_map(pages);
     let annotated: Vec<SearchHit> = fused
         .into_iter()
@@ -116,10 +150,10 @@ pub async fn hybrid_search(
         })
         .collect();
 
-    // 7. Dedup pipeline.
+    // 8. Dedup pipeline.
     let deduped = dedup::dedup_pipeline(annotated, &opts.dedup);
 
-    // 8. Truncate to top_k.
+    // 9. Truncate to top_k.
     Ok(deduped.into_iter().take(opts.top_k).collect())
 }
 
@@ -185,6 +219,7 @@ mod tests {
             expansion: false, // disable expansion for determinism
             vector_limit: 10,
             keyword_limit: 10,
+            graph_limit: 10,
             dedup: DedupConfig::default(),
         };
 
@@ -214,6 +249,7 @@ mod tests {
             expansion: false,
             vector_limit: 10,
             keyword_limit: 10,
+            graph_limit: 10,
             dedup: DedupConfig::default(),
         };
 
@@ -222,5 +258,73 @@ mod tests {
             .await
             .unwrap();
         assert!(!results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn graph_expansion_surfaces_linked_page_without_chunks() {
+        use crate::vault::{Frontmatter, Page};
+        use camino::Utf8PathBuf;
+
+        // Page A has an embedded chunk matching the query; page B is linked
+        // from A but has no chunks in the store at all. Only the PPR list
+        // can surface B.
+        let mut fm_a = Frontmatter::new("Alpha");
+        fm_a.id = PageId::new();
+        let mut fm_b = Frontmatter::new("Beta");
+        fm_b.id = PageId::new();
+        let a_id = fm_a.id;
+        let b_id = fm_b.id;
+        let pages = vec![
+            Page {
+                path: Utf8PathBuf::from("wiki/alpha.md"),
+                frontmatter: fm_a,
+                body: "Quantum things. See [[beta]].\n".into(),
+            },
+            Page {
+                path: Utf8PathBuf::from("wiki/beta.md"),
+                frontmatter: fm_b,
+                body: "No chunks for this page.\n".into(),
+            },
+        ];
+
+        let mock = MockProvider::constant("");
+        // Store A's chunk under the query's own mock embedding so the vector
+        // list ranks it deterministically (the mock hashes text to a vector).
+        let query_vec = mock
+            .embed(&["quantum".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let store = EmbeddingsStore::in_memory().unwrap();
+        store
+            .upsert(&embed_row(
+                a_id,
+                "quantum mechanics is fascinating",
+                query_vec,
+            ))
+            .unwrap();
+
+        let opts = HybridSearchOpts {
+            top_k: 5,
+            expansion: false,
+            vector_limit: 10,
+            keyword_limit: 10,
+            graph_limit: 10,
+            dedup: DedupConfig::default(),
+        };
+
+        let results = hybrid_search(&store, &mock, &mock, "mock-1", "quantum", &pages, &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            results[0].page_id, a_id,
+            "retrieval hit must stay on top; graph expansion only adds"
+        );
+        let beta = results
+            .iter()
+            .find(|h| h.page_id == b_id)
+            .expect("graph-linked page with no chunks should surface via PPR");
+        assert_eq!(beta.chunk_text, "Beta", "synthetic hit carries the title");
     }
 }

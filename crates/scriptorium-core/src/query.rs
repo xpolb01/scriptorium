@@ -3,12 +3,13 @@
 //! ```text
 //! question  ──►  expand_query() → embed variants → vector search (N lists)
 //!                                                   keyword search (1 list)
+//!                                                   PPR graph walk (1 list)
 //!                                                         │
 //!                                                         ▼
 //!                                          RRF fusion → dedup pipeline
 //!                                                         │
 //!                                                         ▼
-//!                              dedupe chunks → page ids → backlink expansion
+//!                                          dedupe chunks → page ids
 //!                                                         │
 //!                                                         ▼
 //!                         PromptContext { schema, relevant_pages }
@@ -21,9 +22,11 @@
 //! ```
 //!
 //! Retrieval uses [`crate::search::hybrid_search`], which combines vector
-//! similarity, FTS5 keyword search, multi-query expansion, and RRF fusion
-//! into a single ranked result set. For tests, the mock provider gives
-//! deterministic embeddings and expansion gracefully degrades.
+//! similarity, FTS5 keyword search, multi-query expansion, Personalized
+//! `PageRank` over the wikilink graph (multi-hop expansion — replaces the
+//! old single-hop backlink hop), and RRF fusion into a single ranked result
+//! set. For tests, the mock provider gives deterministic embeddings and
+//! expansion gracefully degrades.
 
 use std::collections::{HashMap, HashSet};
 
@@ -33,7 +36,7 @@ use crate::lint::stale;
 use crate::llm::{query_prompt, record_usage, LlmProvider, PromptContext, QueryAnswer};
 use crate::schema::Schema;
 use crate::search::{self, HybridSearchOpts};
-use crate::vault::{LinkGraph, Page, PageId, Vault};
+use crate::vault::{Page, PageId, Vault};
 
 /// Report accompanying a [`query`] result: the answer itself plus which pages
 /// were retrieved and which of them the LLM cited.
@@ -49,9 +52,11 @@ pub struct QueryReport {
 
 /// Run the full query pipeline.
 ///
-/// `top_k` is the number of chunks pulled from the embeddings store; the
-/// resulting page set is then expanded one hop through the link graph
-/// (pages that link to any of the top hits are included as context).
+/// `top_k` is the number of chunks pulled from the embeddings store. Graph
+/// context comes from the Personalized `PageRank` list inside
+/// [`search::hybrid_search`]: pages linked (multi-hop, forward or backward)
+/// to the top hits compete in the fusion and surface directly in the
+/// ranked result set.
 ///
 /// Takes **two provider references** on purpose: `llm_provider` handles the
 /// `complete()` call (generates the answer) and `embed_provider` handles
@@ -68,7 +73,8 @@ pub async fn query(
     question: &str,
     top_k: usize,
 ) -> Result<QueryReport> {
-    // 1-3. Hybrid search: vector + keyword + RRF fusion + dedup.
+    // 1-3. Hybrid search: vector + keyword + PPR graph expansion + RRF
+    //      fusion + dedup.
     let scan = vault.scan()?;
     let opts = HybridSearchOpts::with_top_k(top_k);
     let hits = search::hybrid_search(
@@ -82,7 +88,9 @@ pub async fn query(
     )
     .await?;
 
-    // Build page scores from the fused results.
+    // 4. Build page scores from the fused results. Graph-relevant pages are
+    //    already folded in: hybrid search fuses a PPR list over the wikilink
+    //    graph, so multi-hop neighbors of strong hits arrive here scored.
     let mut page_scores: HashMap<PageId, f32> = HashMap::new();
     for hit in &hits {
         page_scores
@@ -90,19 +98,9 @@ pub async fn query(
             .and_modify(|s| *s = s.max(hit.score))
             .or_insert(hit.score);
     }
+    let relevant_ids: HashSet<PageId> = page_scores.keys().copied().collect();
 
-    // 4. Build the graph for backlink expansion.
-    let graph = LinkGraph::build(&scan.pages);
-
-    let mut relevant_ids: HashSet<PageId> = page_scores.keys().copied().collect();
-    let seed_ids: Vec<PageId> = page_scores.keys().copied().collect();
-    for id in seed_ids {
-        for back in graph.backlinks(id) {
-            relevant_ids.insert(back);
-        }
-    }
-
-    // 5. Order the relevant pages by score (fall back to 0 for expansion hits).
+    // 5. Order the relevant pages by score.
     let mut ordered_pages: Vec<(&Page, f32)> = scan
         .pages
         .iter()
