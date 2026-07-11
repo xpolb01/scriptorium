@@ -77,11 +77,33 @@ pub struct IngestPlan {
 #[serde(deny_unknown_fields)]
 pub(crate) struct IngestPlanRaw {
     pub(crate) summary: String,
+    #[serde(deserialize_with = "pages_or_json_string")]
     pub(crate) pages: Vec<IngestPageAction>,
     #[serde(default)]
     pub(crate) log_entry: Option<String>,
     #[serde(default)]
     pub(crate) redundant: bool,
+}
+
+/// Accept `pages` either as a proper array or as a string containing the
+/// JSON-encoded array. Some OpenAI-compatible proxies double-encode nested
+/// structures under strict response schemas (observed live with a
+/// Vertex-routed LiteLLM proxy during bulk ingest).
+fn pages_or_json_string<'de, D>(de: D) -> Result<Vec<IngestPageAction>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Wire {
+        List(Vec<IngestPageAction>),
+        Json(String),
+    }
+    match Wire::deserialize(de)? {
+        Wire::List(v) => Ok(v),
+        Wire::Json(s) => serde_json::from_str(&s).map_err(D::Error::custom),
+    }
 }
 
 impl TryFrom<IngestPlanRaw> for IngestPlan {
@@ -519,6 +541,16 @@ pub fn query_prompt_with_learnings(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn ingest_plan_tolerates_double_encoded_pages() {
+        let raw = r#"{"summary":"s","pages":"[{\"action\":\"create\",\"path\":\"wiki/concepts/x.md\",\"title\":\"X\",\"body\":\"b\"}]","log_entry":"l"}"#;
+        let plan: IngestPlanRaw = serde_json::from_str(raw).expect("double-encoded pages accepted");
+        assert_eq!(plan.pages.len(), 1);
+        assert_eq!(plan.pages[0].path, "wiki/concepts/x.md");
+    }
+
     use super::*;
     use crate::vault::page::{Frontmatter, PageId};
     use camino::Utf8PathBuf;

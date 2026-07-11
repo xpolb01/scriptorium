@@ -374,8 +374,22 @@ pub async fn ingest_with_retrieval(
         });
     }
 
+    // Valid link targets = every existing wiki page stem plus the stems
+    // this plan itself creates (links between same-plan pages are fine).
+    let mut valid_stems: std::collections::HashSet<String> = prior_scan
+        .pages
+        .iter()
+        .filter(|p| p.path.starts_with("wiki/"))
+        .filter_map(|p| p.path.file_stem().map(str::to_lowercase))
+        .collect();
+    for action in &plan.pages {
+        if let Some(stem) = Utf8Path::new(&action.path).file_stem() {
+            valid_stems.insert(stem.to_lowercase());
+        }
+    }
     for page in &mut plan.pages {
         page.body = normalize_wikilinks(&page.body);
+        page.body = unlink_unresolvable(&page.body, &valid_stems);
     }
 
     guard_stem_collisions(&mut plan, &stem_to_path, &existing_paths)?;
@@ -540,6 +554,36 @@ pub async fn ingest_with_retrieval(
         dry_run_diff: Vec::new(),
         redundant: false,
     })
+}
+
+/// Unlink wikilinks whose target resolves to no existing page and no page
+/// created by this plan: `[[ghost]]` becomes `ghost`, `[[ghost|label]]`
+/// becomes `label`.
+///
+/// Bulk ingests hit a chicken-and-egg ordering problem — early sources
+/// legitimately reference concepts that later sources will define. The
+/// lint gate would (correctly) abort the whole commit over one phantom
+/// link; unlinking preserves the prose, keeps the commit flowing, and
+/// leaves re-linking to `suggest-links` / later ingests once the target
+/// exists. Heading-only links (`[[#Section]]`) are left alone.
+fn unlink_unresolvable(body: &str, valid_stems: &std::collections::HashSet<String>) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\[\[([^\]|#]+)(#[^\]|]*)?(\|([^\]]+))?\]\]")
+            .expect("unlink_unresolvable regex is valid")
+    });
+    re.replace_all(body, |caps: &regex::Captures<'_>| {
+        let target = caps.get(1).map_or("", |m| m.as_str()).trim();
+        let display = caps.get(4).map_or(target, |m| m.as_str());
+        if valid_stems.contains(&target.to_lowercase()) {
+            caps.get(0)
+                .map_or_else(String::new, |m| m.as_str().to_string())
+        } else {
+            display.to_string()
+        }
+    })
+    .into_owned()
 }
 
 fn normalize_wikilinks(body: &str) -> String {
@@ -1137,6 +1181,27 @@ mod tests {
             log_entry: "test log".into(),
             redundant: false,
         }
+    }
+
+    #[test]
+    fn unlink_unresolvable_strips_phantom_links() {
+        let mut valid = std::collections::HashSet::new();
+        valid.insert("real-page".to_string());
+        let body = "See [[real-page]] and [[ghost-page]] and [[ghost|Ghost Label]].";
+        let out = unlink_unresolvable(body, &valid);
+        assert_eq!(out, "See [[real-page]] and ghost-page and Ghost Label.");
+    }
+
+    #[test]
+    fn unlink_unresolvable_keeps_heading_and_alias_links() {
+        let mut valid = std::collections::HashSet::new();
+        valid.insert("target".to_string());
+        let body = "Jump to [[#Section]] then [[target|nice name]] and [[Target]].";
+        let out = unlink_unresolvable(body, &valid);
+        // heading-only link untouched; alias preserved; case-insensitive stem match
+        assert!(out.contains("[[#Section]]"));
+        assert!(out.contains("[[target|nice name]]"));
+        assert!(out.contains("[[Target]]"));
     }
 
     fn make_action(action: IngestAction, path: &str) -> IngestPageAction {

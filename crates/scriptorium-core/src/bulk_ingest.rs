@@ -22,8 +22,13 @@ use crate::vault::Vault;
 /// Maximum file size to ingest (5 MB).
 const MAX_FILE_SIZE: u64 = 5 * 1024 * 1024;
 
-/// Extensions eligible for bulk ingest.
-const INGESTABLE_EXTENSIONS: &[&str] = &["md", "markdown", "txt", "text"];
+/// Extensions eligible for bulk ingest — everything the extract router
+/// handles, plus plain-text formats like Gherkin `.feature` files that
+/// flow through the UTF-8 path.
+const INGESTABLE_EXTENSIONS: &[&str] = &[
+    "md", "markdown", "txt", "text", "feature", "html", "htm", "pdf", "docx", "pptx", "xlsx",
+    "epub",
+];
 
 /// Options for [`bulk_ingest`].
 #[derive(Debug, Clone)]
