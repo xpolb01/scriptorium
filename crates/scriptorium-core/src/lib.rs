@@ -21,6 +21,7 @@ pub mod config;
 pub mod doctor;
 pub mod embed;
 pub mod error;
+pub mod eval;
 pub mod git;
 pub mod global_config;
 pub mod hooks;
