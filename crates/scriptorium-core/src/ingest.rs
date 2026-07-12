@@ -175,7 +175,11 @@ pub async fn ingest_with_retrieval(
     }
 
     // 2. Intern into `sources/`.
-    let interned = intern_source(vault, source_path, &raw)?;
+    // Capture the raw bytes' UTF-8 form now — `raw` is shadowed by the
+    // parsed plan later, and converted-source staging needs the original.
+    let raw_utf8: Option<String> = std::str::from_utf8(&raw).ok().map(ToString::to_string);
+    let (interned, newly_interned) = intern_source(vault, source_path, &raw)?;
+    let mut intern_guard = InternGuard::new(vault, &interned, newly_interned);
 
     // 3. Load and render schema. Budget about 1/4 of the provider context.
     let schema = Schema::load(vault)?;
@@ -294,7 +298,7 @@ pub async fn ingest_with_retrieval(
         &response.usage,
     );
     let salvaged = crate::llm::extract_json_payload(&response.text);
-    let raw: crate::llm::prompts::IngestPlanRaw = match serde_json::from_str(&salvaged) {
+    let raw: crate::llm::prompts::IngestPlanRaw = match parse_plan_tolerant(&salvaged) {
         Ok(r) => r,
         Err(parse_err) => {
             // Persist the full context so the bug is debuggable after the
@@ -354,12 +358,16 @@ pub async fn ingest_with_retrieval(
         } else {
             let sibling = Utf8PathBuf::from(format!("{interned}.extracted.md"));
             tx.put_file(&sibling, source_text.clone())?;
+            if let Some(raw_text) = raw_utf8.clone() {
+                tx.put_file(&interned, raw_text)?;
+            }
         }
         tx.append(
             Utf8Path::new("log.md"),
             &format!("\n[skip] redundant — {interned}\n"),
         )?;
         let commit_id = tx.commit(&format!("[ingest:skip] {interned}"))?;
+        intern_guard.defuse();
         if let Some(hooks) = &options.hooks {
             crate::hooks::post_ingest(hooks, source_path, &commit_id, &plan.summary, 0, 0).await;
         }
@@ -374,8 +382,22 @@ pub async fn ingest_with_retrieval(
         });
     }
 
+    // Valid link targets = every existing wiki page stem plus the stems
+    // this plan itself creates (links between same-plan pages are fine).
+    let mut valid_stems: std::collections::HashSet<String> = prior_scan
+        .pages
+        .iter()
+        .filter(|p| p.path.starts_with("wiki/"))
+        .filter_map(|p| p.path.file_stem().map(str::to_lowercase))
+        .collect();
+    for action in &plan.pages {
+        if let Some(stem) = Utf8Path::new(&action.path).file_stem() {
+            valid_stems.insert(stem.to_lowercase());
+        }
+    }
     for page in &mut plan.pages {
         page.body = normalize_wikilinks(&page.body);
+        page.body = unlink_unresolvable(&page.body, &valid_stems);
     }
 
     guard_stem_collisions(&mut plan, &stem_to_path, &existing_paths)?;
@@ -403,8 +425,14 @@ pub async fn ingest_with_retrieval(
     if converter.is_none() {
         tx.put_file(&interned, source_text.clone())?;
     } else {
+        // Converted sources: stage the extracted text as a sibling, and —
+        // when the raw source is itself valid UTF-8 (html) — stage the raw
+        // file too so the cited source is git-tracked, not just on disk.
         let sibling = Utf8PathBuf::from(format!("{interned}.extracted.md"));
         tx.put_file(&sibling, source_text.clone())?;
+        if let Some(raw_text) = raw_utf8.clone() {
+            tx.put_file(&interned, raw_text)?;
+        }
     }
 
     // Pages superseded by this plan get a `superseded_by` marker (their
@@ -503,6 +531,7 @@ pub async fn ingest_with_retrieval(
 
     // 8. Commit (or preview on dry-run).
     if options.dry_run {
+        intern_guard.defuse(); // dry-run intentionally keeps the interned source
         let diff = tx.diff();
         drop(tx); // explicit rollback; the Drop impl is a no-op anyway
         return Ok(IngestReport {
@@ -517,6 +546,7 @@ pub async fn ingest_with_retrieval(
     }
     let commit_message = format!("[ingest] {}", plan.summary);
     let commit_id = tx.commit(&commit_message)?;
+    intern_guard.defuse();
 
     // Post-ingest hook (fire-and-forget).
     if let Some(hooks) = &options.hooks {
@@ -540,6 +570,46 @@ pub async fn ingest_with_retrieval(
         dry_run_diff: Vec::new(),
         redundant: false,
     })
+}
+
+/// Unlink wikilinks whose target resolves to no existing page and no page
+/// created by this plan: `[[ghost]]` becomes `ghost`, `[[ghost|label]]`
+/// becomes `label`.
+///
+/// Bulk ingests hit a chicken-and-egg ordering problem — early sources
+/// legitimately reference concepts that later sources will define. The
+/// lint gate would (correctly) abort the whole commit over one phantom
+/// link; unlinking preserves the prose, keeps the commit flowing, and
+/// leaves re-linking to `suggest-links` / later ingests once the target
+/// exists. Heading-only links (`[[#Section]]`) are left alone.
+fn unlink_unresolvable(body: &str, valid_stems: &std::collections::HashSet<String>) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\[\[([^\]|#]+)(#[^\]|]*)?(\|([^\]]+))?\]\]")
+            .expect("unlink_unresolvable regex is valid")
+    });
+    re.replace_all(body, |caps: &regex::Captures<'_>| {
+        // Repair common LLM link artifacts before validating (all observed
+        // live): stray trailing backslash escapes (`[[target\]]`) and `.md`
+        // extensions on the stem (`[[target.md]]`).
+        let target = caps
+            .get(1)
+            .map_or("", |m| m.as_str())
+            .trim()
+            .trim_end_matches('\\');
+        let target = target.strip_suffix(".md").unwrap_or(target);
+        let display = caps.get(4).map_or(target, |m| m.as_str());
+        if valid_stems.contains(&target.to_lowercase()) {
+            match caps.get(4) {
+                Some(alias) => format!("[[{target}|{}]]", alias.as_str()),
+                None => format!("[[{target}]]"),
+            }
+        } else {
+            display.to_string()
+        }
+    })
+    .into_owned()
 }
 
 fn normalize_wikilinks(body: &str) -> String {
@@ -767,6 +837,30 @@ fn select_relevant_pages<'a>(pages: &'a [Page], source_text: &str, top_n: usize)
 /// Copy a source file into `sources/<category>/<hash_prefix>-<slug>.<ext>`
 /// inside the vault if it is not already there. Returns the vault-relative
 /// path of the interned copy.
+/// Parse an `IngestPlanRaw`, tolerating one tool-call-style envelope:
+/// some proxy routes return the plan wrapped in a tool-arguments shape —
+/// `{"input": {...}}` and `{"tool_input": {...}}` both observed live —
+/// instead of the bare object.
+fn parse_plan_tolerant(payload: &str) -> serde_json::Result<crate::llm::prompts::IngestPlanRaw> {
+    match serde_json::from_str(payload) {
+        Ok(plan) => Ok(plan),
+        Err(direct_err) => {
+            if let Ok(serde_json::Value::Object(map)) =
+                serde_json::from_str::<serde_json::Value>(payload)
+            {
+                for key in ["input", "tool_input", "arguments", "plan", "response"] {
+                    if let Some(inner @ serde_json::Value::Object(_)) = map.get(key) {
+                        if let Ok(plan) = serde_json::from_value(inner.clone()) {
+                            return Ok(plan);
+                        }
+                    }
+                }
+            }
+            Err(direct_err)
+        }
+    }
+}
+
 /// Record span-level provenance and lifecycle metadata from a plan action
 /// onto a page's frontmatter `extra` map:
 /// - `source_quotes`: map of interned-source path → short verbatim quote
@@ -847,7 +941,9 @@ fn find_near_duplicate_source(vault: &Vault, text: &str) -> Option<(Utf8PathBuf,
     None
 }
 
-fn intern_source(vault: &Vault, source_path: &Path, bytes: &[u8]) -> Result<Utf8PathBuf> {
+/// Returns the vault-relative interned path plus whether this call newly
+/// created the file (`false` = it already existed from a prior ingest).
+fn intern_source(vault: &Vault, source_path: &Path, bytes: &[u8]) -> Result<(Utf8PathBuf, bool)> {
     let hash = sha256_hex(bytes);
     let hash_prefix = &hash[..12];
     let ext = source_path
@@ -862,14 +958,48 @@ fn intern_source(vault: &Vault, source_path: &Path, bytes: &[u8]) -> Result<Utf8
     let slug = slugify(stem);
     let rel = Utf8PathBuf::from(format!("sources/{category}/{hash_prefix}-{slug}.{ext}"));
     let abs = vault.root().join(&rel);
-    if !abs.as_std_path().exists() {
+    let created = !abs.as_std_path().exists();
+    if created {
         if let Some(parent) = abs.as_std_path().parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::io(parent.to_path_buf(), e))?;
         }
         std::fs::write(abs.as_std_path(), bytes)
             .map_err(|e| Error::io(abs.clone().into_std_path_buf(), e))?;
     }
-    Ok(rel)
+    Ok((rel, created))
+}
+
+/// Removes a freshly-interned source when its ingest fails before commit.
+///
+/// Interning happens before the LLM call and the transaction; without this
+/// cleanup a failed ingest leaves an orphan under `sources/` that is (a)
+/// untracked by git and (b) poisonous to every retry path — bulk-ingest's
+/// interned-dedup skips the file and the near-duplicate gate matches the
+/// orphan at similarity 1.0. Armed only when this run created the file;
+/// call `defuse()` once the outcome (commit, redundant-skip, dry-run) owns
+/// the file.
+struct InternGuard {
+    abs: Option<std::path::PathBuf>,
+}
+
+impl InternGuard {
+    fn new(vault: &Vault, rel: &Utf8Path, created: bool) -> Self {
+        Self {
+            abs: created.then(|| vault.root().join(rel).into_std_path_buf()),
+        }
+    }
+
+    fn defuse(&mut self) {
+        self.abs = None;
+    }
+}
+
+impl Drop for InternGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.abs.take() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 fn category_for_ext(ext: &str) -> &'static str {
@@ -1137,6 +1267,54 @@ mod tests {
             log_entry: "test log".into(),
             redundant: false,
         }
+    }
+
+    #[test]
+    fn parse_plan_tolerant_unwraps_input_envelope() {
+        let wrapped = r#"{"input":{"summary":"s","pages":[],"log_entry":"l","redundant":true}}"#;
+        let plan = parse_plan_tolerant(wrapped).expect("envelope unwrapped");
+        assert!(plan.redundant);
+        let bare = r#"{"summary":"s","pages":[],"log_entry":"l"}"#;
+        assert!(parse_plan_tolerant(bare).is_ok());
+        assert!(parse_plan_tolerant("{\"nope\":1}").is_err());
+    }
+
+    #[test]
+    fn unlink_unresolvable_strips_phantom_links() {
+        let mut valid = std::collections::HashSet::new();
+        valid.insert("real-page".to_string());
+        let body = "See [[real-page]] and [[ghost-page]] and [[ghost|Ghost Label]].";
+        let out = unlink_unresolvable(body, &valid);
+        assert_eq!(out, "See [[real-page]] and ghost-page and Ghost Label.");
+    }
+
+    #[test]
+    fn unlink_unresolvable_repairs_trailing_backslash() {
+        let mut valid = std::collections::HashSet::new();
+        valid.insert("palantir".to_string());
+        let body = r"See [[palantir\]] for context.";
+        let out = unlink_unresolvable(body, &valid);
+        assert_eq!(out, "See [[palantir]] for context.");
+    }
+
+    #[test]
+    fn unlink_unresolvable_strips_md_extension() {
+        let mut valid = std::collections::HashSet::new();
+        valid.insert("openai".to_string());
+        let out = unlink_unresolvable("See [[openai.md]] and [[missing.md]].", &valid);
+        assert_eq!(out, "See [[openai]] and missing.");
+    }
+
+    #[test]
+    fn unlink_unresolvable_keeps_heading_and_alias_links() {
+        let mut valid = std::collections::HashSet::new();
+        valid.insert("target".to_string());
+        let body = "Jump to [[#Section]] then [[target|nice name]] and [[Target]].";
+        let out = unlink_unresolvable(body, &valid);
+        // heading-only link untouched; alias preserved; case-insensitive stem match
+        assert!(out.contains("[[#Section]]"));
+        assert!(out.contains("[[target|nice name]]"));
+        assert!(out.contains("[[Target]]"));
     }
 
     fn make_action(action: IngestAction, path: &str) -> IngestPageAction {

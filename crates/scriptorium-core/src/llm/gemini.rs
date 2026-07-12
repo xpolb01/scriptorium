@@ -222,51 +222,56 @@ impl LlmProvider for GeminiProvider {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        // Gemini's batchEmbedContents takes one request per text, bundled.
+        // Gemini's batchEmbedContents takes one request per text, bundled —
+        // but rejects batches over 100 requests (INVALID_ARGUMENT, observed
+        // live when embedding a 187-page vault in one call). Chunk and
+        // concatenate so callers can pass any number of texts.
+        const MAX_BATCH: usize = 100;
         let model_path = format!("models/{}", self.config.embed_model);
-        let requests: Vec<serde_json::Value> = texts
-            .iter()
-            .map(|t| {
-                json!({
-                    "model": model_path,
-                    "content": {"parts": [{"text": t}]},
-                })
-            })
-            .collect();
-        let body = json!({ "requests": requests });
         let url = format!(
             "{}/models/{}:batchEmbedContents?key={}",
             self.config.base_url, self.config.embed_model, self.config.api_key
         );
-        let parsed: BatchEmbedResponse =
-            with_retry(self.config.max_attempts, self.config.timeout, || async {
-                let resp = self
-                    .client
-                    .post(&url)
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(|e| Retry::Transient(LlmError::network("gemini", e.to_string())))?;
-                let status = resp.status();
-                if !status.is_success() {
-                    let text = resp.text().await.unwrap_or_default();
-                    return Err(classify(
-                        status,
-                        LlmError::api("gemini", status.as_u16(), text),
-                    ));
-                }
-                let parsed: BatchEmbedResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| Retry::Permanent(LlmError::InvalidResponse(e.to_string())))?;
-                Ok(parsed)
-            })
-            .await?;
-        let vectors = parsed
-            .embeddings
-            .into_iter()
-            .map(|e| normalize(e.values))
-            .collect();
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(MAX_BATCH) {
+            let requests: Vec<serde_json::Value> = batch
+                .iter()
+                .map(|t| {
+                    json!({
+                        "model": model_path,
+                        "content": {"parts": [{"text": t}]},
+                    })
+                })
+                .collect();
+            let body = json!({ "requests": requests });
+            let parsed: BatchEmbedResponse =
+                with_retry(self.config.max_attempts, self.config.timeout, || async {
+                    let resp = self
+                        .client
+                        .post(&url)
+                        .json(&body)
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            Retry::Transient(LlmError::network("gemini", e.to_string()))
+                        })?;
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let text = resp.text().await.unwrap_or_default();
+                        return Err(classify(
+                            status,
+                            LlmError::api("gemini", status.as_u16(), text),
+                        ));
+                    }
+                    let parsed: BatchEmbedResponse = resp
+                        .json()
+                        .await
+                        .map_err(|e| Retry::Permanent(LlmError::InvalidResponse(e.to_string())))?;
+                    Ok(parsed)
+                })
+                .await?;
+            vectors.extend(parsed.embeddings.into_iter().map(|e| normalize(e.values)));
+        }
         Ok(vectors)
     }
 

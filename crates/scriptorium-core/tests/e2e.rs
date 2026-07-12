@@ -254,33 +254,50 @@ async fn ingest_updates_existing_page_and_preserves_id() {
 }
 
 #[tokio::test]
-async fn ingest_aborts_when_plan_introduces_broken_link() {
+async fn ingest_unlinks_unresolvable_plan_links_instead_of_aborting() {
     let (dir, vault) = empty_test_vault();
 
-    // Plan references a non-existent page — validation should block the commit.
+    // Plan references a non-existent page. Historically this aborted the
+    // whole commit at the lint gate; since the bulk-ingest hardening the
+    // phantom link is unlinked to plain text and the commit proceeds
+    // (cross-referencing corpora legitimately link concepts that later
+    // sources define). Links to pages created by the same plan survive.
     let plan = IngestPlan {
-        summary: "bad".into(),
-        pages: vec![IngestPageAction {
-            action: IngestAction::Create,
-            path: "wiki/concepts/broken.md".into(),
-            title: "Broken".into(),
-            tags: vec![],
-            body: "Linking to [[ghost-page]].\n".into(),
-            source_quote: None,
-            supersedes: vec![],
-        }],
-        log_entry: "bad".into(),
+        summary: "phantom link".into(),
+        pages: vec![
+            IngestPageAction {
+                action: IngestAction::Create,
+                path: "wiki/concepts/broken.md".into(),
+                title: "Broken".into(),
+                tags: vec![],
+                body: "Linking to [[ghost-page]] and [[sibling]].\n".into(),
+                source_quote: None,
+                supersedes: vec![],
+            },
+            IngestPageAction {
+                action: IngestAction::Create,
+                path: "wiki/concepts/sibling.md".into(),
+                title: "Sibling".into(),
+                tags: vec![],
+                body: "Sibling page.\n".into(),
+                source_quote: None,
+                supersedes: vec![],
+            },
+        ],
+        log_entry: "phantom link".into(),
         redundant: false,
     };
     let mock = MockProvider::constant(serde_json::to_string(&plan).unwrap());
     let source = dir.path().join("sources/articles/bad.md");
     std::fs::write(&source, "bad").unwrap();
 
-    let err = ingest::ingest(&vault, &mock, &source).await.unwrap_err();
-    assert!(err.to_string().contains("broken wikilink"));
-    // Nothing was written.
-    assert!(!dir.path().join("wiki/concepts/broken.md").exists());
-    assert!(!dir.path().join("log.md").exists());
+    let report = ingest::ingest(&vault, &mock, &source).await.unwrap();
+    assert_eq!(report.created, 2);
+    let body = std::fs::read_to_string(dir.path().join("wiki/concepts/broken.md")).unwrap();
+    assert!(
+        body.contains("Linking to ghost-page and [[sibling]]."),
+        "phantom link unlinked, same-plan link kept: {body}"
+    );
 }
 
 #[tokio::test]
