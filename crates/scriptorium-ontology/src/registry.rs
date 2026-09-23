@@ -129,7 +129,7 @@ impl Registry {
                 Loaded::Invalid(issue) => issues.push(issue),
                 Loaded::Ok(sub) => {
                     if seen.insert(sub.name.clone()) {
-                        sub_ontologies.push(sub);
+                        sub_ontologies.push(*sub);
                     } else {
                         issues.push(RegistryIssue {
                             path: join(&dir, SUBGRAPH_MANIFEST),
@@ -168,7 +168,7 @@ impl Registry {
 enum Loaded {
     NotASubOntology,
     Invalid(RegistryIssue),
-    Ok(SubOntology),
+    Ok(Box<SubOntology>),
 }
 
 fn load_one(snapshot: &dyn Snapshot, dir: &str, dir_name: &str) -> Result<Loaded> {
@@ -238,14 +238,14 @@ fn load_one(snapshot: &dyn Snapshot, dir: &str, dir_name: &str) -> Result<Loaded
         );
     };
 
-    Ok(Loaded::Ok(SubOntology {
+    Ok(Loaded::Ok(Box::new(SubOntology {
         name,
         dir: dir.to_string(),
         description: manifest.description,
         owners: manifest.owners,
         sdl,
         source,
-    }))
+    })))
 }
 
 /// `data_dir` as the path records are read at: relative, inside the

@@ -5,14 +5,26 @@
 //! deliberately small read interface keyed by entity type and key. A record
 //! holds only the fields its own sub-ontology owns — joining an entity's
 //! fields across sub-ontologies is the federation gateway's job.
+//!
+//! | `kind` | Instances | Build feature |
+//! |---|---|---|
+//! | `git` | YAML records in the git snapshot | — |
+//! | `markdown` | `.md` notes with YAML frontmatter in the git snapshot | — |
+//! | `postgres` | one table per entity type | `postgres` |
+//! | `dynamodb` | one table, `pk = "<Type>#<key>"` | `dynamodb` |
 
+#[cfg(feature = "dynamodb")]
+pub mod dynamodb;
 pub mod git;
+pub mod markdown;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::manifest::StorageConfig;
 use crate::registry::SubOntology;
 use crate::snapshot::Snapshot;
@@ -91,24 +103,59 @@ pub trait EntityStore: Send + Sync {
     fn prepare_references(&self, _type_name: &str, _field: &str) -> Result<()> {
         Ok(())
     }
+
+    /// Check the backing store is reachable (connect, describe the table,
+    /// …). `serve` calls this before it publishes a supergraph or accepts
+    /// requests; `compose` does not, so it needs no database access.
+    async fn ready(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Open the store a local sub-ontology's manifest asks for.
 ///
 /// `key_fields` maps each entity type to its key field so adapters can
 /// return records that include their own key.
+///
+/// Opening never touches the network: database stores connect lazily (see
+/// [`EntityStore::ready`]).
 pub fn open_store(
     sub: &SubOntology,
     storage: &StorageConfig,
     snapshot: Arc<dyn Snapshot>,
     key_fields: std::collections::BTreeMap<String, String>,
-) -> Arc<dyn EntityStore> {
-    match storage {
+) -> Result<Arc<dyn EntityStore>> {
+    Ok(match storage {
         StorageConfig::Git { data_dir } => Arc::new(git::GitRecordStore::new(
             snapshot,
             crate::layout::join(&sub.dir, data_dir),
             key_fields,
         )),
+        StorageConfig::Markdown(config) => Arc::new(markdown::MarkdownStore::new(
+            snapshot, &sub.name, config, key_fields,
+        )?),
+        #[cfg(feature = "postgres")]
+        StorageConfig::Postgres(config) => {
+            Arc::new(postgres::PostgresStore::new(&sub.name, config, key_fields)?)
+        }
+        #[cfg(not(feature = "postgres"))]
+        StorageConfig::Postgres(_) => return Err(feature_missing(&sub.name, "postgres")),
+        #[cfg(feature = "dynamodb")]
+        StorageConfig::Dynamodb(config) => {
+            Arc::new(dynamodb::DynamoStore::new(&sub.name, config, key_fields)?)
+        }
+        #[cfg(not(feature = "dynamodb"))]
+        StorageConfig::Dynamodb(_) => return Err(feature_missing(&sub.name, "dynamodb")),
+    })
+}
+
+#[cfg(any(not(feature = "postgres"), not(feature = "dynamodb")))]
+fn feature_missing(sub: &str, feature: &str) -> Error {
+    Error::Store {
+        store: format!("{feature}:{sub}"),
+        message: format!(
+            "this build has no `{feature}` storage; rebuild with `--features {feature}`"
+        ),
     }
 }
 

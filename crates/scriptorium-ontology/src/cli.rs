@@ -744,6 +744,16 @@ async fn serve(
     let supergraph = supergraph.as_deref().map(publication_target).transpose()?;
     let _publisher = supergraph.as_deref().map(lock_publication).transpose()?;
 
+    // Every store must be reachable before anything is published: a
+    // database outage fails startup instead of serving a broken subgraph.
+    for subgraph in &subgraphs {
+        subgraph
+            .store
+            .ready()
+            .await
+            .map_err(|e| miette!("[{}] {}: {e}", subgraph.name, subgraph.store.describe()))?;
+    }
+
     // Bind before publishing the supergraph: if the port is taken (say an
     // older server still runs), fail without touching the gateway's file.
     let listener = crate::serve::bind(&addr)
@@ -819,7 +829,7 @@ fn serve_banner(
                 "  {:12} {}  ({})",
                 sub.name,
                 sub.subgraph_url(base_url),
-                served.store
+                served.store.describe()
             ),
             None => writeln!(
                 banner,

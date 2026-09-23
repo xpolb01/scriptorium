@@ -29,8 +29,9 @@ use crate::store::open_store;
 /// A runnable subgraph for one local sub-ontology.
 pub struct Subgraph {
     pub name: String,
-    /// Where its instances come from, e.g. `git:ontology/core/data@HEAD@1a2b3c4`.
-    pub store: String,
+    /// Where its instances come from; `store.describe()` reads e.g.
+    /// `git:ontology/core/data@HEAD@1a2b3c4`.
+    pub store: Arc<dyn crate::store::EntityStore>,
     pub schema: schema::SubgraphSchema,
     /// The commit it serves, sent as [`REVISION_HEADER`] with every answer.
     pub revision: String,
@@ -55,8 +56,7 @@ pub fn build_subgraphs(registry: &Registry, snapshot: &Arc<dyn Snapshot>) -> Res
             .entities()
             .filter_map(|o| o.key_field().map(|k| (o.name.clone(), k.to_string())))
             .collect();
-        let store = open_store(sub, storage, Arc::clone(snapshot), key_fields);
-        let store_label = store.describe();
+        let store = open_store(sub, storage, Arc::clone(snapshot), key_fields)?;
         // Index every inverse relation up front, before any request arrives.
         for object in model.domain_objects() {
             for field in &object.fields {
@@ -67,10 +67,10 @@ pub fn build_subgraphs(registry: &Registry, snapshot: &Arc<dyn Snapshot>) -> Res
                 }
             }
         }
-        let schema = schema::build_schema(&sub.name, &sub.sdl, store)?;
+        let schema = schema::build_schema(&sub.name, &sub.sdl, Arc::clone(&store))?;
         out.push(Subgraph {
             name: sub.name.clone(),
-            store: store_label,
+            store,
             schema,
             revision: registry
                 .commit
@@ -211,6 +211,7 @@ mod tests {
         assert_eq!(names, ["core"]);
         assert!(subgraphs[0]
             .store
+            .describe()
             .starts_with("git:ontology/core/data@HEAD@"));
     }
 }

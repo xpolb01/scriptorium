@@ -32,6 +32,12 @@ must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
+[features]
+default = []
+# Storage adapters that need a database client.
+postgres = []
+dynamodb = []
+
 [dependencies]
 async-graphql = { version = "7.2.1", default-features = false, features = ["dynamic-schema"] }
 async-trait = "0.1.92"
@@ -39,9 +45,13 @@ axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
 cynic-parser = "0.11.2"
 git2 = { version = "0.21.0", default-features = false }
+# Held at 0.2 like scriptorium-core, so notes read the same way as vault pages
+# (0.3 parses unquoted `True`/`False` as booleans).
+gray_matter = { version = "0.2.9", default-features = false, features = ["yaml"] }
 # MPL-2.0 (GPL-compatible). Do not swap in `apollo-federation` (Elastic-2.0).
 graphql-composition = "0.12.2"
 miette = { version = "7.6.0", features = ["fancy"] }
+regex = "1.13.1"
 # `compose --out` asks the local subgraphs what they serve (rustls over
 # aws-lc-rs, like the root workspace's reqwest).
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
