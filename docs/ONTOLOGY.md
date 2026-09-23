@@ -199,8 +199,10 @@ body_field = "body"      # optional: receives the markdown body
 links_field = "related"  # optional: receives the keys of the notes the body links to
 ```
 
-A frontmatter string that is exactly one `[[wikilink]]` names another note
-and becomes that note's key; links resolve by file stem, ignoring case. A
+In a field the schema declares, a frontmatter string that is exactly one
+`[[wikilink]]` names another note and becomes that note's key; links
+resolve by file stem, ignoring case, and other frontmatter is left as it
+is. A
 frontmatter relation that names no note keeps its text as the key (an
 entity elsewhere, or a dangling reference `check` reports), and one naming
 an ambiguous stem (two notes share it) is an error, never a guess.

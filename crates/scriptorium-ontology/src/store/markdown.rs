@@ -16,7 +16,7 @@
 //! The whole directory is loaded once per store and indexed in memory.
 //! Files that cannot be loaded are skipped and reported by `check`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
@@ -91,6 +91,9 @@ pub struct NoteTypes {
     /// Entity type → the entity type its `links_field` lists: a body link
     /// to a note of another type is prose, not that relation.
     pub link_targets: BTreeMap<String, String>,
+    /// Entity type → the fields its schema declares. Only these hold
+    /// relations; other frontmatter (Obsidian's `aliases`, …) is ignored.
+    pub fields: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl NoteTypes {
@@ -116,9 +119,17 @@ impl NoteTypes {
                     .collect()
             })
             .unwrap_or_default();
+        let fields = model
+            .entities()
+            .map(|o| {
+                let names = o.fields.iter().map(|f| f.name.clone()).collect();
+                (o.name.clone(), names)
+            })
+            .collect();
         Self {
             key_fields,
             link_targets,
+            fields,
         }
     }
 }
@@ -301,9 +312,14 @@ impl Settings {
             body,
         } in parsed
         {
+            // Undeclared frontmatter is ignored, as `check` ignores it, even
+            // when it names an ambiguous stem.
+            let declared = self.schema.fields.get(&type_name);
             let mut ambiguous = Vec::new();
-            for value in record.values_mut() {
-                resolve_wikilink_values(value, &stems, &mut ambiguous);
+            for (field, value) in &mut record {
+                if declared.is_some_and(|fields| fields.contains(field)) {
+                    resolve_wikilink_values(value, &stems, &mut ambiguous);
+                }
             }
             if !ambiguous.is_empty() {
                 loaded.problems.push(Problem {
@@ -721,17 +737,26 @@ mod tests {
         }
     }
 
-    fn store(dir: &std::path::Path, extra: &str, keys: &[(&str, &str)]) -> MarkdownStore {
+    /// A store over `dir` at HEAD for `types`: each entity type, its key
+    /// field, and the fields its schema declares.
+    fn store(dir: &std::path::Path, extra: &str, types: &[(&str, &str, &[&str])]) -> MarkdownStore {
         MarkdownStore::new(
             Arc::new(GitSnapshot::open(dir, "HEAD").unwrap()),
             &sub(),
             &config(extra),
             NoteTypes {
-                key_fields: keys
+                key_fields: types
                     .iter()
-                    .map(|(t, k)| ((*t).to_string(), (*k).to_string()))
+                    .map(|(t, k, _)| ((*t).to_string(), (*k).to_string()))
                     .collect(),
                 link_targets: BTreeMap::new(),
+                fields: types
+                    .iter()
+                    .map(|(t, _, fields)| {
+                        let names = fields.iter().map(ToString::to_string).collect();
+                        ((*t).to_string(), names)
+                    })
+                    .collect(),
             },
         )
         .unwrap()
@@ -753,7 +778,7 @@ mod tests {
         let s = store(
             dir.path(),
             "type = \"Person\"\nbody_field = \"body\"\nlinks_field = \"links\"",
-            &[("Person", "id")],
+            &[("Person", "id", &["name", "friends", "body", "links"])],
         );
         let v = s.get("Person", "vaswani").await.unwrap().unwrap();
         assert_eq!(v["id"], json!("vaswani"));
@@ -816,7 +841,7 @@ mod tests {
         let s = store(
             dir.path(),
             "type_field = \"type\"\nkey = \"frontmatter:id\"",
-            &[("Paper", "id")],
+            &[("Paper", "id", &["title", "cites"])],
         );
         let a = s.get("Paper", "01AAA").await.unwrap().unwrap();
         assert_eq!(
@@ -862,7 +887,7 @@ mod tests {
         let s = store(
             dir.path(),
             "type = \"Topic\"\nbody_field = \"body\"\nlinks_field = \"links\"",
-            &[("Topic", "id")],
+            &[("Topic", "id", &["title", "body", "links"])],
         );
         let (notes, problems) = s.notes().unwrap();
         let mut bad: Vec<(&str, &str)> = problems
@@ -889,6 +914,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_declared_fields_hold_relations() {
+        let dir = tempfile::tempdir().unwrap();
+        commit_files(
+            dir.path(),
+            &[
+                ("notes/a/foo.md", "---\nid: A\n---\n"),
+                ("notes/b/foo.md", "---\nid: B\n---\n"),
+                (
+                    "notes/x.md",
+                    "---\nid: X\naliases: [\"[[foo]]\"]\nrel: [\"[[y]]\"]\n---\n",
+                ),
+                ("notes/y.md", "---\nid: Y\n---\n"),
+            ],
+            "init",
+        );
+        let s = store(
+            dir.path(),
+            "type = \"Topic\"\nkey = \"frontmatter:id\"",
+            &[("Topic", "id", &["rel"])],
+        );
+        // An ambiguous stem in metadata the schema never reads is not a
+        // problem, and is left as it was.
+        let x = s.get("Topic", "X").await.unwrap().expect("X loads");
+        assert_eq!(x["rel"], json!(["Y"]));
+        assert_eq!(x["aliases"], json!(["[[foo]]"]));
+        let (_, problems) = s.notes().unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[tokio::test]
     async fn ambiguous_frontmatter_links_are_problems_not_guesses() {
         let dir = tempfile::tempdir().unwrap();
         commit_files(
@@ -909,7 +964,7 @@ mod tests {
         let s = store(
             dir.path(),
             "type = \"Topic\"\nkey = \"frontmatter:id\"",
-            &[("Topic", "id")],
+            &[("Topic", "id", &["rel"])],
         );
         let (_, problems) = s.notes().unwrap();
         assert_eq!(problems.len(), 1, "{problems:?}");
@@ -990,7 +1045,7 @@ type Query { topic(id: ID!): Topic }
         let parent = repo.head().unwrap().peel_to_commit().unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "latin1", &tree, &[&parent])
             .unwrap();
-        let s = store(dir.path(), "type = \"Topic\"", &[("Topic", "id")]);
+        let s = store(dir.path(), "type = \"Topic\"", &[("Topic", "id", &[])]);
         let (notes, problems) = s.notes().unwrap();
         assert_eq!(notes.len(), 1, "the fine note still loads");
         assert_eq!(problems.len(), 1, "{problems:?}");
@@ -1020,7 +1075,7 @@ type Query { topic(id: ID!): Topic }
             ],
             "init",
         );
-        let s = store(dir.path(), "type = \"Topic\"", &[("Topic", "id")]);
+        let s = store(dir.path(), "type = \"Topic\"", &[("Topic", "id", &[])]);
         let (notes, problems) = s.notes().unwrap();
         let mut bad: Vec<&str> = problems.iter().map(|p| p.path.as_str()).collect();
         bad.sort_unstable();
@@ -1050,6 +1105,7 @@ type Query { topic(id: ID!): Topic }
         NoteTypes {
             key_fields: BTreeMap::from([("A".to_string(), "id".to_string())]),
             link_targets: BTreeMap::new(),
+            fields: BTreeMap::new(),
         }
     }
 
