@@ -147,7 +147,7 @@ fn check_git(vault: &Vault) -> DoctorCheck {
             let branch = repo
                 .head()
                 .ok()
-                .and_then(|h| h.shorthand().map(String::from))
+                .and_then(|h| h.shorthand().ok().map(String::from))
                 .unwrap_or_else(|| "detached".into());
             DoctorCheck::ok("git_repo", format!("Repository on branch {branch}"))
         }

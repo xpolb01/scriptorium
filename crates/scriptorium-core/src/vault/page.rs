@@ -34,7 +34,7 @@ pub struct PageId(Ulid);
 impl PageId {
     /// Generate a fresh, monotonic-time-ordered ID.
     pub fn new() -> Self {
-        Self(Ulid::new())
+        Self(Ulid::generate())
     }
 
     /// Construct from a Crockford-base32 string (the ULID textual form).
@@ -262,6 +262,36 @@ Body text.
         assert_eq!(page.frontmatter.title, "Hello");
         assert_eq!(page.frontmatter.schema_version, SCHEMA_VERSION);
         assert!(page.body.contains("Body text"));
+    }
+
+    #[test]
+    fn unquoted_boolean_like_titles_stay_strings() {
+        // Held at gray_matter 0.2: 0.3's YAML parser reads `True` as a
+        // boolean, which would drop such pages from every vault scan.
+        for title in ["True", "False", "TRUE", "yes", "No"] {
+            let input = format!(
+                "---\nid: 01ARZ3NDEKTSV4RRFFQ69G5FAV\ntitle: {title}\ncreated: 2026-04-06T12:00:00Z\nupdated: 2026-04-06T12:00:00Z\n---\nbody\n"
+            );
+            let page = Page::parse("wiki/t.md", &input).unwrap();
+            assert_eq!(page.frontmatter.title, title);
+        }
+    }
+
+    #[test]
+    fn nested_extra_mappings_render_in_sorted_key_order() {
+        // gray_matter keeps parsed mappings in a `HashMap`; the rendered
+        // frontmatter (and so `content_hash`) must not depend on its order.
+        let input = "---\nid: 01ARZ3NDEKTSV4RRFFQ69G5FAV\ntitle: T\n\
+                     created: 2026-04-06T12:00:00Z\nupdated: 2026-04-06T12:00:00Z\n\
+                     relations:\n- f: 6\n  e: 5\n  d: 4\n  c: 3\n  b: 2\n  a: 1\n---\nbody\n";
+        let rendered = Page::parse("wiki/t.md", input)
+            .unwrap()
+            .to_markdown()
+            .unwrap();
+        assert!(
+            rendered.contains("relations:\n- a: 1\n  b: 2\n  c: 3\n  d: 4\n  e: 5\n  f: 6\n"),
+            "nested mapping not rendered in sorted key order:\n{rendered}"
+        );
     }
 
     #[test]
