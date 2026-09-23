@@ -123,8 +123,8 @@ pub fn check(snapshot: &dyn Snapshot, ontology_dir: &str) -> Result<CheckReport>
         );
     }
 
-    // Every entity type a git-backed sub-ontology owns has a complete key
-    // set, even when it has no records yet.
+    // Every entity type a git- or markdown-backed sub-ontology owns has a
+    // complete key set (both are read in full here), even with no records.
     register_owners(&registry, &mut acc);
     acc.moves = override_moves(&registry);
 
@@ -148,9 +148,13 @@ pub fn check(snapshot: &dyn Snapshot, ontology_dir: &str) -> Result<CheckReport>
     })
 }
 
-/// Whether `check` reads this sub-ontology's instances.
+/// Whether `check` reads this sub-ontology's instances (git records and
+/// markdown notes are read in full).
 fn reads_instances(source: &SubOntologySource) -> bool {
-    matches!(source, SubOntologySource::Local(StorageConfig::Git { .. }))
+    matches!(
+        source,
+        SubOntologySource::Local(StorageConfig::Git { .. } | StorageConfig::Markdown(_))
+    )
 }
 
 /// Note which sub-ontologies own each entity type.
@@ -321,8 +325,8 @@ struct Accumulator {
     stored: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     /// Every stored record, in the order read.
     entries: Vec<Entry>,
-    /// Entity type → the git-backed sub-ontologies that own it (declare a
-    /// plain `type X @key`). An owner answers `null` for a key it has no
+    /// Entity type → the git- or markdown-backed sub-ontologies that own it
+    /// (declare a plain `type X @key`). An owner answers `null` for a key it has no
     /// record of, so an X exists only when every owner stores it.
     owners: BTreeMap<String, BTreeSet<String>>,
     references: Vec<Reference>,
@@ -1232,6 +1236,7 @@ fn validate_markdown_notes(
             );
             continue;
         }
+        lost_filled_fields(sub, config, model, object, &note, acc);
         acc.store(
             &sub.name,
             &note.type_name,
@@ -1253,6 +1258,43 @@ fn validate_markdown_notes(
             &site,
             acc,
         );
+    }
+}
+
+/// With `type_field`, a type may lack a field the store fills: a note of
+/// it with a body or links would lose them unannounced. (A field no type
+/// declares is reported once, by [`filled_field_problems`].)
+fn lost_filled_fields(
+    sub: &SubOntology,
+    config: &MarkdownConfig,
+    model: &SubOntologyModel,
+    object: &ObjectType,
+    note: &crate::store::markdown::Note,
+    acc: &mut Accumulator,
+) {
+    for (field, what) in [(&config.body_field, "body"), (&config.links_field, "links")] {
+        let Some(field) = field.as_ref().filter(|f| {
+            object.field(f).is_none() && model.entities().any(|o| o.field(f).is_some())
+        }) else {
+            continue;
+        };
+        let lost = match note.record.get(field) {
+            Some(Value::String(text)) => !text.trim().is_empty(),
+            Some(Value::Array(items)) => !items.is_empty(),
+            _ => false,
+        };
+        if lost {
+            acc.push(
+                Severity::Error,
+                "ontology.storage",
+                Some(&sub.name),
+                Some(note.path.clone()),
+                format!(
+                    "this `{}` note has {what}, but `{}` declares no `{field}` to serve it in; declare it, or move the {what} out of the note",
+                    note.type_name, note.type_name
+                ),
+            );
+        }
     }
 }
 
@@ -2010,6 +2052,87 @@ type Query { topic(id: ID!): Topic }
         let found = problems(&NOTES_TOML.replace("\"body\"", "\"year\""));
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("fills `Topic.year`"), "{}", found[0]);
+    }
+
+    #[test]
+    fn notes_of_a_type_without_the_filled_fields_keep_nothing_there() {
+        const MIXED: &str = r#"
+extend schema @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
+type Topic @key(fields: "id") { id: ID! body: String related: [Topic!]! }
+type Person @key(fields: "id") { id: ID! name: String }
+type Query { topic(id: ID!): Topic person(id: ID!): Person }
+"#;
+        let report = run(&[
+            (
+                "ontology/notes/subgraph.toml",
+                "[storage]\nkind = \"markdown\"\ndir = \"pages\"\ntype_field = \"type\"\nbody_field = \"body\"\nlinks_field = \"related\"\n",
+            ),
+            ("ontology/notes/schema.graphql", MIXED),
+            (
+                "ontology/notes/pages/topic.md",
+                "---\ntype: Topic\n---\nAbout [[person]].\n",
+            ),
+            (
+                "ontology/notes/pages/person.md",
+                "---\ntype: Person\nname: Ann\n---\nA biography.\n",
+            ),
+            (
+                "ontology/notes/pages/quiet.md",
+                "---\ntype: Person\nname: Bo\n---\n",
+            ),
+        ]);
+        let storage: Vec<(&str, &str)> = report
+            .issues
+            .iter()
+            .filter(|i| i.rule == "ontology.storage")
+            .map(|i| (i.path.as_deref().unwrap_or_default(), i.message.as_str()))
+            .collect();
+        assert_eq!(storage.len(), 1, "{:#?}", report.issues);
+        assert_eq!(storage[0].0, "ontology/notes/pages/person.md");
+        assert!(
+            storage[0].1.contains("declares no `body`"),
+            "{}",
+            storage[0].1
+        );
+    }
+
+    #[test]
+    fn markdown_sub_ontologies_own_their_types() {
+        const READING: &str = r#"
+extend schema @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
+type ReadingList @key(fields: "id") { id: ID! topics: [Topic!]! }
+extend type Topic @key(fields: "id") { id: ID! }
+type Query { list(id: ID!): ReadingList }
+"#;
+        let report = run(&[
+            ("ontology/notes/subgraph.toml", NOTES_TOML),
+            ("ontology/notes/schema.graphql", NOTES),
+            (
+                "ontology/notes/pages/transformers.md",
+                "---\ntitle: Transformers\n---\n",
+            ),
+            ("ontology/reading/subgraph.toml", GIT),
+            ("ontology/reading/schema.graphql", READING),
+            (
+                "ontology/reading/data/ReadingList/week1.yaml",
+                "topics: [transformers, ghost]\n",
+            ),
+        ]);
+        assert_eq!(
+            rules(&report),
+            ["ontology.record.dangling_ref"],
+            "{:#?}",
+            report.issues
+        );
+        let issue = &report.issues[0];
+        assert_eq!(issue.severity, Severity::Error);
+        assert!(
+            issue
+                .message
+                .contains("Topic:ghost, but `notes` (which owns Topic)"),
+            "{}",
+            issue.message
+        );
     }
 
     #[test]
