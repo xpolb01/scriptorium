@@ -635,86 +635,57 @@ fn resolve_wikilink_values(
     }
 }
 
-/// `[[wikilink]]` targets in a markdown body, in order, skipping fenced code
-/// blocks and inline code.
+/// `[[wikilink]]` targets in a markdown body, in order. The body is read as
+/// `CommonMark`, as the vault reads its pages: links in code (spans, which
+/// may run across lines, and fenced or indented blocks) and in raw HTML do
+/// not count, nor do `![[embeds]]`.
 fn wikilink_targets(body: &str) -> Vec<String> {
     let mut targets = Vec::new();
-    // The open code fence: its character and length.
-    let mut fence: Option<(char, usize)> = None;
-    for line in body.lines() {
-        match (fence, code_fence(line)) {
-            (None, Some((c, len, _))) => {
-                fence = Some((c, len));
-                continue;
-            }
-            // As in `CommonMark`, only a fence of the same character, at
-            // least as long, and alone on its line closes one.
-            (Some((open, open_len)), Some((c, len, true))) if c == open && len >= open_len => {
-                fence = None;
-                continue;
-            }
-            (Some(_), _) => continue,
-            (None, None) => {}
-        }
-        let without_code = strip_inline_code(line);
-        for capture in wikilink_regex().captures_iter(&without_code) {
+    let mut at = 0;
+    let end = std::iter::once(body.len()..body.len());
+    for skipped in code_and_html(body).into_iter().chain(end) {
+        let text = &body[at..skipped.start.max(at)];
+        for capture in wikilink_regex().captures_iter(text) {
             let start = capture.get(0).map_or(0, |m| m.start());
-            if without_code[..start].ends_with('!') {
+            if text[..start].ends_with('!') {
                 continue;
             }
             targets.push(capture[1].trim().to_string());
         }
+        at = at.max(skipped.end);
     }
     targets
 }
 
-/// A code fence on `line`: its character, its length, and whether nothing
-/// but spaces follows it (what a closing fence needs).
-fn code_fence(line: &str) -> Option<(char, usize, bool)> {
-    let trimmed = line.trim_start();
-    let c = trimmed.chars().next().filter(|c| matches!(c, '`' | '~'))?;
-    let len = trimmed.chars().take_while(|x| *x == c).count();
-    (len >= 3).then(|| (c, len, trimmed[len..].trim().is_empty()))
-}
-
-/// `line` with its inline code spans blanked. As in `CommonMark`, a run of
-/// N backticks opens a span that the next run of exactly N closes, and a
-/// run nothing closes is literal text.
-fn strip_inline_code(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(start) = rest.find('`') {
-        out.push_str(&rest[..start]);
-        let run = rest[start..].bytes().take_while(|b| *b == b'`').count();
-        let after = &rest[start + run..];
-        if let Some(end) = backtick_run(after, run) {
-            out.push(' ');
-            rest = &after[end + run..];
-        } else {
-            out.push_str(&rest[start..start + run]);
-            rest = after;
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// Where the first run of exactly `len` backticks in `text` starts.
-fn backtick_run(text: &str, len: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut at = 0;
-    while at < bytes.len() {
-        if bytes[at] == b'`' {
-            let run = bytes[at..].iter().take_while(|b| **b == b'`').count();
-            if run == len {
-                return Some(at);
+/// The byte ranges of `body` that are code or raw HTML, in order and
+/// merged. `pulldown-cmark` splits `[[a]]` into brackets and a reference
+/// link, so its text events cannot be searched for links themselves; only
+/// the source between these ranges is.
+fn code_and_html(body: &str) -> Vec<std::ops::Range<usize>> {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut block = None;
+    for (event, range) in Parser::new(body).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => block = Some(range.start),
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(start) = block.take() {
+                    ranges.push(start..range.end);
+                }
             }
-            at += run;
-        } else {
-            at += 1;
+            Event::Code(_) | Event::Html(_) | Event::InlineHtml(_) => ranges.push(range),
+            _ => {}
         }
     }
-    None
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -1117,6 +1088,16 @@ type Query { topic(id: ID!): Topic }
         assert_eq!(
             wikilink_targets("``[[a]]`` `[[b]]` ``x ` [[c]]`` [[d]] `[[e]]"),
             ["d", "e"]
+        );
+        // A code span runs across the lines of its paragraph, not past it.
+        assert_eq!(
+            wikilink_targets("a `code\n[[in-span]]` b [[after]]\n\n`open\n\n[[next]] `"),
+            ["after", "next"]
+        );
+        // Indented code blocks and raw HTML are not prose either.
+        assert_eq!(
+            wikilink_targets("text\n\n    [[indented]]\n\n<div>\n[[html]]\n</div>\n\n[[prose]]"),
+            ["prose"]
         );
     }
 

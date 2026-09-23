@@ -206,26 +206,28 @@ entity elsewhere, or a dangling reference `check` reports), and one naming
 an ambiguous stem (two notes share it) is an error, never a guess.
 `links_field` lists only notes of the type its field lists: a body link to
 a note that does not exist (yet), to a note of another type, or to an
-ambiguous stem adds nothing, since body text links freely. Links inside
-inline code (`` ` `` or ``` `` ```-delimited) and fenced code blocks do not
-count. Body links skip code and
-`![[embeds]]`. With `links_field`, backlinks are an ordinary
-`@inverse(of: "related")`. Frontmatter opened with `---` must be closed by another `---` line; an
+ambiguous stem adds nothing, since body text links freely. The body is
+read as CommonMark, as the vault reads its pages: links in code (spans,
+even ones that run across lines, and fenced or indented blocks) or in raw
+HTML do not count, nor do `![[embeds]]`. With `links_field`, backlinks are
+an ordinary `@inverse(of: "related")`.
+
+Frontmatter opened with `---` must be closed by another `---` line; an
 unclosed block is an error rather than body text. A symlink among the
 notes, or on the way to them, is an error too: git stores the link, not
-what it names, so the notes behind it would be missing. `check` reads notes
-leniently: frontmatter the
-schema does not declare (Obsidian's `tags`, `aliases`, …) is ignored, but
-declared fields must have their declared types. `body_field` and
-`links_field` must name stored fields the notes' type declares (a `String`,
-and a list of entities), or `check` fails: a misspelling would fill a
-field nothing reads; and with `type_field`, a note whose type does not
-declare them may not have a body or links. The store fills the key
-field, `body_field`, and `links_field` itself, so a note whose frontmatter
-sets one of them differently (`id: bar` in `foo.md` keyed by stem) is an
-error, and is not served. A markdown sub-ontology
-owns its types the way a git one does: its notes are the entities. `init`
-scaffolds `notes`, a markdown sub-ontology of topics that link papers.
+what it names, so the notes behind it would be missing. `check` reads
+notes leniently: frontmatter the schema does not declare (Obsidian's
+`tags`, `aliases`, …) is ignored, but declared fields must have their
+declared types. `body_field` and `links_field` must name stored fields the
+notes' type declares (a `String`, and a list of entities), or `check`
+fails: a misspelling would fill a field nothing reads; and with
+`type_field`, a note whose type does not declare them may not have a body
+or links. The store fills the key field, `body_field`, and `links_field`
+itself, so a note whose frontmatter sets one of them differently (`id: bar`
+in `foo.md` keyed by stem) is an error, and is not served. A markdown
+sub-ontology owns its types the way a git one does: its notes are the
+entities. `init` scaffolds `notes`, a markdown sub-ontology of topics that
+link papers.
 
 ### Postgres records
 

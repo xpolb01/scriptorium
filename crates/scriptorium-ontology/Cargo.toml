@@ -58,6 +58,9 @@ gray_matter = { version = "0.2.9", default-features = false, features = ["yaml"]
 # MPL-2.0 (GPL-compatible). Do not swap in `apollo-federation` (Elastic-2.0).
 graphql-composition = "0.12.2"
 miette = { version = "7.6.0", features = ["fancy"] }
+# MIT. Note bodies are read as CommonMark to find their links, as the vault
+# reads its pages (same version as the root workspace).
+pulldown-cmark = { version = "0.13.4", default-features = false }
 regex = "1.13.1"
 # `compose --out` asks the local subgraphs what they serve; `add-remote` and
 # `pull` fetch pinned remote schemas (rustls over aws-lc-rs, like the root
