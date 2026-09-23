@@ -24,8 +24,9 @@ use regex::Regex;
 
 use super::{EntityStore, ListQuery, Record};
 use crate::error::{Error, Result};
-use crate::layout::{join, normalize_dir};
+use crate::layout::{join, resolve_within};
 use crate::manifest::MarkdownConfig;
+use crate::registry::SubOntology;
 use crate::snapshot::Snapshot;
 
 const FRONTMATTER_KEY: &str = "frontmatter:";
@@ -71,8 +72,8 @@ struct Loaded {
 type ReferenceIndex = HashMap<String, Vec<String>>;
 type ReferenceIndexes = HashMap<(String, String), Arc<OnceLock<Arc<ReferenceIndex>>>>;
 
-pub struct MarkdownStore {
-    snapshot: Arc<dyn Snapshot>,
+/// A validated `[storage]` for markdown, independent of any snapshot.
+struct Settings {
     sub: String,
     dir: String,
     types: TypeSource,
@@ -81,19 +82,109 @@ pub struct MarkdownStore {
     links_field: Option<String>,
     /// Entity type → key field name, so every record carries its own key.
     key_fields: BTreeMap<String, String>,
+}
+
+pub struct MarkdownStore {
+    snapshot: Arc<dyn Snapshot>,
+    settings: Settings,
     loaded: OnceLock<std::result::Result<Loaded, String>>,
     references: Mutex<ReferenceIndexes>,
+}
+
+/// Load every note of a markdown sub-ontology from `snapshot`, with the
+/// files that did not load (what `check` reports).
+pub fn load_notes(
+    snapshot: &dyn Snapshot,
+    sub: &SubOntology,
+    config: &MarkdownConfig,
+    key_fields: BTreeMap<String, String>,
+) -> Result<(Vec<Note>, Vec<Problem>)> {
+    let settings = Settings::new(sub, config, key_fields)?;
+    let loaded = settings.load(snapshot)?;
+    Ok((loaded.notes.into_values().collect(), loaded.problems))
 }
 
 impl MarkdownStore {
     pub fn new(
         snapshot: Arc<dyn Snapshot>,
-        sub: &str,
+        sub: &SubOntology,
         config: &MarkdownConfig,
         key_fields: BTreeMap<String, String>,
     ) -> Result<Self> {
+        Ok(Self {
+            snapshot,
+            settings: Settings::new(sub, config, key_fields)?,
+            loaded: OnceLock::new(),
+            references: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn loaded(&self) -> Result<&Loaded> {
+        self.loaded
+            .get_or_init(|| {
+                self.settings
+                    .load(self.snapshot.as_ref())
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|message| Error::Store {
+                store: self.describe(),
+                message: message.clone(),
+            })
+    }
+
+    /// Every note that loaded, and every file that did not.
+    pub fn notes(&self) -> Result<(Vec<Note>, Vec<Problem>)> {
+        let loaded = self.loaded()?;
+        Ok((
+            loaded.notes.values().cloned().collect(),
+            loaded.problems.clone(),
+        ))
+    }
+
+    fn references_of(&self, type_name: &str, field: &str) -> Result<Arc<ReferenceIndex>> {
+        let loaded = self.loaded()?;
+        let slot = Arc::clone(
+            self.references
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry((type_name.to_string(), field.to_string()))
+                .or_default(),
+        );
+        Ok(Arc::clone(slot.get_or_init(|| {
+            let mut index = ReferenceIndex::new();
+            for note in loaded.notes.values().filter(|n| n.type_name == type_name) {
+                let mut add = |value: &serde_json::Value| {
+                    let target = match value {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        _ => return,
+                    };
+                    let sources = index.entry(target).or_default();
+                    if sources.last() != Some(&note.key) {
+                        sources.push(note.key.clone());
+                    }
+                };
+                match note.record.get(field) {
+                    Some(serde_json::Value::Array(items)) => items.iter().for_each(&mut add),
+                    Some(value) => add(value),
+                    None => {}
+                }
+            }
+            Arc::new(index)
+        })))
+    }
+}
+
+impl Settings {
+    fn new(
+        sub: &SubOntology,
+        config: &MarkdownConfig,
+        key_fields: BTreeMap<String, String>,
+    ) -> Result<Self> {
+        let name = sub.name.as_str();
         let invalid = |message: &str| Error::Store {
-            store: format!("markdown:{sub}"),
+            store: format!("markdown:{name}"),
             message: message.to_string(),
         };
         let types = match (&config.type_name, &config.type_field) {
@@ -111,59 +202,37 @@ impl MarkdownStore {
         } else {
             return Err(invalid("`key` must be `stem` or `frontmatter:<field>`"));
         };
-        let dir = normalize_dir(&config.dir);
-        if dir.split('/').any(|part| part == "..") || dir.starts_with('/') {
-            return Err(invalid("`dir` must be a path inside the repository"));
-        }
+        let Some(dir) = resolve_within(&sub.dir, &config.dir) else {
+            return Err(invalid("`dir` must stay inside the repository"));
+        };
         Ok(Self {
-            snapshot,
-            sub: sub.to_string(),
+            sub: name.to_string(),
             dir,
             types,
             key,
             body_field: config.body_field.clone(),
             links_field: config.links_field.clone(),
             key_fields,
-            loaded: OnceLock::new(),
-            references: Mutex::new(HashMap::new()),
         })
     }
 
-    fn loaded(&self) -> Result<&Loaded> {
-        self.loaded
-            .get_or_init(|| self.load().map_err(|e| e.to_string()))
-            .as_ref()
-            .map_err(|message| Error::Store {
-                store: self.describe(),
-                message: message.clone(),
-            })
-    }
-
-    /// Every note that loaded, and every file that did not.
-    pub fn notes(&self) -> Result<(Vec<Note>, Vec<Problem>)> {
-        let loaded = self.loaded()?;
-        Ok((
-            loaded.notes.values().cloned().collect(),
-            loaded.problems.clone(),
-        ))
-    }
-
-    fn load(&self) -> Result<Loaded> {
+    fn load(&self, snapshot: &dyn Snapshot) -> Result<Loaded> {
         let mut files = Vec::new();
-        self.walk(&self.dir, &mut files)?;
+        Self::walk(snapshot, &self.dir, &mut files)?;
 
         // Pass 1: frontmatter, type, key.
         let mut parsed = Vec::new();
         let mut loaded = Loaded::default();
         for path in files {
-            match self.parse_file(&path)? {
+            match self.parse_file(snapshot, &path)? {
                 Ok(note) => parsed.push(note),
                 Err(message) => loaded.problems.push(Problem { path, message }),
             }
         }
 
         // Stems resolve `[[wikilinks]]` to keys. A stem shared by two notes
-        // is ambiguous, so links to it resolve to nothing.
+        // is ambiguous: a body link to it resolves to nothing, and a
+        // frontmatter relation to it is a problem.
         let mut stems: HashMap<String, Option<String>> = HashMap::new();
         for note in &parsed {
             stems
@@ -185,8 +254,19 @@ impl MarkdownStore {
             body,
         } in parsed
         {
+            let mut ambiguous = Vec::new();
             for value in record.values_mut() {
-                resolve_wikilink_values(value, &resolve);
+                resolve_wikilink_values(value, &stems, &mut ambiguous);
+            }
+            if !ambiguous.is_empty() {
+                loaded.problems.push(Problem {
+                    path,
+                    message: format!(
+                        "[[{}]] names more than one note (by file name); rename one, or link by a unique name",
+                        ambiguous.join("]], [[")
+                    ),
+                });
+                continue;
             }
             if let Some(field) = &self.links_field {
                 let mut links: Vec<serde_json::Value> = Vec::new();
@@ -230,15 +310,15 @@ impl MarkdownStore {
         Ok(loaded)
     }
 
-    fn walk(&self, dir: &str, out: &mut Vec<String>) -> Result<()> {
-        for entry in self.snapshot.list(dir)? {
+    fn walk(snapshot: &dyn Snapshot, dir: &str, out: &mut Vec<String>) -> Result<()> {
+        for entry in snapshot.list(dir)? {
             // Obsidian keeps its own state in dot-directories.
             if entry.name.starts_with('.') {
                 continue;
             }
             let path = join(dir, &entry.name);
             if entry.is_dir {
-                self.walk(&path, out)?;
+                Self::walk(snapshot, &path, out)?;
             } else if is_markdown(&entry.name) {
                 out.push(path);
             }
@@ -247,8 +327,12 @@ impl MarkdownStore {
     }
 
     /// `Err` is a per-file problem; the outer `Result` is a read failure.
-    fn parse_file(&self, path: &str) -> Result<std::result::Result<ParsedNote, String>> {
-        let Some(text) = self.snapshot.read_string(path)? else {
+    fn parse_file(
+        &self,
+        snapshot: &dyn Snapshot,
+        path: &str,
+    ) -> Result<std::result::Result<ParsedNote, String>> {
+        let Some(text) = snapshot.read_string(path)? else {
             return Ok(Err("file disappeared while loading".into()));
         };
         let stem = std::path::Path::new(path)
@@ -275,6 +359,9 @@ impl MarkdownStore {
                 _ => return Ok(Err(format!("no `{field}` field to use as the key"))),
             },
         };
+        if let Some(problem) = self.overridden_field(&type_name, &key, &record) {
+            return Ok(Err(problem));
+        }
         Ok(Ok(ParsedNote {
             path: path.to_string(),
             stem,
@@ -284,38 +371,41 @@ impl MarkdownStore {
             body,
         }))
     }
+}
 
-    fn references_of(&self, type_name: &str, field: &str) -> Result<Arc<ReferenceIndex>> {
-        let loaded = self.loaded()?;
-        let slot = Arc::clone(
-            self.references
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry((type_name.to_string(), field.to_string()))
-                .or_default(),
-        );
-        Ok(Arc::clone(slot.get_or_init(|| {
-            let mut index = ReferenceIndex::new();
-            for note in loaded.notes.values().filter(|n| n.type_name == type_name) {
-                let mut add = |value: &serde_json::Value| {
-                    let target = match value {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Number(n) => n.to_string(),
-                        _ => return,
-                    };
-                    let sources = index.entry(target).or_default();
-                    if sources.last() != Some(&note.key) {
-                        sources.push(note.key.clone());
-                    }
+impl Settings {
+    /// The store fills the key, body, and links fields itself: a note whose
+    /// frontmatter states another value for one would be served with a value
+    /// it does not say.
+    fn overridden_field(&self, type_name: &str, key: &str, record: &Record) -> Option<String> {
+        if let Some(key_field) = self.key_fields.get(type_name) {
+            if let Some(stated) = record.get(key_field) {
+                let agrees = match stated {
+                    serde_json::Value::String(s) => s == key,
+                    serde_json::Value::Number(n) => n.to_string() == key,
+                    _ => false,
                 };
-                match note.record.get(field) {
-                    Some(serde_json::Value::Array(items)) => items.iter().for_each(&mut add),
-                    Some(value) => add(value),
-                    None => {}
+                if !agrees {
+                    let from = match &self.key {
+                        KeySource::Stem => "its file name".to_string(),
+                        KeySource::Frontmatter(field) => format!("`{field}`"),
+                    };
+                    return Some(format!(
+                        "`{key_field}: {stated}` disagrees with the note's key `{key}` (from {from}); remove `{key_field}` or make it `{key}`"
+                    ));
                 }
             }
-            Arc::new(index)
-        })))
+        }
+        let filled = [
+            (&self.body_field, "the note's body"),
+            (&self.links_field, "the notes its body links to"),
+        ];
+        filled.into_iter().find_map(|(field, with)| {
+            let field = field.as_ref().filter(|f| record.contains_key(f.as_str()))?;
+            Some(format!(
+                "the frontmatter sets `{field}`, which this store fills with {with}; rename it, or configure another field in subgraph.toml"
+            ))
+        })
     }
 }
 
@@ -337,7 +427,7 @@ struct ParsedNote {
 #[async_trait]
 impl EntityStore for MarkdownStore {
     fn describe(&self) -> String {
-        format!("markdown:{}@{}", self.dir, self.snapshot.label())
+        format!("markdown:{}@{}", self.settings.dir, self.snapshot.label())
     }
 
     async fn get(&self, type_name: &str, key: &str) -> Result<Option<Arc<Record>>> {
@@ -378,7 +468,7 @@ impl EntityStore for MarkdownStore {
         let loaded = self.loaded()?;
         if !loaded.problems.is_empty() {
             tracing::warn!(
-                sub_ontology = %self.sub,
+                sub_ontology = %self.settings.sub,
                 skipped = loaded.problems.len(),
                 "some markdown notes were skipped; run `scriptorium-ontology check`"
             );
@@ -453,20 +543,28 @@ fn whole_wikilink(value: &str) -> Option<&str> {
     (!target.is_empty()).then_some(target)
 }
 
+/// Replace each `[[wikilink]]` value with the key of the note it names by
+/// stem. A link naming no note keeps its target as the key (another
+/// sub-ontology's entity, or a dangling reference `check` reports); one
+/// naming several notes is collected in `ambiguous`.
 fn resolve_wikilink_values(
     value: &mut serde_json::Value,
-    resolve: &impl Fn(&str) -> Option<String>,
+    stems: &HashMap<String, Option<String>>,
+    ambiguous: &mut Vec<String>,
 ) {
     match value {
         serde_json::Value::String(s) => {
             if let Some(target) = whole_wikilink(s) {
-                // An unresolvable link keeps its target as a (dangling) key.
-                *s = resolve(target).unwrap_or_else(|| target.to_string());
+                match stems.get(&target.to_lowercase()) {
+                    Some(Some(key)) => s.clone_from(key),
+                    Some(None) => ambiguous.push(target.to_string()),
+                    None => *s = target.to_string(),
+                }
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                resolve_wikilink_values(item, resolve);
+                resolve_wikilink_values(item, stems, ambiguous);
             }
         }
         _ => {}
@@ -526,13 +624,29 @@ mod tests {
     use serde_json::json;
 
     fn config(extra: &str) -> MarkdownConfig {
-        toml::from_str(&format!("dir = \"notes\"\n{extra}")).unwrap()
+        toml::from_str(&format!("dir = \"../../notes\"\n{extra}")).unwrap()
+    }
+
+    /// A sub-ontology at `ontology/people` whose notes live in `notes/`.
+    fn sub() -> SubOntology {
+        SubOntology {
+            name: "people".into(),
+            dir: "ontology/people".into(),
+            description: None,
+            owners: vec![],
+            sdl: String::new(),
+            source: crate::registry::SubOntologySource::Local(
+                crate::manifest::StorageConfig::Git {
+                    data_dir: "data".into(),
+                },
+            ),
+        }
     }
 
     fn store(dir: &std::path::Path, extra: &str, keys: &[(&str, &str)]) -> MarkdownStore {
         MarkdownStore::new(
             Arc::new(GitSnapshot::open(dir, "HEAD").unwrap()),
-            "people",
+            &sub(),
             &config(extra),
             keys.iter()
                 .map(|(t, k)| ((*t).to_string(), (*k).to_string()))
@@ -650,6 +764,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frontmatter_cannot_contradict_what_the_store_fills() {
+        let dir = tempfile::tempdir().unwrap();
+        commit_files(
+            dir.path(),
+            &[
+                ("notes/foo.md", "---\nid: bar\n---\n"),
+                ("notes/same.md", "---\nid: same\n---\n"),
+                ("notes/body.md", "---\nbody: stated\n---\nThe body.\n"),
+                ("notes/links.md", "---\nlinks: [same]\n---\n"),
+                ("notes/plain.md", "---\ntitle: Plain\n---\n"),
+            ],
+            "init",
+        );
+        let s = store(
+            dir.path(),
+            "type = \"Topic\"\nbody_field = \"body\"\nlinks_field = \"links\"",
+            &[("Topic", "id")],
+        );
+        let (notes, problems) = s.notes().unwrap();
+        let mut bad: Vec<(&str, &str)> = problems
+            .iter()
+            .map(|p| (p.path.as_str(), p.message.as_str()))
+            .collect();
+        bad.sort_unstable();
+        assert_eq!(bad.len(), 3, "{problems:?}");
+        assert_eq!(bad[0].0, "notes/body.md");
+        assert!(bad[0].1.contains("sets `body`"), "{}", bad[0].1);
+        assert_eq!(bad[1].0, "notes/foo.md");
+        assert!(
+            bad[1]
+                .1
+                .contains("`id: \"bar\"` disagrees with the note's key `foo`"),
+            "{}",
+            bad[1].1
+        );
+        assert_eq!(bad[2].0, "notes/links.md");
+        assert!(s.get("Topic", "foo").await.unwrap().is_none(), "not served");
+        let mut served: Vec<&str> = notes.iter().map(|n| n.key.as_str()).collect();
+        served.sort_unstable();
+        assert_eq!(served, ["plain", "same"]);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_frontmatter_links_are_problems_not_guesses() {
+        let dir = tempfile::tempdir().unwrap();
+        commit_files(
+            dir.path(),
+            &[
+                ("notes/a/foo.md", "---\nid: A\n---\n"),
+                ("notes/b/foo.md", "---\nid: B\n---\n"),
+                // Its key happens to be the ambiguous stem.
+                ("notes/bar.md", "---\nid: foo\n---\n"),
+                ("notes/x.md", "---\nid: X\nrel: [\"[[foo]]\"]\n---\n"),
+                (
+                    "notes/y.md",
+                    "---\nid: Y\nrel: [\"[[bar]]\", \"[[elsewhere]]\"]\n---\n",
+                ),
+            ],
+            "init",
+        );
+        let s = store(
+            dir.path(),
+            "type = \"Topic\"\nkey = \"frontmatter:id\"",
+            &[("Topic", "id")],
+        );
+        let (_, problems) = s.notes().unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].path, "notes/x.md");
+        assert!(
+            problems[0]
+                .message
+                .contains("[[foo]] names more than one note"),
+            "{}",
+            problems[0].message
+        );
+        assert!(s.get("Topic", "X").await.unwrap().is_none(), "not served");
+        // A unique stem resolves to its key; an unknown one stays as written.
+        let y = s.get("Topic", "Y").await.unwrap().unwrap();
+        assert_eq!(y["rel"], json!(["foo", "elsewhere"]));
+    }
+
+    #[tokio::test]
     async fn malformed_frontmatter_is_a_problem_not_an_empty_note() {
         let dir = tempfile::tempdir().unwrap();
         commit_files(
@@ -702,14 +898,14 @@ mod tests {
             "type = \"A\"\nkey = \"frontmatter:\"",
         ] {
             assert!(
-                MarkdownStore::new(Arc::clone(&snap), "x", &config(extra), BTreeMap::new())
+                MarkdownStore::new(Arc::clone(&snap), &sub(), &config(extra), BTreeMap::new())
                     .is_err(),
                 "{extra}"
             );
         }
         let escaping: MarkdownConfig =
-            toml::from_str("dir = \"../outside\"\ntype = \"A\"").unwrap();
-        assert!(MarkdownStore::new(snap, "x", &escaping, BTreeMap::new()).is_err());
+            toml::from_str("dir = \"../../../outside\"\ntype = \"A\"").unwrap();
+        assert!(MarkdownStore::new(snap, &sub(), &escaping, BTreeMap::new()).is_err());
     }
 
     #[test]

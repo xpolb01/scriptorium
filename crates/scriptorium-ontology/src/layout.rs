@@ -32,6 +32,26 @@ pub fn normalize_dir(dir: &str) -> String {
         .join("/")
 }
 
+/// Resolve `rel` against the repository-relative directory `base`,
+/// applying `.` and `..`. `None` when the result would leave the repository.
+pub fn resolve_within(base: &str, rel: &str) -> Option<String> {
+    if rel.starts_with('/') {
+        return None;
+    }
+    let base = normalize_dir(base);
+    let mut parts: Vec<&str> = base.split('/').filter(|p| !p.is_empty()).collect();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(parts.join("/"))
+}
+
 /// Sub-ontology names become `join__Graph` enum values in the supergraph
 /// and path segments in subgraph URLs, so keep them to `[a-z][a-z0-9_]*`.
 pub fn validate_sub_ontology_name(name: &str) -> std::result::Result<(), String> {
@@ -92,6 +112,24 @@ mod tests {
             "../x",
             "left for validation to reject"
         );
+    }
+
+    #[test]
+    fn resolve_within_stays_inside_the_repository() {
+        assert_eq!(
+            resolve_within("ontology/notes", "pages").as_deref(),
+            Some("ontology/notes/pages")
+        );
+        assert_eq!(
+            resolve_within("ontology/wiki", "../../wiki").as_deref(),
+            Some("wiki")
+        );
+        assert_eq!(
+            resolve_within("ontology/x", "./a/./b/").as_deref(),
+            Some("ontology/x/a/b")
+        );
+        assert_eq!(resolve_within("ontology/x", "../../.."), None);
+        assert_eq!(resolve_within("ontology/x", "/etc"), None);
     }
 
     #[test]

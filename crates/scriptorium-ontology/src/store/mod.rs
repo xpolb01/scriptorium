@@ -132,7 +132,7 @@ pub fn open_store(
             key_fields,
         )),
         StorageConfig::Markdown(config) => Arc::new(markdown::MarkdownStore::new(
-            snapshot, &sub.name, config, key_fields,
+            snapshot, sub, config, key_fields,
         )?),
         #[cfg(feature = "postgres")]
         StorageConfig::Postgres(config) => {

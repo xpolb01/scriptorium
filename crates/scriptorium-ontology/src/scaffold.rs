@@ -1,9 +1,10 @@
 //! `ontology init`: scaffold the example ontology into a repository.
 //!
-//! The example is three sub-ontologies that extend each other: `core`
-//! (people), `research` (papers; adds `Person.papers`), and `software`
-//! (repositories; adds `Paper.implementations`). It exercises entity
-//! extension, inverse relations, enums, and git-backed records.
+//! The example is four sub-ontologies that extend each other: `core`
+//! (people), `research` (papers; adds `Person.papers`), `software`
+//! (repositories; adds `Paper.implementations`), and `notes` (markdown topic
+//! notes; adds `Paper.topics`). It exercises entity extension, inverse
+//! relations, enums, git-backed records, and markdown storage.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -66,6 +67,22 @@ pub const EXAMPLE: &[(&str, &str)] = &[
     (
         "core/subgraph.toml",
         include_str!("../../../templates/ontology/core/subgraph.toml"),
+    ),
+    (
+        "notes/pages/pretraining.md",
+        include_str!("../../../templates/ontology/notes/pages/pretraining.md"),
+    ),
+    (
+        "notes/pages/transformers.md",
+        include_str!("../../../templates/ontology/notes/pages/transformers.md"),
+    ),
+    (
+        "notes/schema.graphql",
+        include_str!("../../../templates/ontology/notes/schema.graphql"),
+    ),
+    (
+        "notes/subgraph.toml",
+        include_str!("../../../templates/ontology/notes/subgraph.toml"),
     ),
     (
         "ontology.toml",
@@ -187,7 +204,7 @@ mod tests {
         assert_eq!(written.len(), EXAMPLE.len());
         let report = check(&WorktreeSnapshot::new(dir.path()), "ontology").unwrap();
         assert!(report.issues.is_empty(), "{:#?}", report.issues);
-        assert_eq!(report.sub_ontologies, 3);
+        assert_eq!(report.sub_ontologies, 4);
         assert!(report.records > 10);
         assert!(
             scaffold_example(dir.path(), "ontology").is_err(),

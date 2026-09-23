@@ -1,0 +1,9 @@
+description = "Topic notes in markdown: frontmatter holds the fields, [[wikilinks]] the relations."
+owners = []
+
+[storage]
+kind = "markdown"
+dir = "pages"          # relative to this directory; "../../wiki" would read a vault's pages
+type = "Topic"
+body_field = "body"
+links_field = "related"

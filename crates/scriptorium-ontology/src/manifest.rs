@@ -90,7 +90,9 @@ impl StorageConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarkdownConfig {
-    /// Repository-relative directory of `.md` files, searched recursively.
+    /// Directory of `.md` files, searched recursively, relative to the
+    /// sub-ontology directory (`..` may reach elsewhere in the repository,
+    /// e.g. `../../wiki` for the vault's pages).
     pub dir: String,
     /// The entity type of every file. Exactly one of `type` and
     /// `type_field` is required.

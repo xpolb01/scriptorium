@@ -67,7 +67,7 @@ async fn subgraphs_join_entities_across_sub_ontologies() {
     let composition = compose(&registry, &base);
     assert!(composition.is_ok(), "{:?}", composition.errors);
     let supergraph = composition.supergraph.unwrap();
-    for sub in ["core", "research", "software"] {
+    for sub in ["core", "research", "software", "notes"] {
         assert!(
             supergraph.contains(&format!("{base}/{sub}/graphql")),
             "{sub} url in supergraph"
@@ -137,9 +137,11 @@ async fn subgraphs_join_entities_across_sub_ontologies() {
         json!([{ "id": "attention-is-all-you-need", "citedBy": [{ "id": "bert" }] }])
     );
 
+    assert_notes_subgraph(&client, &base).await;
+
     // 5. Each subgraph advertises its committed schema, verbatim, so a
     // gateway composing from live subgraphs sees what `compose` composed.
-    for sub in ["core", "research", "software"] {
+    for sub in ["core", "research", "software", "notes"] {
         let data = post(
             &client,
             &format!("{base}/{sub}/graphql"),
@@ -164,6 +166,44 @@ async fn subgraphs_join_entities_across_sub_ontologies() {
 
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
+}
+
+/// `notes` serves markdown topic notes: frontmatter wikilinks become
+/// relations, body wikilinks become `related`, backlinks are inverse, and
+/// `Paper` gains the topics that cover it.
+async fn assert_notes_subgraph(client: &reqwest::Client, base: &str) {
+    let topic = post(
+        client,
+        &format!("{base}/notes/graphql"),
+        r#"{ topic(id: "transformers") { title papers { id } related { id } backlinks { id } body } }"#,
+    )
+    .await;
+    assert_eq!(topic["topic"]["title"], json!("Transformers"));
+    assert_eq!(
+        topic["topic"]["papers"],
+        json!([{ "id": "attention-is-all-you-need" }, { "id": "bert" }])
+    );
+    assert_eq!(topic["topic"]["related"], json!([{ "id": "pretraining" }]));
+    assert_eq!(
+        topic["topic"]["backlinks"],
+        json!([{ "id": "pretraining" }])
+    );
+    assert!(topic["topic"]["body"]
+        .as_str()
+        .unwrap()
+        .contains("[[pretraining]]"));
+
+    // 6. `notes` extends research's Paper with the topics that cover it.
+    let covered = post(
+        client,
+        &format!("{base}/notes/graphql"),
+        r#"{ _entities(representations: [{__typename: "Paper", id: "bert"}]) { ... on Paper { topics { id } } } }"#,
+    )
+    .await;
+    assert_eq!(
+        covered["_entities"][0]["topics"],
+        json!([{ "id": "pretraining" }, { "id": "transformers" }])
+    );
 }
 
 /// Render JSON as a GraphQL input literal (object keys unquoted).

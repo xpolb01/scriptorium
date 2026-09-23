@@ -12,13 +12,14 @@ use serde_json::Value;
 
 use crate::compose::{compose, Composition};
 use crate::error::Result;
-use crate::layout::{join, validate_record_key, RECORD_EXT};
-use crate::manifest::StorageConfig;
-use crate::model::{ObjectType, SubOntologyModel, TypeExpr, TypeKind};
+use crate::layout::{join, resolve_within, validate_record_key, RECORD_EXT};
+use crate::manifest::{MarkdownConfig, StorageConfig};
+use crate::model::{FieldDef, ObjectType, SubOntologyModel, TypeExpr, TypeKind};
 use crate::registry::{Registry, SubOntology, SubOntologySource};
 use crate::serve::unservable;
 use crate::snapshot::Snapshot;
 use crate::store::git::{json_kind, parse_record};
+use crate::store::markdown::load_notes;
 use crate::store::Record;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -127,16 +128,7 @@ pub fn check(snapshot: &dyn Snapshot, ontology_dir: &str) -> Result<CheckReport>
     register_owners(&registry, &mut acc);
     acc.moves = override_moves(&registry);
 
-    for sub in &registry.sub_ontologies {
-        // Syntax errors are already reported by composition.
-        let Ok(model) = SubOntologyModel::parse(&sub.sdl) else {
-            continue;
-        };
-        if let SubOntologySource::Local(StorageConfig::Git { data_dir }) = &sub.source {
-            acc.require_extension_records(sub, &join(&sub.dir, data_dir), &model);
-            validate_git_records(snapshot, sub, data_dir, &model, &mut acc)?;
-        }
-    }
+    validate_instances(snapshot, &registry, &mut acc)?;
     acc.check_references();
     acc.check_required_records();
     acc.check_override_coverage();
@@ -291,6 +283,36 @@ fn override_moves(registry: &Registry) -> Vec<Move> {
     moves
 }
 
+/// Validate the instances `check` can read: git records and markdown notes.
+/// Database-backed instances are not read.
+fn validate_instances(
+    snapshot: &dyn Snapshot,
+    registry: &Registry,
+    acc: &mut Accumulator,
+) -> Result<()> {
+    for sub in &registry.sub_ontologies {
+        // Syntax errors are already reported by composition.
+        let Ok(model) = SubOntologyModel::parse(&sub.sdl) else {
+            continue;
+        };
+        match &sub.source {
+            SubOntologySource::Local(StorageConfig::Git { data_dir }) => {
+                let records = join(&sub.dir, data_dir);
+                acc.require_extension_records(sub, &model, |type_name| join(&records, type_name));
+                validate_git_records(snapshot, sub, data_dir, &model, acc)?;
+            }
+            SubOntologySource::Local(StorageConfig::Markdown(config)) => {
+                let notes =
+                    resolve_within(&sub.dir, &config.dir).unwrap_or_else(|| sub.dir.clone());
+                acc.require_extension_records(sub, &model, |_| notes.clone());
+                validate_markdown_notes(snapshot, sub, config, &model, acc);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct Accumulator {
     issues: Vec<Issue>,
@@ -404,12 +426,12 @@ impl Accumulator {
     }
 
     /// Note the required stored fields `sub` declares on entity types it
-    /// extends; their records live under `records_dir/<Type>`.
+    /// extends; `location` names where its records of a type live.
     fn require_extension_records(
         &mut self,
         sub: &SubOntology,
-        records_dir: &str,
         model: &SubOntologyModel,
+        location: impl Fn(&str) -> String,
     ) {
         for entity in model.entities().filter(|o| o.extension) {
             let key_field = entity.key_field();
@@ -431,7 +453,7 @@ impl Accumulator {
                     schema_path: sub.schema_path(),
                     type_name: entity.name.clone(),
                     fields,
-                    dir: join(records_dir, &entity.name),
+                    dir: location(&entity.name),
                 });
             }
         }
@@ -503,7 +525,7 @@ impl Accumulator {
                 sub_ontology: Some(req.sub_ontology.clone()),
                 path: Some(req.dir.clone()),
                 message: format!(
-                    "`{fields}` is required, but `{}` has no record for {} {} ({shown}{more}); add their `<key>.{RECORD_EXT}` records here, or make the field nullable",
+                    "`{fields}` is required, but `{}` has no record for {} {} ({shown}{more}); give each one a record, or make the field nullable",
                     req.sub_ontology,
                     missing.len(),
                     req.type_name,
@@ -928,6 +950,10 @@ fn list_keys(keys: &[&str]) -> String {
 struct Site<'a> {
     sub: &'a str,
     path: &'a str,
+    /// Human-edited notes (markdown) carry keys the schema does not know
+    /// about (Obsidian's `tags`, `aliases`, …): unknown fields are ignored and
+    /// fields owned elsewhere only warn. Git records stay strict.
+    lenient: bool,
 }
 
 /// Whether `data_dir` can hold records, reporting why not: a symlink (git
@@ -1074,6 +1100,7 @@ fn validate_git_records(
             let site = Site {
                 sub: &sub.name,
                 path: &path,
+                lenient: false,
             };
             validate_entity(model, object, key_field, key, &record, &site, acc);
         }
@@ -1081,21 +1108,173 @@ fn validate_git_records(
     Ok(())
 }
 
+/// `body_field` and `links_field` name fields the store fills: a stored
+/// field of the notes' type (of some entity, with `type_field`), of the
+/// kind it receives. Otherwise the content lands under a name the schema
+/// never asks for, and nothing says so.
+fn filled_field_problems(config: &MarkdownConfig, model: &SubOntologyModel) -> Vec<String> {
+    let types: Vec<&ObjectType> = model
+        .entities()
+        .filter(|o| config.type_name.as_ref().is_none_or(|t| *t == o.name))
+        .collect();
+    let notes = config
+        .type_name
+        .as_ref()
+        .map_or_else(|| "entity".to_string(), |t| format!("`{t}`"));
+    let settings: [(&str, Option<&String>, &str); 2] = [
+        ("body_field", config.body_field.as_ref(), "a `String`"),
+        (
+            "links_field",
+            config.links_field.as_ref(),
+            "a list of entities, like `[Topic!]!`",
+        ),
+    ];
+    let mut problems = Vec::new();
+    for (setting, field, expected) in settings {
+        let Some(field) = field else {
+            continue;
+        };
+        let declared: Vec<(&ObjectType, &FieldDef)> = types
+            .iter()
+            .filter_map(|o| o.field(field).map(|f| (*o, f)))
+            .collect();
+        if declared.is_empty() {
+            problems.push(format!(
+                "`{setting} = \"{field}\"`, but no {notes} declares `{field}`: the store would fill a field nothing reads"
+            ));
+        }
+        for (object, f) in declared {
+            let fits = f.is_stored()
+                && if setting == "body_field" {
+                    f.ty.named == "String" && !f.ty.is_list()
+                } else {
+                    f.ty.is_list() && matches!(model.kind_of(&f.ty.named), TypeKind::Entity(_))
+                };
+            if !fits {
+                problems.push(format!(
+                    "`{setting} = \"{field}\"` fills `{}.{field}`, which must be a stored field of {expected}",
+                    object.name
+                ));
+            }
+        }
+    }
+    problems
+}
+
+fn validate_markdown_notes(
+    snapshot: &dyn Snapshot,
+    sub: &SubOntology,
+    config: &MarkdownConfig,
+    model: &SubOntologyModel,
+    acc: &mut Accumulator,
+) {
+    for problem in filled_field_problems(config, model) {
+        acc.push(
+            Severity::Error,
+            "ontology.storage",
+            Some(&sub.name),
+            Some(join(&sub.dir, crate::layout::SUBGRAPH_MANIFEST)),
+            problem,
+        );
+    }
+    let key_fields = model
+        .entities()
+        .filter_map(|o| o.key_field().map(|k| (o.name.clone(), k.to_string())))
+        .collect();
+    let (notes, problems) = match load_notes(snapshot, sub, config, key_fields) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            acc.push(
+                Severity::Error,
+                "ontology.storage",
+                Some(&sub.name),
+                Some(join(&sub.dir, crate::layout::SUBGRAPH_MANIFEST)),
+                e.to_string(),
+            );
+            return;
+        }
+    };
+    for problem in problems {
+        acc.push(
+            Severity::Error,
+            "ontology.record.parse",
+            Some(&sub.name),
+            Some(problem.path),
+            problem.message,
+        );
+    }
+    for note in notes {
+        acc.records += 1;
+        let entity = model
+            .entities()
+            .find(|o| o.name == note.type_name)
+            .and_then(|o| o.key_field().map(|k| (o, k)));
+        let Some((object, key_field)) = entity else {
+            acc.push(
+                Severity::Error,
+                "ontology.record.unknown_type",
+                Some(&sub.name),
+                Some(note.path.clone()),
+                format!(
+                    "`{}` is not an entity with a single-field @key in this sub-ontology",
+                    note.type_name
+                ),
+            );
+            continue;
+        };
+        if let Some(message) = int_key_problem(object, key_field, &note.key) {
+            acc.push(
+                Severity::Error,
+                "ontology.record.key",
+                Some(&sub.name),
+                Some(note.path.clone()),
+                message,
+            );
+            continue;
+        }
+        acc.store(
+            &sub.name,
+            &note.type_name,
+            &note.key,
+            &note.path,
+            &note.record,
+        );
+        let site = Site {
+            sub: &sub.name,
+            path: &note.path,
+            lenient: true,
+        };
+        validate_fields(
+            model,
+            object,
+            Some(key_field),
+            &note.record,
+            &object.name,
+            &site,
+            acc,
+        );
+    }
+}
+
+/// For an `Int` key field, `key` must be a 32-bit integer in canonical form
+/// (`042` parses, but lookups by 42 would not find it).
+fn int_key_problem(object: &ObjectType, key_field: &str, key: &str) -> Option<String> {
+    let key_is_int = object.field(key_field).is_some_and(|f| f.ty.named == "Int");
+    let canonical_int = key.parse::<i32>().is_ok_and(|n| n.to_string() == key);
+    (key_is_int && !canonical_int).then(|| {
+        format!(
+            "`{}.{key_field}` is an Int, so the key `{key}` must be a 32-bit integer in canonical form (no leading zeros)",
+            object.name
+        )
+    })
+}
+
 /// Why `key` (a record's file name) cannot name an entity of `object`.
 fn key_problem(object: &ObjectType, key_field: &str, key: &str) -> Option<String> {
     if let Err(message) = validate_record_key(key) {
         return Some(message);
     }
-    let key_is_int = object.field(key_field).is_some_and(|f| f.ty.named == "Int");
-    // `042` parses, but lookups by 42 read `42.yaml`: require the canonical
-    // spelling so every record is reachable by its key.
-    let canonical_int = key.parse::<i32>().is_ok_and(|n| n.to_string() == key);
-    (key_is_int && !canonical_int).then(|| {
-        format!(
-            "`{}.{key_field}` is an Int, so the file name `{key}` must be a 32-bit integer in canonical form (no leading zeros)",
-            object.name
-        )
-    })
+    int_key_problem(object, key_field, key)
 }
 
 fn validate_entity(
@@ -1173,6 +1352,9 @@ fn validate_fields(
             continue;
         }
         let Some(field) = object.field(name) else {
+            if site.lenient {
+                continue;
+            }
             error(
                 acc,
                 "ontology.record.unknown_field",
@@ -1183,19 +1365,37 @@ fn validate_fields(
             );
             continue;
         };
-        if field.external {
-            error(
-                acc,
-                "ontology.record.not_owned",
-                format!("`{at}.{name}` is @external here: another sub-ontology owns it, so store it there"),
-            );
-            continue;
-        }
-        if let Some(of) = &field.inverse_of {
-            error(
-                acc,
-                "ontology.record.derived",
-                format!("`{at}.{name}` is derived (@inverse(of: \"{of}\")) and must not be stored"),
+        if field.external || field.inverse_of.is_some() {
+            let (rule, why) = if field.external {
+                (
+                    "ontology.record.not_owned",
+                    "is @external here: another sub-ontology owns it".to_string(),
+                )
+            } else {
+                (
+                    "ontology.record.derived",
+                    format!(
+                        "is derived (@inverse(of: \"{}\"))",
+                        field.inverse_of.as_deref().unwrap_or_default()
+                    ),
+                )
+            };
+            let severity = if site.lenient {
+                Severity::Warning
+            } else {
+                Severity::Error
+            };
+            let advice = if site.lenient {
+                "so this value is ignored"
+            } else {
+                "so it must not be stored here"
+            };
+            acc.push(
+                severity,
+                rule,
+                Some(site.sub),
+                Some(site.path.to_string()),
+                format!("`{at}.{name}` {why}, {advice}"),
             );
             continue;
         }
@@ -1719,6 +1919,134 @@ extend schema @link(url: "https://specs.apollo.dev/federation/v2.7", import: ["@
 type Person @key(fields: "id") { id: ID! name: String! @shareable }
 type Query { person(id: ID!): Person }
 "#;
+
+    const NOTES_TOML: &str = "[storage]\nkind = \"markdown\"\ndir = \"pages\"\ntype = \"Topic\"\nbody_field = \"body\"\nlinks_field = \"related\"\n";
+    const NOTES: &str = r#"
+extend schema @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
+directive @inverse(of: String!) on FIELD_DEFINITION
+type Topic @key(fields: "id") {
+  id: ID!
+  title: String!
+  year: Int
+  body: String
+  papers: [Paper!]!
+  related: [Topic!]!
+}
+extend type Paper @key(fields: "id") { id: ID! topics: [Topic!]! @inverse(of: "papers") }
+type Query { topic(id: ID!): Topic }
+"#;
+
+    #[test]
+    fn markdown_notes_are_checked_leniently() {
+        let report = run(&[
+            ("ontology/notes/subgraph.toml", NOTES_TOML),
+            ("ontology/notes/schema.graphql", NOTES),
+            (
+                "ontology/notes/pages/attention.md",
+                "---\ntitle: Attention\npapers: [\"[[attention]]\"]\ntags: [unknown, ignored]\n---\nSee [[bad]].\n",
+            ),
+            (
+                "ontology/notes/pages/bad.md",
+                "---\ntitle: Bad\nyear: soon\npapers: [\"[[no-such-paper]]\"]\n---\n",
+            ),
+        ]);
+        let got: Vec<(&str, Option<&str>)> = report
+            .issues
+            .iter()
+            .map(|i| (i.rule, i.path.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "ontology.record.dangling_ref",
+                    Some("ontology/notes/pages/bad.md")
+                ),
+                ("ontology.record.type", Some("ontology/notes/pages/bad.md")),
+            ],
+            "{:#?}",
+            report.issues
+        );
+        assert_eq!(report.records, 4, "two YAML records and two notes");
+    }
+
+    #[test]
+    fn markdown_filled_fields_must_be_declared() {
+        let note = (
+            "ontology/notes/pages/attention.md",
+            "---\ntitle: Attention\n---\nSee [[attention]].\n",
+        );
+        let problems = |toml: &str| -> Vec<String> {
+            run(&[
+                ("ontology/notes/subgraph.toml", toml),
+                ("ontology/notes/schema.graphql", NOTES),
+                note,
+            ])
+            .issues
+            .into_iter()
+            .filter(|i| i.rule == "ontology.storage")
+            .map(|i| i.message)
+            .collect()
+        };
+        assert!(problems(NOTES_TOML).is_empty());
+        // A misspelling would fill a field no query reads.
+        let found = problems(&NOTES_TOML.replace("\"related\"", "\"reltaed\""));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("no `Topic` declares `reltaed`"),
+            "{}",
+            found[0]
+        );
+        // A declared field of the wrong kind cannot hold what is filled in.
+        let found = problems(
+            &NOTES_TOML
+                .replace("\"body\"", "\"title\"")
+                .replace("\"related\"", "\"papers\""),
+        );
+        assert!(
+            found.is_empty(),
+            "String and a relation list fit: {found:?}"
+        );
+        let found = problems(&NOTES_TOML.replace("\"body\"", "\"year\""));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("fills `Topic.year`"), "{}", found[0]);
+    }
+
+    #[test]
+    fn markdown_extensions_with_required_fields_need_a_note_per_entity() {
+        const BIOS: &str = r#"
+extend schema @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
+extend type Person @key(fields: "id") { id: ID! bio: String! }
+"#;
+        let report = run(&[
+            (
+                "ontology/core/data/Person/shazeer.yaml",
+                "name: Noam Shazeer\n",
+            ),
+            (
+                "ontology/bios/subgraph.toml",
+                "[storage]\nkind = \"markdown\"\ndir = \"pages\"\ntype = \"Person\"\n",
+            ),
+            ("ontology/bios/schema.graphql", BIOS),
+            (
+                "ontology/bios/pages/vaswani.md",
+                "---\nbio: Transformer co-author\n---\n",
+            ),
+        ]);
+        assert_eq!(
+            rules(&report),
+            ["ontology.record.missing"],
+            "{:#?}",
+            report.issues
+        );
+        let issue = &report.issues[0];
+        assert_eq!(issue.path.as_deref(), Some("ontology/bios/pages"));
+        assert!(
+            issue.message.contains("1 Person (shazeer)"),
+            "{}",
+            issue.message
+        );
+    }
 
     #[test]
     fn a_field_has_one_local_resolver() {

@@ -1,0 +1,28 @@
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
+
+directive @inverse(of: String!) on FIELD_DEFINITION
+
+"A topic note. Its key is the file name; its body is the note text."
+type Topic @key(fields: "id") {
+  id: ID!
+  title: String!
+  body: String
+  "Papers the topic covers: `papers: [\"[[bert]]\"]` in the frontmatter."
+  papers: [Paper!]!
+  "Topics the note body links to."
+  related: [Topic!]!
+  "Topics whose body links here."
+  backlinks: [Topic!]! @inverse(of: "related")
+}
+
+"notes adds topics to research's Paper."
+extend type Paper @key(fields: "id") {
+  id: ID!
+  topics: [Topic!]! @inverse(of: "papers")
+}
+
+type Query {
+  topic(id: ID!): Topic
+  topics(first: Int): [Topic!]!
+}
