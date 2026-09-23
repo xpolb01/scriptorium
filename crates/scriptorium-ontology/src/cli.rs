@@ -355,14 +355,19 @@ async fn require_live_subgraphs_match(
     if stale.is_empty() {
         return Ok(());
     }
+    let (serve, answer) = if stale.len() == 1 {
+        ("serves", "answers")
+    } else {
+        ("serve", "answer")
+    };
     let stale = stale.join(", ");
     Err(match answering {
         Answering::Separately => miette!(
-            "{stale} serve another commit or schema than {} (an older `serve`?); restart `scriptorium-ontology serve` at this commit first, publish with `serve --supergraph`, or pass --offline",
+            "{stale} {serve} another commit or schema than {} (an older `serve`?); restart `scriptorium-ontology serve` at this commit first, publish with `serve --supergraph`, or pass --offline",
             registry.source
         ),
         Answering::ThisServer => miette!(
-            "{stale} answer with another commit or schema than this server ({}): `serve.base_url` leads to another server; point it at this one, or pass --offline",
+            "{stale} {answer} with another commit or schema than this server ({}): `serve.base_url` leads to another server; point it at this one, or pass --offline",
             registry.source
         ),
     })
@@ -399,8 +404,13 @@ async fn require_remote_pins_match(root: &Path, registry: &Registry) -> Result<(
     if drifted.is_empty() {
         return Ok(());
     }
+    let (remotes, serve, them) = if drifted.len() == 1 {
+        ("remote", "serves", "it")
+    } else {
+        ("remotes", "serve", "them")
+    };
     Err(miette!(
-        "remote {} no longer serve the schema pinned at {}; `scriptorium-ontology pull` them, or pass --offline",
+        "{remotes} {} no longer {serve} the schema pinned at {}; `scriptorium-ontology pull` {them}, or pass --offline",
         drifted.join(", "),
         registry.source
     ))

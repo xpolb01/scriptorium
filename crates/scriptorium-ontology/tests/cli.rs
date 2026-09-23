@@ -584,7 +584,7 @@ fn compose_checks_pinned_remote_schemas_against_the_remote() {
     let out = publish();
     assert!(!out.status.success());
     assert!(
-        stderr_flat(&out).contains("no longer serve the schema pinned"),
+        stderr_flat(&out).contains("no longer serves the schema pinned"),
         "{}",
         stderr(&out)
     );
@@ -832,7 +832,7 @@ fn serve_checks_pinned_remote_schemas_before_publishing() {
     for (url, expected) in [
         (
             format!("{drifted}/venues/graphql"),
-            "no longer serve the schema pinned",
+            "no longer serves the schema pinned",
         ),
         (
             "http://127.0.0.1:9/venues/graphql".to_string(),
@@ -1726,7 +1726,7 @@ fn publishing_asks_remotes_with_their_bound_headers() {
     let out = publish(&[]);
     assert!(!out.status.success());
     assert!(
-        stderr_flat(&out).contains("no longer serve the schema pinned"),
+        stderr_flat(&out).contains("no longer serves the schema pinned"),
         "{}",
         stderr(&out)
     );
@@ -1743,7 +1743,7 @@ fn publishing_asks_remotes_with_their_bound_headers() {
     let out = exits_within(serve(), 30);
     assert!(!out.status.success());
     assert!(
-        stderr_flat(&out).contains("no longer serve the schema pinned"),
+        stderr_flat(&out).contains("no longer serves the schema pinned"),
         "{}",
         stderr(&out)
     );
