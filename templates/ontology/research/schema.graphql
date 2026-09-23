@@ -1,0 +1,35 @@
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
+
+"Derived relation: the list of entities whose `of` field references this one."
+directive @inverse(of: String!) on FIELD_DEFINITION
+
+enum PaperKind {
+  CONFERENCE
+  JOURNAL
+  PREPRINT
+}
+
+"A scholarly paper."
+type Paper @key(fields: "id") {
+  id: ID!
+  title: String!
+  year: Int!
+  kind: PaperKind!
+  venue: String
+  authors: [Person!]!
+  cites: [Paper!]!
+  "Papers in this sub-ontology that cite this one."
+  citedBy: [Paper!]! @inverse(of: "cites")
+}
+
+"research adds authorship to core's Person (`extend`: core owns Person records)."
+extend type Person @key(fields: "id") {
+  id: ID!
+  papers: [Paper!]! @inverse(of: "authors")
+}
+
+type Query {
+  paper(id: ID!): Paper
+  papers(first: Int): [Paper!]!
+}

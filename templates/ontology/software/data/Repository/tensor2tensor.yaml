@@ -1,0 +1,2 @@
+url: https://github.com/tensorflow/tensor2tensor
+implements: [attention-is-all-you-need]

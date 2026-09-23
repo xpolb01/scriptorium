@@ -1,0 +1,5 @@
+description = "Papers, citations, and authorship. Extends core's Person."
+owners = []
+
+[storage]
+kind = "git"

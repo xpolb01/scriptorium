@@ -1,0 +1,6 @@
+title: "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding"
+year: 2019
+kind: CONFERENCE
+venue: NAACL 2019
+authors: [devlin, chang, lee, toutanova]
+cites: [attention-is-all-you-need]
