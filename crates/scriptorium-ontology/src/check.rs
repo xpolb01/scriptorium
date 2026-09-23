@@ -1113,6 +1113,10 @@ fn filled_field_problems(config: &MarkdownConfig, model: &SubOntologyModel) -> V
         .entities()
         .filter(|o| config.type_name.as_ref().is_none_or(|t| *t == o.name))
         .collect();
+    if types.is_empty() {
+        // A `type` the schema lacks: the store refuses it, once.
+        return Vec::new();
+    }
     let notes = config
         .type_name
         .as_ref()
@@ -2069,6 +2073,34 @@ type Query { thing(id: ID!): Thing }
         let found = problems(&NOTES_TOML.replace("\"body\"", "\"year\""));
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("fills `Topic.year`"), "{}", found[0]);
+    }
+
+    #[test]
+    fn a_markdown_type_the_schema_lacks_is_an_error_without_notes() {
+        let misspelled = NOTES_TOML.replace("type = \"Topic\"", "type = \"Topci\"");
+        for files in [
+            vec![
+                ("ontology/notes/subgraph.toml", misspelled.as_str()),
+                ("ontology/notes/schema.graphql", NOTES),
+            ],
+            vec![
+                ("ontology/notes/subgraph.toml", misspelled.as_str()),
+                ("ontology/notes/schema.graphql", NOTES),
+                ("ontology/notes/pages/attention.md", "---\ntitle: A\n---\n"),
+            ],
+        ] {
+            let found: Vec<String> = run(&files)
+                .issues
+                .into_iter()
+                .filter(|i| i.severity == Severity::Error)
+                .map(|i| i.message)
+                .collect();
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(
+                found[0].contains("`type = \"Topci\"` is not an entity"),
+                "{found:?}"
+            );
+        }
     }
 
     #[test]

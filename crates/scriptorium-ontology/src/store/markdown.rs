@@ -223,6 +223,13 @@ impl Settings {
             message: message.to_string(),
         };
         let types = match (&config.type_name, &config.type_field) {
+            // Checked here, not only per note: with no notes yet, nothing
+            // else would notice, and the entity would serve as empty.
+            (Some(name), None) if !schema.key_fields.contains_key(name) => {
+                return Err(invalid(&format!(
+                    "`type = \"{name}\"` is not an entity with a single-field @key in this sub-ontology"
+                )));
+            }
             (Some(name), None) => TypeSource::Fixed(name.clone()),
             (None, Some(field)) => TypeSource::Field(field.clone()),
             _ => return Err(invalid("set exactly one of `type` and `type_field`")),
@@ -1038,29 +1045,38 @@ type Query { topic(id: ID!): Topic }
         assert_eq!(empty, ["comment", "null"]);
     }
 
+    /// A schema with one entity type, `A`, keyed by `id`.
+    fn types_a() -> NoteTypes {
+        NoteTypes {
+            key_fields: BTreeMap::from([("A".to_string(), "id".to_string())]),
+            link_targets: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn config_errors() {
         let snap: Arc<dyn Snapshot> = Arc::new(crate::snapshot::WorktreeSnapshot::new("/tmp"));
+        let new = |config: &MarkdownConfig| {
+            MarkdownStore::new(Arc::clone(&snap), &sub(), config, types_a()).map(|_| ())
+        };
+        assert!(new(&config("type = \"A\"")).is_ok());
         for extra in [
             "",                                 // neither type nor type_field
             "type = \"A\"\ntype_field = \"t\"", // both
             "type = \"A\"\nkey = \"filename\"", // unknown key source
             "type = \"A\"\nkey = \"frontmatter:\"",
         ] {
-            assert!(
-                MarkdownStore::new(
-                    Arc::clone(&snap),
-                    &sub(),
-                    &config(extra),
-                    NoteTypes::default()
-                )
-                .is_err(),
-                "{extra}"
-            );
+            assert!(new(&config(extra)).is_err(), "{extra}");
         }
         let escaping: MarkdownConfig =
             toml::from_str("dir = \"../../../outside\"\ntype = \"A\"").unwrap();
-        assert!(MarkdownStore::new(snap, &sub(), &escaping, NoteTypes::default()).is_err());
+        assert!(new(&escaping).is_err());
+        // A fixed type the schema lacks would serve as empty, notes or not.
+        let err = new(&config("type = \"B\"")).unwrap_err().to_string();
+        assert!(
+            err.contains("`type = \"B\"` is not an entity with a single-field @key"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1138,8 +1154,7 @@ type Query { topic(id: ID!): Topic }
         commit_link(root, "notes/linked", "../elsewhere");
         commit_link(root, "notes/alias.md", "a.md");
         for view in views(root) {
-            let s = MarkdownStore::new(view, &sub(), &config("type = \"A\""), NoteTypes::default())
-                .unwrap();
+            let s = MarkdownStore::new(view, &sub(), &config("type = \"A\""), types_a()).unwrap();
             let (notes, problems) = s.notes().unwrap();
             let keys: Vec<&str> = notes.iter().map(|n| n.key.as_str()).collect();
             assert_eq!(keys, ["a"]);
@@ -1161,8 +1176,7 @@ type Query { topic(id: ID!): Topic }
         commit_files(root, &[("real/a.md", "# A\n")], "init");
         commit_link(root, "notes", "real");
         for view in views(root) {
-            let s = MarkdownStore::new(view, &sub(), &config("type = \"A\""), NoteTypes::default())
-                .unwrap();
+            let s = MarkdownStore::new(view, &sub(), &config("type = \"A\""), types_a()).unwrap();
             let err = s.notes().unwrap_err().to_string();
             assert!(err.contains("`notes` is a symlink"), "{err}");
         }

@@ -218,8 +218,9 @@ notes, or on the way to them, is an error too: git stores the link, not
 what it names, so the notes behind it would be missing. `check` reads
 notes leniently: frontmatter the schema does not declare (Obsidian's
 `tags`, `aliases`, …) is ignored, but declared fields must have their
-declared types. `body_field` and `links_field` must name stored fields the
-notes' type declares (a `String`, and a list of entities), or `check`
+declared types. A fixed `type` must be an entity of the sub-ontology, even
+before it has notes. `body_field` and `links_field` must name stored fields
+the notes' type declares (a `String`, and a list of entities), or `check`
 fails: a misspelling would fill a field nothing reads; and with
 `type_field`, a note whose type does not declare them may not have a body
 or links. The store fills the key field, `body_field`, and `links_field`
