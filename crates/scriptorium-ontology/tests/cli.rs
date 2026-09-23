@@ -1581,6 +1581,52 @@ fn no_pin_lands_without_its_binding() {
     assert_eq!(remote.schema(), VENUES);
 }
 
+#[cfg(feature = "postgres")]
+#[test]
+fn compose_publishes_only_stores_that_can_answer() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    scriptorium(home.path(), repo.path())
+        .args(["init"])
+        .assert()
+        .success();
+    std::fs::create_dir_all(repo.path().join("ontology/things")).unwrap();
+    std::fs::write(
+        repo.path().join("ontology/things/subgraph.toml"),
+        "[storage]\nkind = \"postgres\"\nurl_env = \"ONTOLOGY_TEST_THINGS_URL\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.path().join("ontology/things/schema.graphql"),
+        "extend schema @link(url: \"https://specs.apollo.dev/federation/v2.3\", import: [\"@key\"])\ntype Thing @key(fields: \"id\") { id: ID! label: String }\ntype Query { thing(id: ID!): Thing }\n",
+    )
+    .unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-qm", "things in postgres"]);
+    let out_path = repo.path().join("supergraph.graphql");
+    let publish = |extra: &[&str]| {
+        scriptorium(home.path(), repo.path())
+            .args(["compose", "--base-url", "http://127.0.0.1:9", "--out"])
+            .arg(&out_path)
+            .args(extra)
+            // Nothing listens there: the database is down.
+            .env(
+                "ONTOLOGY_TEST_THINGS_URL",
+                "postgres://onto@127.0.0.1:9/things",
+            )
+            .output()
+            .unwrap()
+    };
+    let out = publish(&[]);
+    assert!(!out.status.success());
+    assert!(stderr_flat(&out).contains("[things]"), "{}", stderr(&out));
+    assert!(!out_path.exists());
+    // --offline asks nothing, the database included.
+    let out = publish(&["--offline"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
 #[test]
 fn credentialed_loopback_fetches_bypass_proxies() {
     // A proxy that counts the connections it is offered.

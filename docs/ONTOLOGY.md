@@ -391,9 +391,10 @@ skips both. An answer to any of these questions that fails (not 2xx), or
 is larger than 8 MiB, refuses publishing. So does, even `--offline`, a
 subgraph URL a gateway cannot connect to: not an absolute http(s) URL, or
 on a wildcard address (`0.0.0.0`, `::`); bind a wildcard with
-`serve.base_url` set to the address it is reached at. `serve` also checks
-that every store is reachable (the database, its tables) before it
-publishes a supergraph or accepts a request.
+`serve.base_url` set to the address it is reached at. `compose --out` also
+checks that every store is reachable (the database, its tables), unless
+`--offline`; `serve` always does, before it publishes a supergraph or
+accepts a request.
 
 All commands read from a git revision (`--rev`, default `HEAD`). Pass
 `--worktree` to read uncommitted files while editing (`list`, `check`, and

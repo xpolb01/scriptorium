@@ -257,6 +257,19 @@ async fn probe_json(
     Ok(serde_json::from_slice(&body).ok())
 }
 
+/// Ask every store whether it can answer (a database reachable, its tables
+/// there), as `serve` does before it starts.
+async fn require_stores_ready(subgraphs: &[crate::serve::Subgraph]) -> Result<()> {
+    for subgraph in subgraphs {
+        subgraph
+            .store
+            .ready()
+            .await
+            .map_err(|e| miette!("[{}] {}: {e}", subgraph.name, subgraph.store.describe()))?;
+    }
+    Ok(())
+}
+
 /// Who must answer at the base URL a supergraph routes local subgraphs to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Answering {
@@ -1301,14 +1314,17 @@ async fn compose_cmd(
     if out.is_some() {
         require_clean(snapshot.as_ref(), source, "publish a supergraph")?;
     }
-    if let Err(e) = build_subgraphs(&registry, &snapshot) {
-        eprintln!("error: {e}");
-        eprintln!(
-            "composition succeeded, but `scriptorium-ontology serve` could not start at {}",
-            registry.source
-        );
-        return Ok(ExitCode::from(1));
-    }
+    let subgraphs = match build_subgraphs(&registry, &snapshot) {
+        Ok(subgraphs) => subgraphs,
+        Err(e) => {
+            eprintln!("error: {e}");
+            eprintln!(
+                "composition succeeded, but `scriptorium-ontology serve` could not start at {}",
+                registry.source
+            );
+            return Ok(ExitCode::from(1));
+        }
+    };
     let sdl = if api {
         composition.api_schema.unwrap_or_default()
     } else {
@@ -1318,6 +1334,9 @@ async fn compose_cmd(
         Some(path) => {
             require_routable(&registry, &base_url)?;
             if !offline {
+                // What `serve` would check before it starts: a subgraph whose
+                // database is down or missing tables cannot answer.
+                require_stores_ready(&subgraphs).await?;
                 require_live_subgraphs_match(&registry, &base_url, Answering::Separately).await?;
                 require_remote_pins_match(root, &registry).await?;
             }
@@ -1425,13 +1444,7 @@ async fn serve(
 
     // Every store must be reachable before anything is published: a
     // database outage fails startup instead of serving a broken subgraph.
-    for subgraph in &subgraphs {
-        subgraph
-            .store
-            .ready()
-            .await
-            .map_err(|e| miette!("[{}] {}: {e}", subgraph.name, subgraph.store.describe()))?;
-    }
+    require_stores_ready(&subgraphs).await?;
 
     // Bind before publishing the supergraph: if the port is taken (say an
     // older server still runs), fail without touching the gateway's file.
