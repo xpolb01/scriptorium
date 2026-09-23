@@ -88,7 +88,7 @@ pub(crate) struct IngestPlanRaw {
 /// Accept `pages` either as a proper array or as a string containing the
 /// JSON-encoded array. Some OpenAI-compatible proxies double-encode nested
 /// structures under strict response schemas (observed live with a
-/// Vertex-routed LiteLLM proxy during bulk ingest).
+/// Vertex-routed `LiteLLM` proxy during bulk ingest).
 fn pages_or_json_string<'de, D>(de: D) -> Result<Vec<IngestPageAction>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -251,6 +251,8 @@ where
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
     Ok(match value {
         None | Some(serde_json::Value::Null) => None,
+        // The field is f32; narrowing the parsed f64 (rounds to nearest) is intended.
+        #[allow(clippy::cast_possible_truncation)]
         Some(serde_json::Value::Number(n)) => n.as_f64().map(|x| x as f32),
         Some(serde_json::Value::Bool(b)) => Some(if b { 1.0 } else { 0.0 }),
         Some(serde_json::Value::String(s)) => parse_confidence_label(&s),
@@ -273,7 +275,7 @@ fn parse_confidence_label(raw: &str) -> Option<f32> {
         "medium" | "moderate" | "mid" => Some(0.6),
         "high" => Some(0.85),
         "very_high" | "very high" | "certain" => Some(0.95),
-        "" | "none" | "n/a" | "unknown" => None,
+        // Explicit non-answers ("", "none", "n/a", "unknown") and unknown labels.
         _ => None,
     }
 }
@@ -551,7 +553,6 @@ mod tests {
         assert_eq!(plan.pages[0].path, "wiki/concepts/x.md");
     }
 
-    use super::*;
     use crate::vault::page::{Frontmatter, PageId};
     use camino::Utf8PathBuf;
     use chrono::{TimeZone, Utc};
@@ -734,7 +735,7 @@ mod tests {
         assert!(entry.contains("1 page"));
         assert!(!entry.contains("1 pages"));
 
-        let multi = derive_log_entry("topic", &vec![]);
+        let multi = derive_log_entry("topic", &[]);
         assert!(multi.contains("0 pages"));
     }
 

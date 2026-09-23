@@ -71,7 +71,7 @@ pub struct DrainConfig {
 impl Default for DrainConfig {
     fn default() -> Self {
         Self {
-            debounce: Duration::from_secs(120),
+            debounce: Duration::from_mins(2),
             max_per_run: None,
             dry_run: false,
         }
@@ -464,8 +464,7 @@ pub fn queue_stats(vault: &Vault) -> Result<QueueStats> {
 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     let mut min_ts: Option<u64> = None;
     let mut max_ts: Option<u64> = None;
@@ -527,8 +526,7 @@ pub fn queue_health_check(vault: &Vault, stuck_threshold: Duration) -> DoctorChe
 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let threshold_secs = stuck_threshold.as_secs();
 
     if pending > 1000 {
@@ -698,7 +696,7 @@ fn try_drain_lock<T, F: FnOnce() -> Result<T>>(meta: &Path, f: F) -> Result<Opti
     outcome
 }
 
-/// Returns `true` if the drain fd_lock is actively held by another process.
+/// Returns `true` if the drain `fd_lock` is actively held by another process.
 ///
 /// Attempts a non-blocking `try_write()` on the lock file. On success we
 /// immediately release the lock (the guard drops at end of scope) and return
@@ -711,16 +709,15 @@ fn try_drain_lock<T, F: FnOnce() -> Result<T>>(meta: &Path, f: F) -> Result<Opti
 /// run at least once".
 fn probe_drain_lock_active(meta: &Path) -> bool {
     let lock_path = meta.join(DRAIN_LOCK_FILE);
-    let file = match OpenOptions::new()
+    let Ok(file) = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(&lock_path)
-    {
-        Ok(f) => f,
+    else {
         // Can't open the file — assume not locked; caller will surface IO issues separately.
-        Err(_) => return false,
+        return false;
     };
     // Use a local block so the guard (which borrows rwlock) drops before rwlock
     // does, satisfying the borrow checker.
@@ -763,8 +760,7 @@ fn pid_alive(pid: u32) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -977,7 +973,7 @@ mod tests {
         let src = write_source(dir.path(), "src.md", "hello");
         enqueue(&vault, &src, None).unwrap();
         let cfg = DrainConfig {
-            debounce: Duration::from_secs(120),
+            debounce: Duration::from_mins(2),
             ..Default::default()
         };
         let report = drain(&vault, &dummy_provider(), cfg).await.unwrap();
@@ -1214,7 +1210,7 @@ mod tests {
     #[test]
     fn queue_health_ok_when_empty() {
         let (_dir, vault) = make_test_vault();
-        let check = queue_health_check(&vault, Duration::from_secs(3600));
+        let check = queue_health_check(&vault, Duration::from_hours(1));
         assert_eq!(check.name, "queue_health");
         assert_eq!(check.status, crate::doctor::CheckStatus::Ok);
     }
@@ -1239,7 +1235,7 @@ mod tests {
             let name = format!("{now_secs}-{i:08x}.json");
             fs::write(dir.join(name), &body).unwrap();
         }
-        let check = queue_health_check(&vault, Duration::from_secs(3600));
+        let check = queue_health_check(&vault, Duration::from_hours(1));
         assert_eq!(check.status, crate::doctor::CheckStatus::Warn);
         assert!(check.message.contains("1001"));
     }
@@ -1257,7 +1253,7 @@ mod tests {
         })
         .unwrap();
         fs::write(dir.join("1000-deadbeef.json"), &body).unwrap();
-        let check = queue_health_check(&vault, Duration::from_secs(60));
+        let check = queue_health_check(&vault, Duration::from_mins(1));
         assert_eq!(check.status, crate::doctor::CheckStatus::Fail);
         assert!(check.message.contains("1000-deadbeef.json"));
     }
@@ -1274,7 +1270,7 @@ mod tests {
         fs::create_dir_all(&meta).unwrap();
         fs::write(meta.join(DRAIN_LOCK_FILE), b"").unwrap();
         fs::write(meta.join(DRAIN_PID_FILE), format!("{}\n", u32::MAX)).unwrap();
-        let check = queue_health_check(&vault, Duration::from_secs(3600));
+        let check = queue_health_check(&vault, Duration::from_hours(1));
         // Lock file exists but is not actually held — idle is the correct status.
         assert_eq!(check.status, crate::doctor::CheckStatus::Ok);
     }

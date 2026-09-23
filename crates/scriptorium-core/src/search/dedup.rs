@@ -280,7 +280,7 @@ mod tests {
                     id,
                     0,
                     &format!("concept {i}"),
-                    1.0 - i as f32 * 0.05,
+                    1.0 - f32::from(u8::try_from(i).unwrap()) * 0.05,
                     "wiki/concepts/foo.md",
                 )
             })

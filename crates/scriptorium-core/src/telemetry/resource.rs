@@ -53,9 +53,10 @@ impl Resource {
         );
 
         // host.name via hostname crate
-        let hostname = hostname::get()
-            .map(|h| h.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "unknown".to_string());
+        let hostname = hostname::get().map_or_else(
+            |_| "unknown".to_string(),
+            |h| h.to_string_lossy().into_owned(),
+        );
         attributes.insert("host.name".to_string(), hostname);
 
         // process.pid as decimal string
@@ -73,24 +74,21 @@ impl Resource {
 
         // scriptorium.vault — canonicalized path if provided
         if let Some(vault) = vault_path {
-            match vault.canonicalize() {
-                Ok(canonical) => {
-                    attributes.insert(
-                        "scriptorium.vault".to_string(),
-                        canonical.to_string_lossy().into_owned(),
-                    );
-                }
-                Err(_) => {
-                    // Canonicalization failed (vault doesn't exist yet). Fall back to literal path.
-                    tracing::debug!(
-                        "vault path canonicalization failed, using literal path: {:?}",
-                        vault
-                    );
-                    attributes.insert(
-                        "scriptorium.vault".to_string(),
-                        vault.to_string_lossy().into_owned(),
-                    );
-                }
+            if let Ok(canonical) = vault.canonicalize() {
+                attributes.insert(
+                    "scriptorium.vault".to_string(),
+                    canonical.to_string_lossy().into_owned(),
+                );
+            } else {
+                // Canonicalization failed (vault doesn't exist yet). Fall back to literal path.
+                tracing::debug!(
+                    "vault path canonicalization failed, using literal path: {:?}",
+                    vault
+                );
+                attributes.insert(
+                    "scriptorium.vault".to_string(),
+                    vault.to_string_lossy().into_owned(),
+                );
             }
         }
 
@@ -220,9 +218,7 @@ mod tests {
             assert_eq!(
                 resource.attributes.get("service.name"),
                 Some(&expected_name.to_string()),
-                "Source::{:?} should map to {}",
-                source,
-                expected_name
+                "Source::{source:?} should map to {expected_name}"
             );
         }
     }

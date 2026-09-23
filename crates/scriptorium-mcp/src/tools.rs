@@ -965,7 +965,7 @@ mod tests {
     /// POISONS the tool registry for the rest of the session — every
     /// subsequent API call also fails until the tool is removed.
     ///
-    /// scriptorium_ingest previously used `oneOf` at the top level to
+    /// `scriptorium_ingest` previously used `oneOf` at the top level to
     /// express "source XOR url", which broke Claude Code sessions that
     /// tried to load it. Runtime handlers do the XOR check instead. No
     /// tool spec should ever re-introduce a top-level combinator.
@@ -1003,13 +1003,13 @@ mod tests {
     // The tests use MockProvider for both chat (returns a fixed IngestPlan
     // JSON) and embeddings (returns deterministic SHA-derived vectors).
 
-    /// Build a temp vault, a ServerContext, and a source file inside the
-    /// vault wired up so a single ingest_tool call exercises the full
+    /// Build a temp vault, a `ServerContext`, and a source file inside the
+    /// vault wired up so a single `ingest_tool` call exercises the full
     /// commit + auto-reindex path. Returns:
-    ///   - the TempDir guard (kept alive by caller)
-    ///   - the ServerContext (already wired with mock providers)
+    ///   - the `TempDir` guard (kept alive by caller)
+    ///   - the `ServerContext` (already wired with mock providers)
     ///   - the absolute path of the source file the test should pass to
-    ///     ingest_tool
+    ///     `ingest_tool`
     fn make_test_context(
         plan: &IngestPlan,
         source_name: &str,
@@ -1061,10 +1061,10 @@ mod tests {
         }
     }
 
-    /// Happy path: a successful ingest_tool call leaves the embeddings
+    /// Happy path: a successful `ingest_tool` call leaves the embeddings
     /// store populated, so the freshly created page is immediately
     /// retrievable. This is the contract the auto-reindex behavior
-    /// guarantees — without it, store.len() would be 0 after the call.
+    /// guarantees — without it, `store.len()` would be 0 after the call.
     #[tokio::test]
     async fn ingest_tool_embeds_pages_into_store_after_commit() {
         let plan = make_simple_plan(
@@ -1099,7 +1099,7 @@ mod tests {
         );
     }
 
-    /// Dry-run path: ingest_tool with dry_run=true should NOT touch the
+    /// Dry-run path: `ingest_tool` with `dry_run=true` should NOT touch the
     /// embeddings store at all. Even though the source is interned and the
     /// LLM is consulted, no commit happens, so no reindex should fire and
     /// the store should remain empty.

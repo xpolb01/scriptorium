@@ -518,7 +518,7 @@ mod tests {
         hash: &str,
         session_id: &str,
         agent_type: Option<&str>,
-        score: Option<i64>,
+        hook_score: Option<i64>,
         signals: Option<&str>,
     ) {
         let conn = Connection::open(store.db_path()).unwrap();
@@ -526,7 +526,7 @@ mod tests {
             "INSERT INTO hook_events (ts, session_id, hook_type, agent_type, score, signals, \
              raw_json, raw_json_hash) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![ts, session_id, hook_type, agent_type, score, signals, "{}", hash,],
+            params![ts, session_id, hook_type, agent_type, hook_score, signals, "{}", hash,],
         )
         .unwrap();
     }

@@ -9,7 +9,7 @@
 //! marker logs so the caller still sees evidence of the miss.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -64,10 +64,10 @@ pub enum LogAction {
 }
 
 /// Entry point for the `log` subtree.
-pub fn run(cmd: LogCommand, db_path: PathBuf) -> Result<()> {
+pub fn run(cmd: LogCommand, db_path: &Path) -> Result<()> {
     match cmd.action {
         LogAction::Emit => {
-            emit(&db_path);
+            emit(db_path);
             Ok(())
         }
         LogAction::Tail {
@@ -80,7 +80,7 @@ pub fn run(cmd: LogCommand, db_path: PathBuf) -> Result<()> {
             aggregate,
             json,
         } => tail(
-            &db_path,
+            db_path,
             &source,
             severity,
             since.as_deref(),
@@ -99,7 +99,7 @@ pub fn run(cmd: LogCommand, db_path: PathBuf) -> Result<()> {
 ///
 /// Errors (bad JSON, invalid source, write failure) are reported to
 /// stderr; a marker log is written for certain classes of bad input.
-fn emit(db_path: &PathBuf) {
+fn emit(db_path: &Path) {
     let mut raw = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
         eprintln!("scriptorium log emit: stdin read: {e}");
@@ -133,13 +133,10 @@ fn emit(db_path: &PathBuf) {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let source = match Source::from_str(&raw_source) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("scriptorium log emit: invalid source: {raw_source:?}");
-            emit_invalid_source_marker(&store, &raw_source);
-            return;
-        }
+    let Ok(source) = Source::from_str(&raw_source) else {
+        eprintln!("scriptorium log emit: invalid source: {raw_source:?}");
+        emit_invalid_source_marker(&store, &raw_source);
+        return;
     };
 
     let body = parsed
@@ -157,56 +154,7 @@ fn emit(db_path: &PathBuf) {
         .map_or(SeverityNumber::INFO, parse_severity);
 
     let mut attributes = attrs_from_value(parsed.get("attributes"));
-
-    // Trace/span id normalization: invalid hex → NULL + invalid-id marker.
-    let mut invalid_trace_hit = false;
-    let trace_id_stdin = parsed.get("trace_id").and_then(Value::as_str);
-    let mut trace_id: Option<TraceId> = None;
-    if let Some(raw_tid) = trace_id_stdin {
-        match normalize_hex(raw_tid, 32).and_then(|h| TraceId::from_str(&h).ok()) {
-            Some(t) => trace_id = Some(t),
-            None => {
-                invalid_trace_hit = true;
-                attributes.insert(
-                    "telemetry.invalid_trace_id".to_string(),
-                    Value::String(raw_tid.to_string()),
-                );
-            }
-        }
-    }
-
-    let span_id_stdin = parsed.get("span_id").and_then(Value::as_str);
-    let mut span_id: Option<SpanId> = None;
-    if let Some(raw_sid) = span_id_stdin {
-        match normalize_hex(raw_sid, 16).and_then(|h| SpanId::from_str(&h).ok()) {
-            Some(s) => span_id = Some(s),
-            None => {
-                attributes.insert(
-                    "telemetry.invalid_span_id".to_string(),
-                    Value::String(raw_sid.to_string()),
-                );
-            }
-        }
-    }
-
-    // Env correlation. If stdin didn't provide a trace_id, inherit from
-    // SCRIPTORIUM_TRACEPARENT — including the env span_id unless stdin
-    // explicitly set span_id (stdin wins). If both env and stdin are
-    // missing, synthesize a new root.
-    if trace_id.is_none() {
-        if let Some(ctx) = TraceContext::from_env() {
-            trace_id = Some(ctx.trace_id);
-            if span_id.is_none() {
-                span_id = Some(ctx.span_id);
-            }
-        } else {
-            let ctx = TraceContext::new_root(None, None);
-            trace_id = Some(ctx.trace_id);
-            if span_id.is_none() {
-                span_id = Some(ctx.span_id);
-            }
-        }
-    }
+    let (trace_id, span_id, invalid_trace_hit) = resolve_log_ids(&parsed, &mut attributes);
 
     let resource = Resource::detect(source, None);
     let _ = store.insert_resource(&resource);
@@ -252,6 +200,65 @@ fn emit(db_path: &PathBuf) {
     }
 }
 
+/// Resolve the trace/span ids for an emitted log from stdin and the env.
+/// Returns `(trace_id, span_id, invalid_trace_hit)`; invalid stdin ids are
+/// recorded in `attributes`.
+fn resolve_log_ids(
+    parsed: &Value,
+    attributes: &mut Attributes,
+) -> (Option<TraceId>, Option<SpanId>, bool) {
+    // Trace/span id normalization: invalid hex → NULL + invalid-id marker.
+    let mut invalid_trace_hit = false;
+    let trace_id_stdin = parsed.get("trace_id").and_then(Value::as_str);
+    let mut trace_id: Option<TraceId> = None;
+    if let Some(raw_tid) = trace_id_stdin {
+        if let Some(t) = normalize_hex(raw_tid, 32).and_then(|h| TraceId::from_str(&h).ok()) {
+            trace_id = Some(t);
+        } else {
+            invalid_trace_hit = true;
+            attributes.insert(
+                "telemetry.invalid_trace_id".to_string(),
+                Value::String(raw_tid.to_string()),
+            );
+        }
+    }
+
+    let span_id_stdin = parsed.get("span_id").and_then(Value::as_str);
+    let mut span_id: Option<SpanId> = None;
+    if let Some(raw_sid) = span_id_stdin {
+        match normalize_hex(raw_sid, 16).and_then(|h| SpanId::from_str(&h).ok()) {
+            Some(s) => span_id = Some(s),
+            None => {
+                attributes.insert(
+                    "telemetry.invalid_span_id".to_string(),
+                    Value::String(raw_sid.to_string()),
+                );
+            }
+        }
+    }
+
+    // Env correlation. If stdin didn't provide a trace_id, inherit from
+    // SCRIPTORIUM_TRACEPARENT — including the env span_id unless stdin
+    // explicitly set span_id (stdin wins). If both env and stdin are
+    // missing, synthesize a new root.
+    if trace_id.is_none() {
+        if let Some(ctx) = TraceContext::from_env() {
+            trace_id = Some(ctx.trace_id);
+            if span_id.is_none() {
+                span_id = Some(ctx.span_id);
+            }
+        } else {
+            let ctx = TraceContext::new_root(None, None);
+            trace_id = Some(ctx.trace_id);
+            if span_id.is_none() {
+                span_id = Some(ctx.span_id);
+            }
+        }
+    }
+
+    (trace_id, span_id, invalid_trace_hit)
+}
+
 fn emit_invalid_source_marker(store: &TelemetryStore, original: &str) {
     let resource = Resource::detect(Source::Core, None);
     let _ = store.insert_resource(&resource);
@@ -275,7 +282,7 @@ fn emit_invalid_source_marker(store: &TelemetryStore, original: &str) {
 
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn tail(
-    db_path: &PathBuf,
+    db_path: &Path,
     sources: &[String],
     severity: Option<u8>,
     since: Option<&str>,
@@ -376,10 +383,10 @@ fn parse_severity(v: &Value) -> SeverityNumber {
         Value::String(s) => match s.to_ascii_uppercase().as_str() {
             "TRACE" => SeverityNumber::TRACE,
             "DEBUG" => SeverityNumber::DEBUG,
-            "INFO" => SeverityNumber::INFO,
             "WARN" | "WARNING" => SeverityNumber::WARN,
             "ERROR" => SeverityNumber::ERROR,
             "FATAL" => SeverityNumber::FATAL,
+            // "INFO" and unrecognized labels.
             _ => SeverityNumber::INFO,
         },
         _ => SeverityNumber::INFO,
@@ -409,7 +416,7 @@ fn parse_iso_to_nanos(s: &str) -> Option<i64> {
     let dt = chrono::DateTime::parse_from_rfc3339(s).ok()?;
     let secs = dt.timestamp();
     let nanos = i64::from(dt.timestamp_subsec_nanos());
-    Some(secs.checked_mul(1_000_000_000)?.checked_add(nanos)?)
+    secs.checked_mul(1_000_000_000)?.checked_add(nanos)
 }
 
 // ── tests ───────────────────────────────────────────────────────────────
@@ -417,6 +424,7 @@ fn parse_iso_to_nanos(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn tmp_db() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();

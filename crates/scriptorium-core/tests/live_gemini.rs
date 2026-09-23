@@ -18,18 +18,15 @@ use scriptorium_core::llm::{
 /// Try to construct a provider; returns `None` (and prints a skip message) if
 /// the API key isn't available so the test exits cleanly rather than panicking.
 fn provider_or_skip() -> Option<GeminiProvider> {
-    let config = match GeminiConfig::from_env() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("SKIP: SCRIPTORIUM_GOOGLE_API_KEY not available, skipping live Gemini test");
-            return None;
-        }
+    let Ok(config) = GeminiConfig::from_env() else {
+        eprintln!("SKIP: SCRIPTORIUM_GOOGLE_API_KEY not available, skipping live Gemini test");
+        return None;
     };
     Some(GeminiProvider::new(config).expect("GeminiProvider builds from valid config"))
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "hits the live Gemini API; run with --ignored"]
 async fn complete_plain_text() {
     let Some(provider) = provider_or_skip() else {
         return;
@@ -51,7 +48,9 @@ async fn complete_plain_text() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "hits the live Gemini API; run with --ignored"]
+// Page paths must end in lowercase `.md` (same contract as `guard_stem_collisions`).
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 async fn complete_structured_ingest_plan() {
     let Some(provider) = provider_or_skip() else {
         return;
@@ -99,7 +98,7 @@ async fn complete_structured_ingest_plan() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "hits the live Gemini API; run with --ignored"]
 async fn embed_returns_correct_dimensions() {
     let Some(provider) = provider_or_skip() else {
         return;
@@ -129,7 +128,7 @@ async fn embed_returns_correct_dimensions() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "hits the live Gemini API; run with --ignored"]
 async fn embed_single_text() {
     let Some(provider) = provider_or_skip() else {
         return;
@@ -145,7 +144,7 @@ async fn embed_single_text() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "hits the live Gemini API; run with --ignored"]
 fn metadata_is_sane() {
     let Some(provider) = provider_or_skip() else {
         return;

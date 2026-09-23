@@ -127,7 +127,7 @@ impl VectorIndex for LinearIndex {
     }
 
     fn len(&self) -> usize {
-        self.entries.read().map(|e| e.len()).unwrap_or(0)
+        self.entries.read().map_or(0, |e| e.len())
     }
 }
 

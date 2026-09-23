@@ -184,14 +184,13 @@ pub fn extract_json_payload(text: &str) -> String {
         .strip_prefix("```json")
         .or_else(|| trimmed.strip_prefix("```JSON"))
         .or_else(|| trimmed.strip_prefix("```"))
-        .map(|rest| {
-            let rest = rest.trim_start_matches(|c: char| c == '\n' || c == '\r' || c == ' ');
-            rest.strip_suffix("```")
-                .map(str::trim)
-                .unwrap_or(rest)
-                .to_string()
-        })
-        .unwrap_or_else(|| trimmed.to_string());
+        .map_or_else(
+            || trimmed.to_string(),
+            |rest| {
+                let rest = rest.trim_start_matches(['\n', '\r', ' ']);
+                rest.strip_suffix("```").map_or(rest, str::trim).to_string()
+            },
+        );
     if let (Some(start), Some(end)) = (unfenced.find('{'), unfenced.rfind('}')) {
         if end >= start {
             return unfenced[start..=end].to_string();

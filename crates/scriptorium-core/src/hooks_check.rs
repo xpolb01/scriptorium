@@ -421,8 +421,7 @@ fn check_dependencies() -> Vec<CheckItem> {
         let found = std::process::Command::new("which")
             .arg(dep)
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+            .is_ok_and(|o| o.status.success());
         if found {
             items.push(CheckItem::pass(
                 "dependency",
@@ -1030,8 +1029,7 @@ fn check_vault_hook_commands(hooks: &crate::hooks::HooksConfig) -> Vec<CheckItem
                 let in_path = std::process::Command::new("which")
                     .arg(binary)
                     .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false);
+                    .is_ok_and(|o| o.status.success());
                 if in_path {
                     items.push(CheckItem::pass(
                         "vault_hook_command",
@@ -1124,9 +1122,7 @@ pub fn list_hooks(settings_path: &Path, hooks_dir: &Path) -> Vec<HookListEntry> 
             let resolved = expand_tilde(&hook.command);
             let on_disk = resolved.exists();
             let executable = on_disk
-                && fs::metadata(&resolved)
-                    .map(|m| m.permissions().mode() & 0o111 != 0)
-                    .unwrap_or(false);
+                && fs::metadata(&resolved).is_ok_and(|m| m.permissions().mode() & 0o111 != 0);
             let name = resolved
                 .file_name()
                 .map_or_else(|| hook.command.clone(), |n| n.to_string_lossy().to_string());
@@ -1156,9 +1152,8 @@ pub fn list_hooks(settings_path: &Path, hooks_dir: &Path) -> Vec<HookListEntry> 
             {
                 let abs = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
                 if !seen_paths.contains(&abs) {
-                    let executable = fs::metadata(&abs)
-                        .map(|m| m.permissions().mode() & 0o111 != 0)
-                        .unwrap_or(false);
+                    let executable =
+                        fs::metadata(&abs).is_ok_and(|m| m.permissions().mode() & 0o111 != 0);
                     entries.push(HookListEntry {
                         name: name_str,
                         event_type: "\u{2014}".to_string(), // em-dash
@@ -1551,7 +1546,7 @@ mod tests {
         ];
         for (variant, expected_json_str) in variants {
             let serialized = serde_json::to_string(&variant).unwrap();
-            assert_eq!(serialized, format!(r#""{}""#, expected_json_str));
+            assert_eq!(serialized, format!(r#""{expected_json_str}""#));
 
             let deserialized: CheckStatus = serde_json::from_str(&serialized).unwrap();
             assert_eq!(deserialized, variant);

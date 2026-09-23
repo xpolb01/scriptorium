@@ -1132,7 +1132,7 @@ mod tests {
         e3.raw_json_hash = HooksStore::hash_raw("unique-3");
         store.insert_event(&e3).unwrap();
 
-        let summary = store.query_summary(Duration::from_secs(3600)).unwrap();
+        let summary = store.query_summary(Duration::from_hours(1)).unwrap();
         assert_eq!(summary.total_events, 3);
         assert_eq!(summary.total_ingests, 1);
         assert_eq!(summary.total_skips, 1);
@@ -1481,7 +1481,7 @@ mod tests {
         let all_events = store.query_events(1000, None).unwrap();
         assert_eq!(
             all_events.len(),
-            total_expected as usize,
+            usize::try_from(total_expected).unwrap(),
             "Expected {total_expected} events from {num_threads} threads × {events_per_thread} each, got {}",
             all_events.len()
         );
@@ -1510,9 +1510,7 @@ mod tests {
             store.insert_event(&e).unwrap();
         }
 
-        let summary = store
-            .query_summary(Duration::from_secs(86_400 * 7))
-            .unwrap();
+        let summary = store.query_summary(Duration::from_hours(24 * 7)).unwrap();
         assert_eq!(
             summary.ingests_today, 3,
             "expected 3 ingests dated today; yesterday's 2 must not count"
@@ -1530,7 +1528,7 @@ mod tests {
         event.raw_json_hash = HooksStore::hash_raw("wal-age-unique");
         store.insert_event(&event).unwrap();
 
-        let summary = store.query_summary(Duration::from_secs(3600)).unwrap();
+        let summary = store.query_summary(Duration::from_hours(1)).unwrap();
         let age = summary
             .wal_checkpoint_age_seconds
             .expect("-wal file should exist after a write in WAL mode");
@@ -1540,7 +1538,7 @@ mod tests {
     #[test]
     fn summary_wal_age_none_for_in_memory() {
         let store = HooksStore::in_memory().unwrap();
-        let summary = store.query_summary(Duration::from_secs(3600)).unwrap();
+        let summary = store.query_summary(Duration::from_hours(1)).unwrap();
         assert!(
             summary.wal_checkpoint_age_seconds.is_none(),
             "in-memory store has no -wal file"

@@ -931,8 +931,7 @@ impl TelemetryStore {
         let since_ns: i64 = {
             let now_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
-                .unwrap_or(0);
+                .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
             if window_ms == 0 {
                 0
             } else {
@@ -988,7 +987,7 @@ impl TelemetryStore {
             .into_iter()
             .map(|(name, points)| aggregate_group(name, &points))
             .collect();
-        summary.sort_by(|a, b| b.count.cmp(&a.count));
+        summary.sort_by_key(|row| std::cmp::Reverse(row.count));
         summary.truncate(10);
 
         Ok(SummaryReport {
@@ -1016,8 +1015,7 @@ impl TelemetryStore {
         let since_ns: i64 = {
             let now_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
-                .unwrap_or(0);
+                .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
             if window_ms == 0 {
                 0
             } else {
@@ -1049,7 +1047,7 @@ impl TelemetryStore {
             .into_iter()
             .map(|(name, points)| aggregate_group(name, &points))
             .collect();
-        summary.sort_by(|a, b| b.count.cmp(&a.count));
+        summary.sort_by_key(|row| std::cmp::Reverse(row.count));
         summary.truncate(10);
 
         Ok(SummaryReport {

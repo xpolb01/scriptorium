@@ -119,10 +119,10 @@ pub fn cap_attributes(
 ) -> (Attributes, Vec<TruncationMeta>) {
     let mut metas = Vec::new();
 
-    for (key, value) in attrs.iter_mut() {
+    for (key, value) in &mut attrs {
         // Serialize the value to JSON, then truncate.
         let json_str = serde_json::to_string(&value)
-            .unwrap_or_else(|_| format!("{{\"error\": \"serialization failed\"}}"));
+            .unwrap_or_else(|_| r#"{"error": "serialization failed"}"#.to_string());
 
         let json_bytes = json_str.as_bytes();
         if json_bytes.len() <= cap.max_attr_value_bytes {
@@ -305,7 +305,7 @@ mod tests {
         let body = "x".repeat(10_000);
         let (preview, meta) = cap_body(&body, &default_cap());
         assert!(preview.len() <= 8192);
-        assert_eq!(preview.as_bytes().len(), 8192);
+        assert_eq!(preview.len(), 8192);
         let m = meta.expect("should truncate");
         assert_eq!(m.field, "body");
         assert_eq!(m.original_len, 10_000);
@@ -324,10 +324,10 @@ mod tests {
         assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
 
         // Verify the length is a multiple of 2 (since each "é" is 2 bytes)
-        assert_eq!(preview.as_bytes().len() % 2, 0);
+        assert_eq!(preview.len() % 2, 0);
 
         // Verify we got exactly 8192 bytes (max_body_bytes)
-        assert_eq!(preview.as_bytes().len(), 8192);
+        assert_eq!(preview.len(), 8192);
 
         let m = meta.expect("should truncate");
         assert_eq!(m.original_len, 10_000);
@@ -349,7 +349,7 @@ mod tests {
         let (preview, meta) = cap_body(&body, &default_cap());
 
         assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
-        assert!(preview.as_bytes().len() <= 8192);
+        assert!(preview.len() <= 8192);
 
         // The original is > cap, so we should have truncation metadata
         assert!(meta.is_some());
@@ -429,7 +429,7 @@ mod tests {
             binary: false,
         };
 
-        add_truncation_attrs(&mut attrs, &[meta.clone()]);
+        add_truncation_attrs(&mut attrs, std::slice::from_ref(&meta));
 
         assert_eq!(
             attrs.get("telemetry.truncated"),

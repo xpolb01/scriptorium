@@ -46,7 +46,7 @@ impl Default for OllamaConfig {
             embed_dim: DEFAULT_EMBED_DIM,
             base_url: std::env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string()),
-            timeout: Duration::from_secs(120),
+            timeout: Duration::from_mins(2),
             max_attempts: DEFAULT_MAX_ATTEMPTS,
         }
     }

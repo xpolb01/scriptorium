@@ -89,7 +89,7 @@ impl GeminiConfig {
             embed_dim: DEFAULT_EMBED_DIM,
             base_url: std::env::var("GEMINI_BASE_URL")
                 .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string()),
-            timeout: Duration::from_secs(120),
+            timeout: Duration::from_mins(2),
             max_attempts: DEFAULT_MAX_ATTEMPTS,
         })
     }
@@ -219,14 +219,14 @@ impl LlmProvider for GeminiProvider {
     }
 
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
         // Gemini's batchEmbedContents takes one request per text, bundled —
         // but rejects batches over 100 requests (INVALID_ARGUMENT, observed
         // live when embedding a 187-page vault in one call). Chunk and
         // concatenate so callers can pass any number of texts.
         const MAX_BATCH: usize = 100;
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
         let model_path = format!("models/{}", self.config.embed_model);
         let url = format!(
             "{}/models/{}:batchEmbedContents?key={}",

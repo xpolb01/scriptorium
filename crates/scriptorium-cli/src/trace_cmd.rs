@@ -11,7 +11,7 @@
 //! and `scriptorium span start` when `SCRIPTORIUM_TRACEPARENT` is absent.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::Path;
 use std::str::FromStr;
 
 use clap::{Args, Subcommand};
@@ -77,9 +77,9 @@ pub enum TraceAction {
 }
 
 /// Entry point for the `trace` subtree.
-pub fn run(cmd: TraceCommand, db_path: PathBuf) -> Result<()> {
+pub fn run(cmd: TraceCommand, db_path: &Path) -> Result<()> {
     match cmd.action {
-        TraceAction::Inspect { trace_id, json } => inspect(&db_path, &trace_id, json),
+        TraceAction::Inspect { trace_id, json } => inspect(db_path, &trace_id, json),
         TraceAction::NewRoot {
             session_id,
             turn_id,
@@ -97,7 +97,7 @@ pub fn run(cmd: TraceCommand, db_path: PathBuf) -> Result<()> {
             parent_span_id,
         } => {
             span_start(
-                &db_path,
+                db_path,
                 name,
                 &kind,
                 &attributes,
@@ -113,7 +113,7 @@ pub fn run(cmd: TraceCommand, db_path: PathBuf) -> Result<()> {
             status_message,
             attributes,
         } => {
-            span_end(&db_path, &span_id, &status, status_message, &attributes);
+            span_end(db_path, &span_id, &status, status_message, &attributes);
             Ok(())
         }
     }
@@ -122,7 +122,7 @@ pub fn run(cmd: TraceCommand, db_path: PathBuf) -> Result<()> {
 // ── span start ─────────────────────────────────────────────────────────
 
 fn span_start(
-    db_path: &PathBuf,
+    db_path: &Path,
     name: String,
     kind: &str,
     attrs_json: &str,
@@ -133,12 +133,9 @@ fn span_start(
     if let Some(parent) = db_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let source = match Source::from_str(source_str) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("scriptorium span start: invalid source: {source_str:?}");
-            return;
-        }
+    let Ok(source) = Source::from_str(source_str) else {
+        eprintln!("scriptorium span start: invalid source: {source_str:?}");
+        return;
     };
     let store = match TelemetryStore::open(db_path) {
         Ok(s) => s,
@@ -201,18 +198,15 @@ fn span_start(
 // ── span end ───────────────────────────────────────────────────────────
 
 fn span_end(
-    db_path: &PathBuf,
+    db_path: &Path,
     span_id: &str,
     status: &str,
     status_message: Option<String>,
     attrs_json: &str,
 ) {
-    let sid = match normalize_hex(span_id, 16).and_then(|s| SpanId::from_str(&s).ok()) {
-        Some(s) => s,
-        None => {
-            eprintln!("scriptorium span end: invalid span_id: {span_id:?}");
-            return;
-        }
+    let Some(sid) = normalize_hex(span_id, 16).and_then(|s| SpanId::from_str(&s).ok()) else {
+        eprintln!("scriptorium span end: invalid span_id: {span_id:?}");
+        return;
     };
     let store = match TelemetryStore::open(db_path) {
         Ok(s) => s,
@@ -233,7 +227,7 @@ fn span_end(
 
 // ── inspect ────────────────────────────────────────────────────────────
 
-fn inspect(db_path: &PathBuf, trace_id: &str, json: bool) -> Result<()> {
+fn inspect(db_path: &Path, trace_id: &str, json: bool) -> Result<()> {
     let store = TelemetryStore::open(db_path).map_err(|e| miette!("open store: {e}"))?;
     let tree = store
         .query_trace(trace_id)
@@ -316,8 +310,7 @@ fn print_span(
 fn now_unix_nanos() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
 
 fn parse_kind(s: &str) -> SpanKind {
@@ -355,6 +348,7 @@ fn normalize_hex(s: &str, len: usize) -> Option<String> {
 mod tests {
     use super::*;
     use scriptorium_core::telemetry::TelemetryStore;
+    use std::path::PathBuf;
 
     fn tmp_db() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();

@@ -166,7 +166,7 @@ pub struct PruneReport {
 ///
 /// `freed_bytes_estimate` compares `PRAGMA page_count * PRAGMA page_size`
 /// before and after; on dry-run it is `0`. This is approximate because
-/// SQLite does not reclaim pages without `VACUUM`.
+/// `SQLite` does not reclaim pages without `VACUUM`.
 ///
 /// # Errors
 ///
@@ -179,8 +179,7 @@ pub fn prune_telemetry(
 ) -> rusqlite::Result<PruneReport> {
     let now_ns: i64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
-        .unwrap_or(0);
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
     let older_ns: i64 = i64::try_from(older_than.as_nanos()).unwrap_or(i64::MAX);
     let cutoff_ns = now_ns.saturating_sub(older_ns);
 
@@ -373,8 +372,7 @@ mod tests {
             seed_span(&path, now - 2 * hour_ns, rid, "old-span");
             seed_span(&path, now + hour_ns, rid, "new-span");
 
-            let report =
-                prune_telemetry(&store, Duration::from_secs(3600), false).expect("prune ok");
+            let report = prune_telemetry(&store, Duration::from_hours(1), false).expect("prune ok");
             assert_eq!(report.deleted_logs, 1);
             assert_eq!(report.deleted_spans, 1);
             assert!(!report.dry_run);
@@ -400,8 +398,7 @@ mod tests {
             );
             seed_log(&path, now, live_id, "new-l");
 
-            let report =
-                prune_telemetry(&store, Duration::from_secs(3600), false).expect("prune ok");
+            let report = prune_telemetry(&store, Duration::from_hours(1), false).expect("prune ok");
             assert_eq!(report.deleted_logs, 1);
             assert!(report.deleted_resources >= 1);
 
@@ -427,8 +424,7 @@ mod tests {
             seed_log(&path, now - 2 * hour_ns, rid, "old2");
 
             let before_logs = count(&path, "SELECT COUNT(*) FROM logs WHERE body='b'");
-            let report =
-                prune_telemetry(&store, Duration::from_secs(3600), true).expect("prune ok");
+            let report = prune_telemetry(&store, Duration::from_hours(1), true).expect("prune ok");
             assert!(report.dry_run);
             assert_eq!(report.deleted_logs, 2);
             assert_eq!(report.freed_bytes_estimate, 0);
@@ -440,7 +436,7 @@ mod tests {
         #[test]
         fn empty_db_zero_report() {
             let (_d, store, _path) = open_store();
-            let report = prune_telemetry(&store, Duration::from_secs(60), false).expect("prune ok");
+            let report = prune_telemetry(&store, Duration::from_mins(1), false).expect("prune ok");
             assert_eq!(report.deleted_logs, 0);
             assert_eq!(report.deleted_spans, 0);
         }
