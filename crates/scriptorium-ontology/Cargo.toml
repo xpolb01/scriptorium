@@ -2,7 +2,7 @@
 name = "scriptorium-ontology"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.94"
+rust-version = "1.94.1"
 license = "GPL-3.0-only"
 repository = "https://github.com/xpolb01/scriptorium"
 authors = ["Bogdan Polovko"]
