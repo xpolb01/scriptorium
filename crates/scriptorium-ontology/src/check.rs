@@ -1144,6 +1144,14 @@ fn filled_field_problems(config: &MarkdownConfig, model: &SubOntologyModel) -> V
             ));
         }
         for (object, f) in declared {
+            // The store fills the key last, over whatever else went there.
+            if object.key_field() == Some(field.as_str()) {
+                problems.push(format!(
+                    "`{setting} = \"{field}\"` names `{}`'s key, which the store fills with each note's key: what it receives would be lost",
+                    object.name
+                ));
+                continue;
+            }
             let fits = f.is_stored()
                 && if setting == "body_field" {
                     f.ty.named == "String" && !f.ty.is_list()
@@ -2073,6 +2081,35 @@ type Query { thing(id: ID!): Thing }
         let found = problems(&NOTES_TOML.replace("\"body\"", "\"year\""));
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("fills `Topic.year`"), "{}", found[0]);
+    }
+
+    #[test]
+    fn a_markdown_body_field_cannot_be_the_key() {
+        const SLUGGED: &str = r#"
+extend schema @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
+type Topic @key(fields: "slug") { slug: String! body: String }
+type Query { topic(slug: String!): Topic }
+"#;
+        let problems = |body_field: &str| -> Vec<String> {
+            let toml = format!(
+                "[storage]\nkind = \"markdown\"\ndir = \"pages\"\ntype = \"Topic\"\nbody_field = \"{body_field}\"\n"
+            );
+            run(&[
+                ("ontology/notes/subgraph.toml", toml.as_str()),
+                ("ontology/notes/schema.graphql", SLUGGED),
+                ("ontology/notes/pages/a.md", "Text.\n"),
+            ])
+            .issues
+            .into_iter()
+            .filter(|i| i.rule == "ontology.storage")
+            .map(|i| i.message)
+            .collect()
+        };
+        assert!(problems("body").is_empty(), "{:?}", problems("body"));
+        // The key is filled last, so the body would never be read.
+        let found = problems("slug");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("names `Topic`'s key"), "{}", found[0]);
     }
 
     #[test]
