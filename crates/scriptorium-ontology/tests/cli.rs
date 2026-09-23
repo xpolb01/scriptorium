@@ -1026,3 +1026,695 @@ fn serve_publishes_only_a_base_url_that_reaches_it() {
     let _ = server.wait();
     assert!(published, "serve published with base_url {url}");
 }
+
+/// Runs while a [`FakeSubgraph`] answers, standing in for whatever else
+/// happens to the repository meanwhile.
+type Meanwhile = std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>>;
+
+/// A stand-in remote subgraph on a loopback port: answers every POST with
+/// `_service { sdl }` from `sdl`, or 401 without the token, and records the
+/// `authorization` header of every request it gets.
+struct FakeSubgraph {
+    url: String,
+    sdl: std::sync::Arc<std::sync::Mutex<String>>,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    meanwhile: Meanwhile,
+}
+
+fn fake_subgraph(sdl: &str, token: &'static str) -> FakeSubgraph {
+    let state = std::sync::Arc::new(std::sync::Mutex::new(sdl.to_string()));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let meanwhile: Meanwhile = std::sync::Arc::default();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/graphql", listener.local_addr().unwrap());
+    let (shared, log, hook) = (
+        std::sync::Arc::clone(&state),
+        std::sync::Arc::clone(&seen),
+        std::sync::Arc::clone(&meanwhile),
+    );
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let app = axum::Router::new().route(
+                "/graphql",
+                axum::routing::post(move |headers: axum::http::HeaderMap| {
+                    let (shared, log, hook) = (
+                        std::sync::Arc::clone(&shared),
+                        std::sync::Arc::clone(&log),
+                        std::sync::Arc::clone(&hook),
+                    );
+                    async move {
+                        if let Some(meanwhile) = hook.lock().unwrap().as_mut() {
+                            meanwhile();
+                        }
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(ToString::to_string);
+                        log.lock().unwrap().push(auth.clone());
+                        if auth.as_deref() != Some(token) {
+                            return Err(axum::http::StatusCode::UNAUTHORIZED);
+                        }
+                        let sdl = shared.lock().unwrap().clone();
+                        Ok(axum::Json(
+                            serde_json::json!({ "data": { "_service": { "sdl": sdl } } }),
+                        ))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+    FakeSubgraph {
+        url,
+        sdl: state,
+        seen,
+        meanwhile,
+    }
+}
+
+fn head_message(repo: &Path) -> String {
+    let repo = git2::Repository::open(repo).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    head.message().unwrap_or_default().to_string()
+}
+
+const VENUES: &str = r#"extend schema @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
+type Venue @key(fields: "id") { id: ID! name: String! }
+type Query { venue(id: ID!): Venue }
+"#;
+
+/// A scaffolded repository and a stand-in `venues` subgraph that wants
+/// `Authorization: Bearer s3cret`.
+struct Remote {
+    home: tempfile::TempDir,
+    repo: tempfile::TempDir,
+    subgraph: FakeSubgraph,
+}
+
+impl Remote {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        scriptorium(home.path(), repo.path())
+            .args(["init"])
+            .assert()
+            .success();
+        Self {
+            home,
+            repo,
+            subgraph: fake_subgraph(VENUES, "Bearer s3cret"),
+        }
+    }
+
+    fn url(&self) -> &str {
+        &self.subgraph.url
+    }
+
+    /// The binary, with the credential the subgraph wants in `$VENUES_TOKEN`.
+    fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = scriptorium(self.home.path(), self.repo.path());
+        cmd.args(args).env("VENUES_TOKEN", "Bearer s3cret");
+        cmd
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        self.command(args).output().unwrap()
+    }
+
+    fn pin(&self) {
+        let out = self.run(&[
+            "add-remote",
+            "venues",
+            self.url(),
+            "--header",
+            "Authorization=VENUES_TOKEN",
+        ]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+
+    fn schema(&self) -> String {
+        std::fs::read_to_string(self.repo.path().join("ontology/venues/schema.graphql")).unwrap()
+    }
+}
+
+#[test]
+fn add_remote_pins_a_schema_but_not_its_credential() {
+    let remote = Remote::new();
+    // Without the header the subgraph refuses, and nothing is written.
+    let out = remote.run(&["add-remote", "venues", remote.url()]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("HTTP 401"), "{}", stderr(&out));
+    assert!(!remote.repo.path().join("ontology/venues").exists());
+
+    remote.pin();
+    assert_eq!(remote.schema(), VENUES);
+    let manifest =
+        std::fs::read_to_string(remote.repo.path().join("ontology/venues/subgraph.toml")).unwrap();
+    assert!(
+        !manifest.contains("VENUES_TOKEN") && !manifest.contains("s3cret"),
+        "no credential or binding in the committed manifest: {manifest}"
+    );
+    let bindings = std::fs::read_to_string(
+        remote
+            .repo
+            .path()
+            .join(".git/scriptorium-ontology/remotes.toml"),
+    )
+    .unwrap();
+    assert!(
+        bindings.contains("VENUES_TOKEN") && bindings.contains(remote.url()),
+        "{bindings}"
+    );
+    assert!(!bindings.contains("s3cret"), "only the variable's name");
+    assert!(
+        head_message(remote.repo.path()).starts_with("ontology: pin remote sub-ontology venues")
+    );
+    assert!(remote.run(&["check"]).status.success());
+    // The gateway reaches a remote at its own URL.
+    let out = remote.run(&["compose"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(remote.url()),
+        "supergraph routes venues to {}",
+        remote.url()
+    );
+
+    let out = remote.run(&["add-remote", "venues", remote.url()]);
+    assert!(stderr(&out).contains("already exists"), "{}", stderr(&out));
+}
+
+#[test]
+fn add_remote_refuses_credentials_in_urls_and_paths_outside_the_repo() {
+    let remote = Remote::new();
+    for url in [
+        format!("{}?token=s3cret", remote.url()),
+        remote.url().replace("http://", "http://user:s3cret@"),
+    ] {
+        let out = remote.run(&["add-remote", "venues", &url]);
+        assert!(!out.status.success(), "{url}");
+        assert!(stderr(&out).contains("must not"), "{}", stderr(&out));
+        assert!(!stderr(&out).contains("s3cret"), "{}", stderr(&out));
+    }
+    let out = remote.run(&["add-remote", "venues", remote.url(), "--dir", "../outside"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("inside the repository"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!remote.repo.path().join("../outside").exists());
+    assert!(
+        remote.subgraph.seen.lock().unwrap().is_empty(),
+        "refused before any request"
+    );
+}
+
+#[test]
+fn pull_refreshes_pinned_schemas_that_still_compose() {
+    let remote = Remote::new();
+    remote.pin();
+
+    // A new field upstream: a dry run shows it and writes nothing…
+    let v2 = VENUES.replace("name: String! }", "name: String! city: String }");
+    *remote.subgraph.sdl.lock().unwrap() = v2.clone();
+    let out = remote.run(&["pull", "--dry-run"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("venues: +1 -1 lines"), "{stdout}");
+    assert!(
+        stdout.contains("+type Venue @key(fields: \"id\") { id: ID! name: String! city: String }"),
+        "{stdout}"
+    );
+    assert_eq!(remote.schema(), VENUES);
+    // …and a pull commits it.
+    let out = remote.run(&["pull", "venues"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(remote.schema(), v2);
+    assert!(head_message(remote.repo.path()).starts_with("ontology: pull remote schemas (venues)"));
+
+    // A schema that no longer composes (Person.name clashes with core's) is refused.
+    *remote.subgraph.sdl.lock().unwrap() =
+        format!("{v2}type Person @key(fields: \"id\") {{ id: ID! name: Int }}\n");
+    let out = remote.run(&["pull"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("does not compose"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(remote.schema(), v2, "nothing written");
+    // …and a binding asked for with it is not kept either.
+    let out = remote
+        .command(&["pull", "venues", "--header", "Authorization=OTHER_TOKEN"])
+        .env("OTHER_TOKEN", "Bearer s3cret")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let bindings = std::fs::read_to_string(
+        remote
+            .repo
+            .path()
+            .join(".git/scriptorium-ontology/remotes.toml"),
+    )
+    .unwrap();
+    assert!(
+        bindings.contains("VENUES_TOKEN") && !bindings.contains("OTHER_TOKEN"),
+        "{bindings}"
+    );
+
+    let out = remote.run(&["pull", "core"]);
+    assert!(
+        stderr(&out).contains("`core` is not a remote"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pull_replaces_every_changed_schema_or_none() {
+    use std::os::unix::fs::PermissionsExt;
+    const ZONES: &str = "extend schema @link(url: \"https://specs.apollo.dev/federation/v2.3\", import: [\"@key\"])\ntype Zone @key(fields: \"id\") { id: ID! label: String! }\ntype Query { zone(id: ID!): Zone }\n";
+    let remote = Remote::new();
+    remote.pin();
+    let zones = fake_subgraph(ZONES, "Bearer s3cret");
+    let out = remote.run(&[
+        "add-remote",
+        "zones",
+        &zones.url,
+        "--header",
+        "Authorization=VENUES_TOKEN",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // Both change upstream, and the second schema cannot be written.
+    let venues_v2 = VENUES.replace("name: String! }", "name: String! city: String }");
+    *remote.subgraph.sdl.lock().unwrap() = venues_v2.clone();
+    *zones.sdl.lock().unwrap() = ZONES.replace("label: String! }", "label: String! floor: Int }");
+    let zones_dir = remote.repo.path().join("ontology/zones");
+    let set_mode = |mode| {
+        std::fs::set_permissions(&zones_dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    set_mode(0o555);
+    let probe = zones_dir.join(".probe");
+    if std::fs::write(&probe, "").is_ok() {
+        // Permissions do not bind here (root): nothing can fail the write.
+        let _ = std::fs::remove_file(&probe);
+        set_mode(0o755);
+        return;
+    }
+    let out = remote.run(&["pull"]);
+    set_mode(0o755);
+    assert!(!out.status.success());
+    assert!(
+        stderr_flat(&out).contains("nothing written"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(remote.schema(), VENUES, "venues was not replaced alone");
+    let status = hermetic(&mut Command::new("git"))
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(remote.repo.path())
+        .output()
+        .unwrap();
+    assert!(
+        status.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    // Writable again: both land, in one commit.
+    let out = remote.run(&["pull"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(remote.schema(), venues_v2);
+    assert!(head_message(remote.repo.path())
+        .starts_with("ontology: pull remote schemas (venues, zones)"));
+}
+
+#[test]
+fn pull_refuses_what_changed_while_it_fetched() {
+    let remote = Remote::new();
+    remote.pin();
+    let v2 = VENUES.replace("name: String! }", "name: String! city: String }");
+    *remote.subgraph.sdl.lock().unwrap() = v2.clone();
+    let repo = remote.repo.path().to_path_buf();
+    let meanwhile = |f: Box<dyn FnMut() + Send>| {
+        *remote.subgraph.meanwhile.lock().unwrap() = Some(f);
+    };
+
+    // Someone edits the pinned schema while the remote answers: the edit
+    // stays, and nothing is written.
+    let schema = repo.join("ontology/venues/schema.graphql");
+    let edited = schema.clone();
+    meanwhile(Box::new(move || {
+        std::fs::write(&edited, "# edited meanwhile\n").unwrap();
+    }));
+    let out = remote.run(&["pull"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr_flat(&out).contains("changed while pulling"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&schema).unwrap(),
+        "# edited meanwhile\n"
+    );
+    git(&repo, &["checkout", "--", "ontology/venues/schema.graphql"]);
+
+    // Someone commits while the remote answers: the new schemas were
+    // checked against the old HEAD, so nothing is written.
+    let committer = repo.clone();
+    meanwhile(Box::new(move || {
+        std::fs::write(committer.join("NOTES"), "meanwhile\n").unwrap();
+        git(&committer, &["add", "NOTES"]);
+        git(&committer, &["commit", "-qm", "meanwhile"]);
+    }));
+    let out = remote.run(&["pull"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr_flat(&out).contains("HEAD moved while pulling"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(remote.schema(), VENUES);
+    assert!(head_message(&repo).starts_with("meanwhile"));
+
+    // Quiet again: pulled.
+    *remote.subgraph.meanwhile.lock().unwrap() = None;
+    let out = remote.run(&["pull"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(remote.schema(), v2);
+}
+
+#[test]
+fn one_pin_change_at_a_time() {
+    let remote = Remote::new();
+    remote.pin();
+    *remote.subgraph.sdl.lock().unwrap() =
+        VENUES.replace("name: String! }", "name: String! city: String }");
+    // Another process is changing this clone's pins.
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(
+            remote
+                .repo
+                .path()
+                .join(".git/scriptorium-ontology/pins.lock"),
+        )
+        .unwrap();
+    held.lock().unwrap();
+    for args in [
+        vec!["pull"],
+        vec!["add-remote", "zones", "http://127.0.0.1:9/graphql"],
+    ] {
+        let out = remote.run(&args);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(
+            stderr_flat(&out).contains("another `add-remote` or `pull` is changing"),
+            "{}",
+            stderr(&out)
+        );
+    }
+    assert_eq!(remote.schema(), VENUES);
+    // A dry run only reads.
+    assert!(remote.run(&["pull", "--dry-run"]).status.success());
+    held.unlock().unwrap();
+    let out = remote.run(&["pull"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_pull_commit_puts_read_only_pins_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let remote = Remote::new();
+    remote.pin();
+    *remote.subgraph.sdl.lock().unwrap() =
+        VENUES.replace("name: String! }", "name: String! city: String }");
+    let schema = remote.repo.path().join("ontology/venues/schema.graphql");
+    std::fs::set_permissions(&schema, std::fs::Permissions::from_mode(0o444)).unwrap();
+    // Another git process holds the index: the commit fails after the swap.
+    let index_lock = remote.repo.path().join(".git/index.lock");
+    std::fs::write(&index_lock, "").unwrap();
+    let out = remote.run(&["pull"]);
+    std::fs::remove_file(&index_lock).unwrap();
+    assert!(!out.status.success());
+    assert!(
+        stderr_flat(&out).contains("the previous schemas are back"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(remote.schema(), VENUES);
+    let mode = std::fs::metadata(&schema).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o444, "the original file itself is back");
+    let status = hermetic(&mut Command::new("git"))
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(remote.repo.path())
+        .output()
+        .unwrap();
+    assert!(
+        status.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    // With the index free again, the pull lands.
+    let out = remote.run(&["pull"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
+#[test]
+fn add_remote_writes_nothing_over_what_appeared_meanwhile() {
+    let remote = Remote::new();
+    let dir = remote.repo.path().join("ontology/venues");
+    let claimed = dir.clone();
+    *remote.subgraph.meanwhile.lock().unwrap() = Some(Box::new(move || {
+        std::fs::create_dir_all(&claimed).unwrap();
+        std::fs::write(claimed.join("schema.graphql"), "# someone else's\n").unwrap();
+    }));
+    let add = || {
+        remote.run(&[
+            "add-remote",
+            "venues",
+            remote.url(),
+            "--header",
+            "Authorization=VENUES_TOKEN",
+        ])
+    };
+    let out = add();
+    assert!(!out.status.success());
+    assert!(
+        stderr_flat(&out).contains("appeared while `venues` was fetched"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("schema.graphql")).unwrap(),
+        "# someone else's\n"
+    );
+    assert!(!dir.join("subgraph.toml").exists());
+
+    // A commit that fails takes the new directory away again.
+    std::fs::remove_dir_all(&dir).unwrap();
+    *remote.subgraph.meanwhile.lock().unwrap() = None;
+    let index_lock = remote.repo.path().join(".git/index.lock");
+    std::fs::write(&index_lock, "").unwrap();
+    let out = add();
+    std::fs::remove_file(&index_lock).unwrap();
+    assert!(!out.status.success());
+    assert!(
+        stderr_flat(&out).contains("is removed again"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!dir.exists());
+    let out = add();
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
+#[cfg(unix)]
+#[test]
+fn no_pin_lands_without_its_binding() {
+    use std::os::unix::fs::PermissionsExt;
+    const ZONES: &str = "extend schema @link(url: \"https://specs.apollo.dev/federation/v2.3\", import: [\"@key\"])\ntype Zone @key(fields: \"id\") { id: ID! }\ntype Query { zone(id: ID!): Zone }\n";
+    let remote = Remote::new();
+    remote.pin();
+    let head = || head_message(remote.repo.path());
+    let before = head();
+    let zones = fake_subgraph(ZONES, "Bearer s3cret");
+    *remote.subgraph.sdl.lock().unwrap() =
+        VENUES.replace("name: String! }", "name: String! city: String }");
+    // The bindings file cannot be replaced.
+    let state = remote.repo.path().join(".git/scriptorium-ontology");
+    let set_mode = |mode| {
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    set_mode(0o555);
+    let probe = state.join(".probe");
+    if std::fs::write(&probe, "").is_ok() {
+        // Permissions do not bind here (root): nothing can fail.
+        let _ = std::fs::remove_file(&probe);
+        set_mode(0o755);
+        return;
+    }
+    let add = remote.run(&[
+        "add-remote",
+        "zones",
+        &zones.url,
+        "--header",
+        "Authorization=VENUES_TOKEN",
+    ]);
+    let pull = remote
+        .command(&["pull", "venues", "--header", "Authorization=OTHER_TOKEN"])
+        .env("OTHER_TOKEN", "Bearer s3cret")
+        .output()
+        .unwrap();
+    set_mode(0o755);
+    for out in [&add, &pull] {
+        assert!(!out.status.success(), "{}", stderr(out));
+    }
+    assert_eq!(head(), before, "nothing committed");
+    assert!(!remote.repo.path().join("ontology/zones").exists());
+    assert_eq!(remote.schema(), VENUES);
+}
+
+#[test]
+fn credentialed_loopback_fetches_bypass_proxies() {
+    // A proxy that counts the connections it is offered.
+    let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    let offered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&offered);
+    std::thread::spawn(move || {
+        for connection in proxy.incoming() {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(connection);
+        }
+    });
+    let remote = Remote::new();
+    let out = scriptorium(remote.home.path(), remote.repo.path())
+        .args([
+            "add-remote",
+            "venues",
+            remote.url(),
+            "--header",
+            "Authorization=VENUES_TOKEN",
+        ])
+        .env("VENUES_TOKEN", "Bearer s3cret")
+        .env("HTTP_PROXY", &proxy_url)
+        .env("http_proxy", &proxy_url)
+        .env("ALL_PROXY", &proxy_url)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        offered.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the credential never went through the proxy"
+    );
+}
+
+#[test]
+fn a_repointed_remote_does_not_get_the_bound_credentials() {
+    let remote = Remote::new();
+    remote.pin();
+    // A commit points `venues` somewhere else.
+    let elsewhere = fake_subgraph(VENUES, "Bearer s3cret");
+    let manifest = remote.repo.path().join("ontology/venues/subgraph.toml");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(&manifest, text.replace(remote.url(), &elsewhere.url)).unwrap();
+    git(remote.repo.path(), &["commit", "-qam", "repoint venues"]);
+
+    let out = remote.run(&["pull"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("bound to"), "{}", stderr(&out));
+    assert!(
+        elsewhere.seen.lock().unwrap().is_empty(),
+        "no request, so no credential, reached the new URL"
+    );
+    // Binding again is an explicit choice, for one remote.
+    let out = remote.run(&["pull", "--header", "Authorization=VENUES_TOKEN"]);
+    assert!(
+        stderr(&out).contains("name exactly one"),
+        "{}",
+        stderr(&out)
+    );
+    let out = remote.run(&["pull", "venues", "--header", "Authorization=VENUES_TOKEN"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        elsewhere.seen.lock().unwrap().as_slice(),
+        [Some("Bearer s3cret".to_string())]
+    );
+    let out = remote.run(&["pull"]);
+    assert!(
+        out.status.success(),
+        "the new binding sticks: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn publishing_asks_remotes_with_their_bound_headers() {
+    let remote = Remote::new();
+    remote.pin();
+    let out_path = remote.repo.path().join("supergraph.graphql");
+    let publish = |extra: &[&str]| {
+        let mut args = vec!["compose", "--base-url", "http://127.0.0.1:9", "--out"];
+        args.extend_from_slice(extra);
+        let out_path = out_path.to_string_lossy().into_owned();
+        let mut all: Vec<&str> = args.clone();
+        all.push(&out_path);
+        remote.run(&all)
+    };
+    // The bound header opens the remote, and its schema is the pinned one.
+    let out = publish(&[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // Upstream changed: publishing the old pin is refused.
+    *remote.subgraph.sdl.lock().unwrap() =
+        VENUES.replace("name: String! }", "name: String! city: String }");
+    let out = publish(&[]);
+    assert!(!out.status.success());
+    assert!(
+        stderr_flat(&out).contains("no longer serve the schema pinned"),
+        "{}",
+        stderr(&out)
+    );
+
+    // `serve --supergraph` asks the same way: refused while upstream
+    // differs, and published once it matches (the subgraph answers 401
+    // without the bound header).
+    let supergraph = remote.repo.path().join("served.graphql");
+    let serve = || {
+        let mut cmd = remote.command(&["serve", "--addr", "127.0.0.1:0", "--supergraph"]);
+        cmd.arg(&supergraph);
+        cmd
+    };
+    let out = exits_within(serve(), 30);
+    assert!(!out.status.success());
+    assert!(
+        stderr_flat(&out).contains("no longer serve the schema pinned"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!supergraph.exists());
+    *remote.subgraph.sdl.lock().unwrap() = VENUES.to_string();
+    let mut server = serve()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if supergraph.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = server.kill();
+    let _ = server.wait();
+    assert!(supergraph.exists(), "serve published with the bound header");
+}

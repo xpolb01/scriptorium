@@ -59,13 +59,16 @@ gray_matter = { version = "0.2.9", default-features = false, features = ["yaml"]
 graphql-composition = "0.12.2"
 miette = { version = "7.6.0", features = ["fancy"] }
 regex = "1.13.1"
-# `compose --out` asks the local subgraphs what they serve (rustls over
-# aws-lc-rs, like the root workspace's reqwest).
+# `compose --out` asks the local subgraphs what they serve; `add-remote` and
+# `pull` fetch pinned remote schemas (rustls over aws-lc-rs, like the root
+# workspace's reqwest).
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # Held at 0.0.12 like the root workspace (0.0.13 renders YAML differently).
 serde_yml = "0.0.12"
+# Apache-2.0. Line diffs of refreshed remote schemas (`pull --dry-run`).
+similar = "3.2.0"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 # MIT/Apache-2.0. `postgres` storage; `with-serde_json-1` decodes `jsonb` rows.

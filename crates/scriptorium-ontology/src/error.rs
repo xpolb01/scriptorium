@@ -26,6 +26,9 @@ pub enum Error {
     #[error("store `{store}`: {message}")]
     Store { store: String, message: String },
 
+    #[error("remote subgraph {url}: {message}")]
+    Remote { url: String, message: String },
+
     #[error("sub-ontology `{sub_ontology}` cannot be served: {message}")]
     Serve {
         sub_ontology: String,

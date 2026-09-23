@@ -18,6 +18,7 @@
 //! - [`check`] — registry, composition, and record validation
 //! - [`store`] — storage adapters for instance data
 //! - [`serve`] — HTTP subgraph servers for local sub-ontologies
+//! - [`remote`] — pin remote subgraphs' schemas (`add-remote`, `pull`)
 //! - [`cli`] — the `scriptorium-ontology` command line
 //!
 //! See `docs/ONTOLOGY.md` for the design.
@@ -30,6 +31,7 @@ pub mod layout;
 pub mod manifest;
 pub mod model;
 pub mod registry;
+pub mod remote;
 pub mod scaffold;
 pub mod serve;
 pub mod snapshot;

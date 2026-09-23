@@ -158,7 +158,9 @@ pub fn scaffold_example(repo_root: &Path, ontology_dir: &str) -> Result<Vec<Path
 
 /// `ontology_dir` must name a place inside `repo_root`: relative, no `..`,
 /// and no existing component that is a symlink (which could point anywhere).
-fn confine(repo_root: &Path, ontology_dir: &str) -> Result<()> {
+/// Refuse a repository-relative directory that is absolute, climbs out
+/// (`..`), or passes through a symlink, before anything is written there.
+pub(crate) fn confine(repo_root: &Path, ontology_dir: &str) -> Result<()> {
     let invalid = |message: &str| Error::Invalid {
         what: "ontology directory",
         path: ontology_dir.to_string(),

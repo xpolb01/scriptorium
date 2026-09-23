@@ -337,15 +337,66 @@ pub fn discover_repo_root(start: &Path) -> Option<PathBuf> {
 /// Returns the new commit id. The commit contains the whole index, so
 /// callers check [`has_staged_changes`] before calling this.
 pub fn commit_paths(repo_root: &Path, paths: &[PathBuf], message: &str) -> Result<String> {
-    let repo = match Repository::open(repo_root) {
-        Ok(repo) => repo,
+    let repo = open_or_init(repo_root)?;
+    let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+    commit_index(&repo, paths, message, parent.as_ref())
+}
+
+/// [`commit_paths`], but only onto `parent`: the commit (`None`: no commit
+/// yet) the caller checked its change against. If HEAD is anything else by
+/// then, nothing is committed; the ref update itself also requires `parent`
+/// to still be HEAD.
+pub fn commit_paths_onto(
+    repo_root: &Path,
+    paths: &[PathBuf],
+    message: &str,
+    parent: Option<&str>,
+) -> Result<String> {
+    let repo = open_or_init(repo_root)?;
+    let parent = parent
+        .map(|id| repo.find_commit(Oid::from_str(id)?))
+        .transpose()?;
+    let head = repo
+        .head()
+        .ok()
+        .and_then(|head| head.peel_to_commit().ok())
+        .map(|commit| commit.id());
+    if head != parent.as_ref().map(git2::Commit::id) {
+        let short = |id: Option<Oid>| {
+            id.map_or_else(
+                || "(no commit)".to_string(),
+                |id| id.to_string()[..7].to_string(),
+            )
+        };
+        return Err(git2::Error::from_str(&format!(
+            "HEAD moved to {} since {}; nothing committed",
+            short(head),
+            short(parent.as_ref().map(git2::Commit::id))
+        ))
+        .into());
+    }
+    commit_index(&repo, paths, message, parent.as_ref())
+}
+
+fn open_or_init(repo_root: &Path) -> Result<Repository> {
+    match Repository::open(repo_root) {
+        Ok(repo) => Ok(repo),
         Err(e) if e.code() == ErrorCode::NotFound => {
             let mut opts = git2::RepositoryInitOptions::new();
             opts.initial_head("main");
-            Repository::init_opts(repo_root, &opts)?
+            Ok(Repository::init_opts(repo_root, &opts)?)
         }
-        Err(e) => return Err(e.into()),
-    };
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Stage `paths` and commit the index on top of `parent`, moving HEAD.
+fn commit_index(
+    repo: &Repository,
+    paths: &[PathBuf],
+    message: &str,
+    parent: Option<&git2::Commit<'_>>,
+) -> Result<String> {
     let mut index = repo.index()?;
     for path in paths {
         index.add_path(path)?;
@@ -355,8 +406,7 @@ pub fn commit_paths(repo_root: &Path, paths: &[PathBuf], message: &str) -> Resul
     let signature = repo
         .signature()
         .or_else(|_| git2::Signature::now("scriptorium", "noreply@scriptorium"))?;
-    let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
-    let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+    let parents: Vec<&git2::Commit<'_>> = parent.into_iter().collect();
     let oid = repo.commit(
         Some("HEAD"),
         &signature,
@@ -366,6 +416,15 @@ pub fn commit_paths(repo_root: &Path, paths: &[PathBuf], message: &str) -> Resul
         &parents,
     )?;
     Ok(oid.to_string())
+}
+
+/// Reset the index entries for `paths` to HEAD: undoes a [`commit_paths`]
+/// that staged them but could not commit.
+pub fn unstage_paths(repo_root: &Path, paths: &[PathBuf]) -> Result<()> {
+    let repo = Repository::open(repo_root)?;
+    let head = repo.head()?.peel(ObjectType::Commit)?;
+    repo.reset_default(Some(&head), paths.iter().map(PathBuf::as_path))?;
+    Ok(())
 }
 
 /// True when the index holds staged changes. A commit made now would
@@ -515,6 +574,35 @@ mod tests {
         let err = head.read("b.txt").unwrap_err().to_string();
         assert!(err.contains("symlink"), "{err}");
         assert_eq!(head.read("a.txt").unwrap().unwrap(), b"real");
+    }
+
+    #[test]
+    fn commits_land_only_on_the_expected_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let first = commit_files(root, &[("a.txt", "1")], "first");
+        let second = commit_files(root, &[("a.txt", "2")], "second");
+        std::fs::write(root.join("b.txt"), "new").unwrap();
+        let paths = [PathBuf::from("b.txt")];
+
+        // Checked against `first`, but HEAD moved on: nothing committed or staged.
+        let err = commit_paths_onto(root, &paths, "late", Some(&first)).unwrap_err();
+        assert!(err.to_string().contains("HEAD moved"), "{err}");
+        let repo = Repository::open(root).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.id().to_string(), second);
+        assert!(
+            repo.index()
+                .unwrap()
+                .get_path(Path::new("b.txt"), 0)
+                .is_none(),
+            "the index is untouched"
+        );
+
+        let third = commit_paths_onto(root, &paths, "on time", Some(&second)).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.id().to_string(), third);
+        assert_eq!(head.parent_id(0).unwrap().to_string(), second);
     }
 
     #[test]

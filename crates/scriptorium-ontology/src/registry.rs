@@ -205,7 +205,12 @@ fn load_one(snapshot: &dyn Snapshot, dir: &str, dir_name: &str) -> Result<Loaded
 
     let source = match (manifest.storage, manifest.remote) {
         (Some(storage), None) => SubOntologySource::Local(storage),
-        (None, Some(remote)) => SubOntologySource::Remote(remote),
+        (None, Some(remote)) => {
+            if let Err(message) = crate::remote::validate_url(&remote.url) {
+                return invalid(&manifest_path, message);
+            }
+            SubOntologySource::Remote(remote)
+        }
         (Some(_), Some(_)) => {
             return invalid(
                 &manifest_path,
@@ -275,6 +280,31 @@ mod tests {
 
     const SDL: &str = "type Query { ok: Boolean }";
     const GIT: &str = "[storage]\nkind = \"git\"\n";
+
+    #[test]
+    fn remote_urls_carrying_credentials_are_issues() {
+        let dir = tempfile::tempdir().unwrap();
+        commit_files(
+            dir.path(),
+            &[
+                (
+                    "ontology/partner/subgraph.toml",
+                    "[remote]\nurl = \"https://p.example/graphql?api_key=s3cret\"\n",
+                ),
+                ("ontology/partner/schema.graphql", SDL),
+            ],
+            "init",
+        );
+        let snap = GitSnapshot::open(dir.path(), "HEAD").unwrap();
+        let (reg, issues) = Registry::load(&snap, "ontology").unwrap();
+        assert!(reg.get("partner").is_none());
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(
+            issues[0].message.contains("must not have a query"),
+            "{issues:?}"
+        );
+        assert!(!issues[0].message.contains("s3cret"), "{issues:?}");
+    }
 
     #[test]
     fn loads_local_and_remote_sub_ontologies_sorted() {

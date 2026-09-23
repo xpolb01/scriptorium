@@ -149,7 +149,9 @@ fn default_data_dir() -> String {
 }
 
 /// A Federation v2 subgraph served elsewhere. Its `schema.graphql` in git is
-/// a pinned snapshot of the remote SDL.
+/// a pinned snapshot of the remote SDL (`add-remote`, refreshed by `pull`).
+/// Credentials for fetching it are never part of the manifest; see
+/// [`crate::remote::Credentials`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteConfig {
@@ -190,6 +192,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.remote.unwrap().url, "https://example.com/graphql");
+        // Credentials never belong in the manifest.
+        assert!(toml::from_str::<SubgraphManifest>(
+            "[remote]\nurl = \"https://example.com/graphql\"\nheaders_env = { Authorization = \"T\" }"
+        )
+        .is_err());
     }
 
     #[test]

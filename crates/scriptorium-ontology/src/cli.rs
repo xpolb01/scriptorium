@@ -58,7 +58,7 @@ impl SourceArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum OntologyAction {
-    /// Scaffold the example ontology (core, research, software) and commit it.
+    /// Scaffold the example ontology (core, research, software, notes) and commit it.
     Init {
         /// Ontology directory, relative to the repository root.
         #[arg(long, default_value = ONTOLOGY_DIR)]
@@ -102,6 +102,47 @@ pub enum OntologyAction {
         #[arg(long)]
         json: bool,
     },
+    /// Pin a remote Federation subgraph as a sub-ontology: fetch its schema,
+    /// check it composes with the ontology at HEAD, write it, and commit.
+    AddRemote {
+        /// Sub-ontology name, the directory under the ontology directory.
+        name: String,
+        /// The subgraph's GraphQL endpoint; it must answer `_service { sdl }`.
+        url: String,
+        /// Send header HEADER with the value of environment variable ENV,
+        /// e.g. `--header Authorization=PEOPLE_TOKEN` (repeatable). The
+        /// binding (variable names, and this URL) is kept in the git
+        /// directory, never in a commit.
+        #[arg(long = "header", value_name = "HEADER=ENV")]
+        headers: Vec<String>,
+        /// Ontology directory, relative to the repository root.
+        #[arg(long, default_value = ONTOLOGY_DIR)]
+        dir: String,
+        /// Write the files without committing them.
+        #[arg(long)]
+        no_commit: bool,
+    },
+    /// Refresh pinned remote schemas from their subgraphs, and commit the
+    /// ones that changed if everything still composes.
+    Pull {
+        /// Remote sub-ontologies to refresh (default: every remote).
+        names: Vec<String>,
+        /// Bind headers to the one named remote at its current URL, and send
+        /// them (`--header Authorization=PEOPLE_TOKEN`). Otherwise a remote
+        /// gets the headers bound to it by `add-remote` or an earlier pull,
+        /// and only while its URL is the one they were bound to.
+        #[arg(long = "header", value_name = "HEADER=ENV")]
+        headers: Vec<String>,
+        /// Ontology directory, relative to the repository root.
+        #[arg(long, default_value = ONTOLOGY_DIR)]
+        dir: String,
+        /// Show what would change, with a diff, without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Write the files without committing them.
+        #[arg(long)]
+        no_commit: bool,
+    },
     /// Serve local sub-ontologies as Federation v2 subgraphs over HTTP.
     Serve {
         #[command(flatten)]
@@ -142,6 +183,20 @@ pub async fn run(cmd: OntologyCommand, root: &Path) -> Result<ExitCode> {
             offline,
         } => compose_cmd(root, &source, base_url, out, api, offline).await,
         OntologyAction::Check { source, json } => check_cmd(root, &source, json),
+        OntologyAction::AddRemote {
+            name,
+            url,
+            headers,
+            dir,
+            no_commit,
+        } => add_remote(root, &name, &url, &headers, &dir, no_commit).await,
+        OntologyAction::Pull {
+            names,
+            headers,
+            dir,
+            dry_run,
+            no_commit,
+        } => pull(root, &names, &headers, &dir, dry_run, no_commit).await,
         OntologyAction::Serve {
             source,
             addr,
@@ -303,13 +358,10 @@ async fn require_live_subgraphs_match(
 /// Before publishing, ask each remote sub-ontology what it serves: a pinned
 /// schema the remote no longer matches would route queries to fields it
 /// lacks. Any failure refuses, since the remote's schema is then unknown.
-/// No credentials are sent.
-async fn require_remote_pins_match(registry: &Registry) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .into_diagnostic()?;
+/// The request is the one `pull` makes, with the headers bound to the
+/// remote in this clone (only while its URL is the bound one).
+async fn require_remote_pins_match(root: &Path, registry: &Registry) -> Result<()> {
+    let credentials = crate::remote::Credentials::load(root).into_diagnostic()?;
     let mut drifted = Vec::new();
     for sub in &registry.sub_ontologies {
         let SubOntologySource::Remote(remote) = &sub.source else {
@@ -321,25 +373,13 @@ async fn require_remote_pins_match(registry: &Registry) -> Result<()> {
                 sub.name
             )
         };
-        let response = client
-            .post(&remote.url)
-            .json(&serde_json::json!({ "query": "{ _service { sdl } }" }))
-            .send()
+        let headers = credentials
+            .headers_for(&sub.dir, &sub.name, &remote.url)
+            .map_err(&unknown)?;
+        let served = crate::remote::fetch_sdl(&remote.url, &headers)
             .await
-            .map_err(|e| unknown(error_chain(&e.without_url())))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(unknown(format!("HTTP {status}")));
-        }
-        let served = probe_json(response)
-            .await
-            .map_err(unknown)?
-            .and_then(|body| {
-                body.pointer("/data/_service/sdl")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            });
-        if served.as_deref() != Some(sub.sdl.as_str()) {
+            .map_err(|e| unknown(e.to_string()))?;
+        if served != sub.sdl {
             drifted.push(format!("`{}`", sub.name));
         }
     }
@@ -347,7 +387,7 @@ async fn require_remote_pins_match(registry: &Registry) -> Result<()> {
         return Ok(());
     }
     Err(miette!(
-        "remote {} no longer serve the schema pinned at {}; commit their current schema.graphql, or pass --offline",
+        "remote {} no longer serve the schema pinned at {}; `scriptorium-ontology pull` them, or pass --offline",
         drifted.join(", "),
         registry.source
     ))
@@ -423,6 +463,645 @@ fn error_chain(e: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     out
+}
+
+/// Held for the whole of `add-remote` and `pull`: one process at a time
+/// changes a clone's pins and bindings. `None` outside a repository, where
+/// there is nothing to share.
+fn lock_pins(root: &Path) -> Result<Option<std::fs::File>> {
+    let repo = match git2::Repository::open(root) {
+        Ok(repo) => repo,
+        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+        Err(e) => return Err(miette!("{e}")),
+    };
+    let dir = repo.commondir().join("scriptorium-ontology");
+    std::fs::create_dir_all(&dir).into_diagnostic()?;
+    let path = dir.join("pins.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .into_diagnostic()?;
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(lock)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(miette!(
+            "another `add-remote` or `pull` is changing this repository's pins; wait for it to finish"
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(miette!("locking {}: {e}", path.display())),
+    }
+}
+
+/// The ontology at HEAD, which `add-remote` and `pull` extend: what they
+/// commit is HEAD plus the pinned schemas. A repository without commits has
+/// an empty ontology.
+fn head_registry(root: &Path, dir: &str) -> Result<Registry> {
+    let source = SourceArgs {
+        rev: "HEAD".into(),
+        worktree: false,
+        dir: dir.to_string(),
+    };
+    let has_head = git2::Repository::open(root)
+        .ok()
+        .is_some_and(|repo| repo.head().is_ok());
+    if !has_head {
+        return Ok(Registry {
+            ontology_dir: source.dir(),
+            manifest: crate::manifest::OntologyManifest::default(),
+            sub_ontologies: Vec::new(),
+            source: "(no commits)".into(),
+            commit: None,
+        });
+    }
+    let snapshot = source.spec().open(root).into_diagnostic()?;
+    load(snapshot.as_ref(), &source, Issues::Fail)
+}
+
+/// `registry` with `pins` added, or replacing the sub-ontologies of the
+/// same name.
+fn with_pins(registry: &Registry, pins: &[crate::SubOntology]) -> Registry {
+    let mut out = registry.clone();
+    for pin in pins {
+        out.sub_ontologies.retain(|s| s.name != pin.name);
+        out.sub_ontologies.push(pin.clone());
+    }
+    out.sub_ontologies.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Refuse pins that do not compose: printing why, and writing nothing.
+fn require_composes(registry: &Registry, pins: &[crate::SubOntology], what: &str) -> Result<()> {
+    let composition = compose(
+        &with_pins(registry, pins),
+        &registry.manifest.serve.base_url(),
+    );
+    for warning in &composition.warnings {
+        eprintln!("warning: {warning}");
+    }
+    if composition.is_ok() {
+        return Ok(());
+    }
+    for error in &composition.errors {
+        eprintln!("error: {error}");
+    }
+    Err(miette!(
+        "{what} does not compose with the ontology at {}; nothing written",
+        registry.source
+    ))
+}
+
+/// Commit `paths` unless told not to, or unless unrelated changes are
+/// staged (the commit would include them).
+fn commit_pinned(
+    root: &Path,
+    paths: &[PathBuf],
+    message: &str,
+    no_commit: bool,
+    parent: Option<&str>,
+) -> Result<()> {
+    if no_commit {
+        println!("not committed (--no-commit)");
+        return Ok(());
+    }
+    if has_staged_changes(root).into_diagnostic()? {
+        println!("other changes are staged, so nothing was committed: commit it yourself");
+        return Ok(());
+    }
+    // Onto the commit the pins were checked against, or not at all.
+    let sha = crate::snapshot::commit_paths_onto(root, paths, message, parent).into_diagnostic()?;
+    println!("committed {}", &sha[..7.min(sha.len())]);
+    Ok(())
+}
+
+/// `--header HEADER=ENV` arguments as header → variable name.
+fn parse_headers(args: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut headers = std::collections::BTreeMap::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for arg in args {
+        let (header, var) = crate::remote::parse_header_arg(arg).map_err(|e| miette!("{e}"))?;
+        // Header names ignore case: `Authorization` and `authorization` are
+        // one header, and only one of the two values would be sent.
+        if !seen.insert(header.to_ascii_lowercase()) {
+            return Err(miette!("header `{header}` is given twice"));
+        }
+        headers.insert(header, var);
+    }
+    Ok(headers)
+}
+
+/// Bind `headers` to remote `name` at `url` in this clone's credentials.
+/// [`bind_headers`], returning the bindings as they were, to put back if
+/// what the binding is for fails.
+fn rebind(
+    root: &Path,
+    sub: &PinnedRemote<'_>,
+    headers: Headers,
+) -> Result<crate::remote::Credentials> {
+    let previous = crate::remote::Credentials::load(root).into_diagnostic()?;
+    bind_headers(root, sub, headers)?;
+    Ok(previous)
+}
+
+/// The remote sub-ontology a binding is for: its name, directory, and URL.
+struct PinnedRemote<'a> {
+    name: &'a str,
+    dir: &'a str,
+    url: &'a str,
+}
+
+type Headers = std::collections::BTreeMap<String, String>;
+
+fn bind_headers(root: &Path, sub: &PinnedRemote<'_>, headers: Headers) -> Result<()> {
+    let PinnedRemote { name, dir, url } = *sub;
+    let mut credentials = crate::remote::Credentials::load(root).into_diagnostic()?;
+    credentials.bind(dir, url, headers);
+    credentials.save(root).into_diagnostic()?;
+    println!(
+        "headers for `{name}` bound to {} in {}",
+        crate::remote::display_url(url),
+        crate::remote::Credentials::path(root)
+            .into_diagnostic()?
+            .display()
+    );
+    Ok(())
+}
+
+async fn add_remote(
+    root: &Path,
+    name: &str,
+    url: &str,
+    headers: &[String],
+    dir: &str,
+    no_commit: bool,
+) -> Result<ExitCode> {
+    crate::layout::validate_sub_ontology_name(name).map_err(|e| miette!("{e}"))?;
+    crate::remote::validate_url(url).map_err(|e| miette!("{e}"))?;
+    let headers = parse_headers(headers)?;
+    let dir = crate::layout::normalize_dir(dir);
+    let sub_dir = crate::layout::join(&dir, name);
+    crate::scaffold::confine(root, &sub_dir).into_diagnostic()?;
+    let _pins = lock_pins(root)?;
+    let registry = head_registry(root, &dir)?;
+    if registry.get(name).is_some() || root.join(&sub_dir).exists() {
+        return Err(miette!(
+            "{sub_dir}/ already exists; choose another name, or refresh a pinned remote with `scriptorium-ontology pull {name}`"
+        ));
+    }
+    let sdl = crate::remote::fetch_sdl(url, &headers)
+        .await
+        .into_diagnostic()?;
+    let remote = crate::manifest::RemoteConfig {
+        url: url.to_string(),
+    };
+    let pin = crate::SubOntology {
+        name: name.to_string(),
+        dir: sub_dir.clone(),
+        description: None,
+        owners: Vec::new(),
+        sdl,
+        source: SubOntologySource::Remote(remote.clone()),
+    };
+    require_composes(&registry, std::slice::from_ref(&pin), &format!("`{name}`"))?;
+
+    let manifest = remote_manifest(name, remote)?;
+    let manifest_path = PathBuf::from(crate::layout::join(
+        &sub_dir,
+        crate::layout::SUBGRAPH_MANIFEST,
+    ));
+    let schema_path = PathBuf::from(pin.schema_path());
+    // The remote may have been slow: nothing may have moved HEAD or claimed
+    // the directory meanwhile, and nothing already there is written over.
+    if head_commit(root) != registry.commit {
+        return Err(miette!(
+            "HEAD moved while `{name}` was fetched; nothing written, add it again"
+        ));
+    }
+    let created = create_pin(
+        root,
+        &sub_dir,
+        &[
+            (manifest_path, manifest.as_bytes()),
+            (schema_path, pin.sdl.as_bytes()),
+        ],
+    )
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            miette!("{sub_dir}/ appeared while `{name}` was fetched; nothing written")
+        } else {
+            miette!("writing {sub_dir}/: {e}; nothing written")
+        }
+    })?;
+    let rollback = |created: &[PathBuf]| remove_pin(root, &sub_dir, created);
+    println!(
+        "pinned `{name}` from {} → {sub_dir}/",
+        crate::remote::display_url(url)
+    );
+    // Bound before the commit, so no pin lands without the credential it
+    // needs; the bindings as they were come back if the commit fails.
+    let previous = if headers.is_empty() {
+        None
+    } else {
+        let pinned = PinnedRemote {
+            name,
+            dir: &sub_dir,
+            url,
+        };
+        match rebind(root, &pinned, headers) {
+            Ok(previous) => Some(previous),
+            Err(e) => {
+                rollback(&created);
+                return Err(miette!("{e}; {sub_dir}/ is removed again"));
+            }
+        }
+    };
+    if let Err(e) = commit_pinned(
+        root,
+        &created,
+        &format!("ontology: pin remote sub-ontology {name}"),
+        no_commit,
+        registry.commit.as_deref(),
+    ) {
+        let _ = crate::snapshot::unstage_paths(root, &created);
+        rollback(&created);
+        if let Some(previous) = previous {
+            let _ = previous.save(root);
+        }
+        return Err(miette!("{e}; {sub_dir}/ is removed again"));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The `subgraph.toml` of a remote sub-ontology pinned from `remote`.
+fn remote_manifest(name: &str, remote: crate::manifest::RemoteConfig) -> Result<String> {
+    let manifest = crate::manifest::SubgraphManifest {
+        name: None,
+        description: None,
+        owners: Vec::new(),
+        storage: None,
+        remote: Some(remote),
+    };
+    Ok(format!(
+        "# A remote sub-ontology: schema.graphql is a pinned copy of what the subgraph\n# serves. Refresh it with `scriptorium-ontology pull {name}`.\n{}",
+        toml::to_string(&manifest).into_diagnostic()?
+    ))
+}
+
+/// Create the new directory `sub_dir` holding `files`, refusing a directory
+/// or file already there; on failure nothing it created is left.
+fn create_pin(
+    root: &Path,
+    sub_dir: &str,
+    files: &[(PathBuf, &[u8])],
+) -> std::io::Result<Vec<PathBuf>> {
+    let dir = root.join(sub_dir);
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(&dir)?;
+    let mut created = Vec::new();
+    for (path, contents) in files {
+        if let Err(e) = write_new(&root.join(path), contents) {
+            remove_pin(root, sub_dir, &created);
+            return Err(e);
+        }
+        created.push(path.clone());
+    }
+    Ok(created)
+}
+
+/// Remove what [`create_pin`] created: the files, then the directory if it
+/// is empty.
+fn remove_pin(root: &Path, sub_dir: &str, created: &[PathBuf]) {
+    for path in created {
+        let _ = std::fs::remove_file(root.join(path));
+    }
+    let _ = std::fs::remove_dir(root.join(sub_dir));
+}
+
+/// Create `path` holding `contents`, refusing whatever is already there: a
+/// file, or a symlink, which an exclusive create does not follow.
+fn write_new(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    write_new_with(path, |file| file.write_all(contents))
+}
+
+/// [`write_new`] with `write` filling the file; a file it cannot finish is
+/// removed, so nothing half written stays behind.
+fn write_new_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let written = write(&mut file);
+    if written.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+    written
+}
+
+/// The commit HEAD points at, if there is one.
+fn head_commit(root: &Path) -> Option<String> {
+    let repo = git2::Repository::open(root).ok()?;
+    let id = repo.head().ok()?.peel_to_commit().ok()?.id();
+    Some(id.to_string())
+}
+
+/// The remote sub-ontologies `pull` refreshes: `names`, or every remote.
+fn pull_targets<'a>(
+    registry: &'a Registry,
+    names: &[String],
+) -> Result<Vec<(&'a crate::SubOntology, &'a crate::manifest::RemoteConfig)>> {
+    let mut targets = Vec::new();
+    for sub in &registry.sub_ontologies {
+        if let SubOntologySource::Remote(remote) = &sub.source {
+            if names.is_empty() || names.contains(&sub.name) {
+                targets.push((sub, remote));
+            }
+        }
+    }
+    for name in names {
+        if !targets.iter().any(|(sub, _)| &sub.name == name) {
+            return Err(miette!(
+                "`{name}` is not a remote sub-ontology at {}",
+                registry.source
+            ));
+        }
+    }
+    Ok(targets)
+}
+
+async fn pull(
+    root: &Path,
+    names: &[String],
+    headers: &[String],
+    dir: &str,
+    dry_run: bool,
+    no_commit: bool,
+) -> Result<ExitCode> {
+    let explicit = parse_headers(headers)?;
+    if !explicit.is_empty() && names.len() != 1 {
+        return Err(miette!(
+            "--header binds credentials to one remote: name exactly one (`pull <name> --header …`)"
+        ));
+    }
+    let _pins = if dry_run { None } else { lock_pins(root)? };
+    let registry = head_registry(root, dir)?;
+    let targets = pull_targets(&registry, names)?;
+    if targets.is_empty() {
+        println!("no remote sub-ontologies at {}", registry.source);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !dry_run {
+        for (sub, _) in &targets {
+            crate::scaffold::confine(root, &sub.dir).into_diagnostic()?;
+            if has_uncommitted_changes(root, &sub.dir).into_diagnostic()? {
+                return Err(miette!(
+                    "{}/ has uncommitted changes; commit or discard them before `pull` replaces its schema",
+                    sub.dir
+                ));
+            }
+        }
+    }
+
+    let credentials = crate::remote::Credentials::load(root).into_diagnostic()?;
+    let mut pins = Vec::new();
+    let mut failed = 0;
+    // `--header` binds one remote.
+    let mut bind_to = None;
+    for (sub, remote) in targets {
+        let headers = if explicit.is_empty() {
+            match credentials.headers_for(&sub.dir, &sub.name, &remote.url) {
+                Ok(headers) => headers,
+                Err(e) => {
+                    eprintln!("error: {}: {e}", sub.name);
+                    failed += 1;
+                    continue;
+                }
+            }
+        } else {
+            explicit.clone()
+        };
+        match crate::remote::fetch_sdl(&remote.url, &headers).await {
+            Ok(sdl) if sdl == sub.sdl => println!("  {}: unchanged", sub.name),
+            Ok(sdl) => {
+                let (added, removed) = crate::remote::line_changes(&sub.sdl, &sdl);
+                println!("  {}: +{added} -{removed} lines", sub.name);
+                if dry_run {
+                    print!(
+                        "{}",
+                        crate::remote::unified_diff(&sub.sdl, &sdl, &sub.schema_path())
+                    );
+                }
+                pins.push(crate::SubOntology { sdl, ..sub.clone() });
+            }
+            Err(e) => {
+                eprintln!("error: {}: {e}", sub.name);
+                failed += 1;
+                continue;
+            }
+        }
+        if !explicit.is_empty() && !dry_run {
+            bind_to = Some((sub.name.clone(), sub.dir.clone(), remote.url.clone()));
+        }
+    }
+    if failed > 0 {
+        return Err(miette!(
+            "{failed} remote schema(s) could not be fetched; nothing written"
+        ));
+    }
+    if !pins.is_empty() {
+        require_composes(&registry, &pins, "the refreshed schema set")?;
+        if dry_run {
+            println!("dry run: nothing written");
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    // A new binding is saved before the pins it opens are committed, and
+    // put back as it was if they are not.
+    let previous = match &bind_to {
+        Some((name, dir, url)) => Some(rebind(root, &PinnedRemote { name, dir, url }, explicit)?),
+        None => None,
+    };
+    if pins.is_empty() {
+        println!("remote schemas are up to date at {}", registry.source);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let names: Vec<&str> = pins.iter().map(|p| p.name.as_str()).collect();
+    let installed = install_pins(
+        root,
+        &registry,
+        &pins,
+        &format!("ontology: pull remote schemas ({})", names.join(", ")),
+        no_commit,
+    );
+    if let (Err(_), Some(previous)) = (&installed, previous) {
+        let _ = previous.save(root);
+    }
+    installed?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A new schema written beside the pin it replaces: (repository path,
+/// staged copy, the pinned schema at HEAD).
+type Staged<'a> = (PathBuf, PathBuf, &'a str);
+
+fn discard(staged: &[Staged<'_>]) {
+    for (_, temp, _) in staged {
+        let _ = std::fs::remove_file(temp);
+    }
+}
+
+/// Write each pin's new schema beside its target, created exclusively and
+/// with the target's mode. Nothing is left behind on failure.
+fn stage_pins<'a>(
+    root: &Path,
+    registry: &'a Registry,
+    pins: &[crate::SubOntology],
+    suffix: &str,
+) -> Result<Vec<Staged<'a>>> {
+    let mut staged: Vec<Staged<'a>> = Vec::new();
+    for pin in pins {
+        let path = PathBuf::from(pin.schema_path());
+        let target = root.join(&path);
+        let temp = target.with_file_name(format!(".schema.graphql.{suffix}.pull"));
+        let pinned = registry.get(&pin.name).map_or("", |sub| sub.sdl.as_str());
+        if let Err(e) = write_new(&temp, pin.sdl.as_bytes()) {
+            // Only a staged copy this pull created is removed.
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                let _ = std::fs::remove_file(&temp);
+            }
+            discard(&staged);
+            return Err(miette!("writing {}: {e}; nothing written", path.display()));
+        }
+        let mode = std::fs::metadata(&target)
+            .and_then(|meta| std::fs::set_permissions(&temp, meta.permissions()));
+        if let Err(e) = mode {
+            let _ = std::fs::remove_file(&temp);
+            discard(&staged);
+            return Err(miette!("writing {}: {e}; nothing written", path.display()));
+        }
+        staged.push((path, temp, pinned));
+    }
+    Ok(staged)
+}
+
+/// The new pins were composed against HEAD as it was, and replace the
+/// schemas as they were: anything else by now is someone else's change.
+fn require_unmoved(
+    root: &Path,
+    registry: &Registry,
+    pins: &[crate::SubOntology],
+    staged: &[Staged<'_>],
+) -> Result<()> {
+    if head_commit(root) != registry.commit {
+        return Err(miette!(
+            "HEAD moved while pulling (the new schemas were checked against {}); nothing written, pull again",
+            registry.source
+        ));
+    }
+    let unchanged = |file: &Path, expected: &str| {
+        std::fs::read(file).is_ok_and(|now| now == expected.as_bytes())
+    };
+    let edited: Vec<String> = staged
+        .iter()
+        .zip(pins)
+        .filter(|((path, temp, pinned), pin)| {
+            !unchanged(&root.join(path), pinned) || !unchanged(temp, &pin.sdl)
+        })
+        .map(|((path, _, _), _)| path.display().to_string())
+        .collect();
+    if edited.is_empty() {
+        return Ok(());
+    }
+    Err(miette!(
+        "{} changed while pulling; nothing written",
+        edited.join(", ")
+    ))
+}
+
+/// Replace each pin's `schema.graphql` and commit them, all or none: every
+/// new schema is staged beside its target first, and nothing is replaced if
+/// HEAD or a pinned schema changed while the remotes answered. Then they
+/// are swapped in and committed onto the commit they were checked against;
+/// a failed swap or commit puts the previous pins back.
+fn install_pins(
+    root: &Path,
+    registry: &Registry,
+    pins: &[crate::SubOntology],
+    message: &str,
+    no_commit: bool,
+) -> Result<()> {
+    // Names no one can plant a file or symlink at in advance.
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    );
+    let staged = stage_pins(root, registry, pins, &suffix)?;
+    if let Err(e) = require_unmoved(root, registry, pins, &staged) {
+        discard(&staged);
+        return Err(e);
+    }
+    // Each replaced pin is kept beside it until the commit lands, and put
+    // back by renaming it: whatever its mode, no write is needed.
+    let backup = |path: &Path| {
+        root.join(path)
+            .with_file_name(format!(".schema.graphql.{suffix}.orig"))
+    };
+    let restore = |replaced: &[Staged<'_>]| -> String {
+        let stuck: Vec<String> = replaced
+            .iter()
+            .filter(|(path, _, _)| std::fs::rename(backup(path), root.join(path)).is_err())
+            .map(|(path, _, _)| path.display().to_string())
+            .collect();
+        if stuck.is_empty() {
+            "the previous schemas are back".to_string()
+        } else {
+            format!(
+                "could not put back {}; `git checkout -- <path>` restores them",
+                stuck.join(", ")
+            )
+        }
+    };
+    for (i, (path, temp, _)) in staged.iter().enumerate() {
+        let target = root.join(path);
+        let saved = backup(path);
+        // A rename replaces whatever is there, so nothing may be.
+        let moved_aside = if std::fs::symlink_metadata(&saved).is_ok() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{} is in the way", saved.display()),
+            ))
+        } else {
+            std::fs::rename(&target, &saved)
+        };
+        if let Err(e) = moved_aside {
+            let restored = restore(&staged[..i]);
+            discard(&staged[i..]);
+            return Err(miette!("replacing {}: {e}; {restored}", path.display()));
+        }
+        if let Err(e) = std::fs::rename(temp, &target) {
+            let restored = restore(&staged[..=i]);
+            discard(&staged[i..]);
+            return Err(miette!("replacing {}: {e}; {restored}", path.display()));
+        }
+    }
+    let paths: Vec<PathBuf> = staged.iter().map(|(path, _, _)| path.clone()).collect();
+    if let Err(e) = commit_pinned(root, &paths, message, no_commit, registry.commit.as_deref()) {
+        let restored = restore(&staged);
+        let _ = crate::snapshot::unstage_paths(root, &paths);
+        return Err(miette!("{e}; {restored}"));
+    }
+    for (path, _, _) in &staged {
+        let _ = std::fs::remove_file(backup(path));
+    }
+    Ok(())
 }
 
 /// Refuse to publish or serve a revision that `check` rejects: a malformed
@@ -640,7 +1319,7 @@ async fn compose_cmd(
             require_routable(&registry, &base_url)?;
             if !offline {
                 require_live_subgraphs_match(&registry, &base_url, Answering::Separately).await?;
-                require_remote_pins_match(&registry).await?;
+                require_remote_pins_match(root, &registry).await?;
             }
             let target = publication_target(&path)?;
             let _publisher = lock_publication(&target)?;
@@ -737,7 +1416,7 @@ async fn serve(
     // A remote's pin can be stale (this server's own subgraphs are asked
     // once it listens).
     if supergraph.is_some() && !offline {
-        require_remote_pins_match(&registry).await?;
+        require_remote_pins_match(root, &registry).await?;
     }
     // One publisher per supergraph path, held for the server's lifetime, so
     // a second (possibly older) serve cannot replace what this one published.
@@ -964,6 +1643,53 @@ fn write_atomically(path: &Path, contents: &str) -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_header_given_twice_in_any_case_is_refused() {
+        let args = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for twice in [
+            ["Authorization=A", "Authorization=B"],
+            ["Authorization=A", "authorization=B"],
+            ["X-Key=A", "x-KEY=B"],
+        ] {
+            let err = parse_headers(&args(&twice)).unwrap_err().to_string();
+            assert!(err.contains("given twice"), "{twice:?}: {err}");
+        }
+        let headers = parse_headers(&args(&["Authorization=A", "X-Key=B"])).unwrap();
+        assert_eq!(
+            headers.into_iter().collect::<Vec<_>>(),
+            [
+                ("Authorization".to_string(), "A".to_string()),
+                ("X-Key".to_string(), "B".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn exclusive_writes_refuse_what_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "keep me").unwrap();
+        let link = dir.path().join(".schema.graphql.1.pull");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let err = write_new(&link, b"new").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep me");
+        let fresh = dir.path().join("fresh");
+        write_new(&fresh, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "new");
+        assert!(write_new(&fresh, b"again").is_err());
+        // A write that fails partway leaves nothing behind.
+        let partial = dir.path().join("partial");
+        let err = write_new_with(&partial, |file| {
+            use std::io::Write as _;
+            file.write_all(b"half")?;
+            Err(std::io::Error::other("disk full"))
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "disk full");
+        assert!(!partial.exists());
+    }
 
     #[test]
     fn ownership_that_cannot_be_kept_is_an_error() {
