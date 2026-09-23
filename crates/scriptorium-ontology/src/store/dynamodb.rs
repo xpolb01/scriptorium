@@ -456,28 +456,39 @@ fn number(n: &str) -> std::result::Result<Json, String> {
         .ok_or_else(|| format!("`{n}` is not a number"))
 }
 
-/// Order the members of an NS by value; integers kept as digits come after
-/// every 64-bit value of their sign, ordered by magnitude.
+/// Order the members of an NS by value: integers exactly (one wider than 64
+/// bits is kept as its digits), anything else by its 64-bit float value.
 fn compare_number_values(a: &Json, b: &Json) -> Ordering {
     if let (Json::Number(x), Json::Number(y)) = (a, b) {
         return compare_numbers(x, y);
     }
-    let key = |v: &Json| {
-        let text = match v {
-            Json::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        let float = text.parse::<f64>().unwrap_or_default();
-        (float, text.trim_start_matches('-').len(), text)
+    let text = |v: &Json| match v {
+        Json::String(s) => s.clone(),
+        other => other.to_string(),
     };
-    let (x, y) = (key(a), key(b));
-    x.0.total_cmp(&y.0)
-        .then(if x.0 < 0.0 {
-            y.1.cmp(&x.1)
-        } else {
-            x.1.cmp(&y.1)
-        })
-        .then(x.2.cmp(&y.2))
+    let (x, y) = (text(a), text(b));
+    if is_integer(&x) && is_integer(&y) {
+        return compare_integers(&x, &y);
+    }
+    let float = |t: &str| t.parse::<f64>().unwrap_or_default();
+    float(&x).total_cmp(&float(&y)).then_with(|| x.cmp(&y))
+}
+
+/// Order two canonical integers (see [`is_integer`]) by value, digit by
+/// digit: wide ones round to the same float.
+fn compare_integers(a: &str, b: &str) -> Ordering {
+    let (a_negative, a_digits) = a.strip_prefix('-').map_or((false, a), |d| (true, d));
+    let (b_negative, b_digits) = b.strip_prefix('-').map_or((false, b), |d| (true, d));
+    let magnitude = a_digits
+        .len()
+        .cmp(&b_digits.len())
+        .then_with(|| a_digits.cmp(b_digits));
+    match (a_negative, b_negative) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => magnitude,
+        (true, true) => magnitude.reverse(),
+    }
 }
 
 fn compare_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Ordering {
@@ -894,6 +905,10 @@ mod tests {
             "18446744073709551614",
             "-9223372036854775808",
             "-123456789012345678901234567890",
+            // Round to the same float as their neighbours above.
+            "-123456789012345678901234567891",
+            "-9223372036854775809",
+            "18446744073709551616",
         ]
         .iter()
         .map(|n| number(n).unwrap())
@@ -909,12 +924,15 @@ mod tests {
         assert_eq!(
             sorted,
             [
+                "-123456789012345678901234567891",
                 "-123456789012345678901234567890",
+                "-9223372036854775809",
                 "-9223372036854775808",
                 "-2.5",
                 "3",
                 "18446744073709551614",
                 "18446744073709551615",
+                "18446744073709551616",
                 "123456789012345678901234567890"
             ]
         );
