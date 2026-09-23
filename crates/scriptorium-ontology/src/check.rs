@@ -311,7 +311,20 @@ fn validate_instances(
                 acc.require_extension_records(sub, &model, |_| notes.clone());
                 validate_markdown_notes(snapshot, sub, config, &model, acc);
             }
-            _ => {}
+            // Database instances are not read, but their settings are
+            // checked the way `serve` opens them (without connecting).
+            SubOntologySource::Local(storage) => {
+                if let Err(e) = crate::store::validate_database_storage(sub, storage, &model) {
+                    acc.push(
+                        Severity::Error,
+                        "ontology.storage",
+                        Some(&sub.name),
+                        Some(join(&sub.dir, crate::layout::SUBGRAPH_MANIFEST)),
+                        e.to_string(),
+                    );
+                }
+            }
+            SubOntologySource::Remote(_) => {}
         }
     }
     Ok(())
@@ -1977,6 +1990,34 @@ type Topic @key(fields: "id") {
 extend type Paper @key(fields: "id") { id: ID! topics: [Topic!]! @inverse(of: "papers") }
 type Query { topic(id: ID!): Topic }
 "#;
+
+    #[test]
+    fn database_storage_settings_serve_would_refuse_are_errors() {
+        const THINGS: &str = r#"
+extend schema @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
+type Thing @key(fields: "id") { id: ID! type: String! }
+type Query { thing(id: ID!): Thing }
+"#;
+        let report = run(&[
+            (
+                "ontology/things/subgraph.toml",
+                "[storage]\nkind = \"dynamodb\"\ntable = \"things\"\n",
+            ),
+            ("ontology/things/schema.graphql", THINGS),
+        ]);
+        assert_eq!(rules(&report), ["ontology.storage"], "{:#?}", report.issues);
+        assert!(
+            report.issues[0]
+                .message
+                .contains("reserved attribute names"),
+            "{}",
+            report.issues[0].message
+        );
+        assert_eq!(
+            report.issues[0].path.as_deref(),
+            Some("ontology/things/subgraph.toml")
+        );
+    }
 
     #[test]
     fn markdown_notes_are_checked_leniently() {

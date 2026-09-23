@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::manifest::StorageConfig;
 use crate::model::SubOntologyModel;
 use crate::registry::SubOntology;
@@ -57,7 +57,7 @@ impl ListQuery {
 }
 
 /// Keys are compared as strings: a relation may store `123` or `"123"`.
-fn key_matches(value: &serde_json::Value, key: &str) -> bool {
+pub(crate) fn key_matches(value: &serde_json::Value, key: &str) -> bool {
     match value {
         serde_json::Value::String(s) => s == key,
         serde_json::Value::Number(n) => n.to_string() == key,
@@ -125,19 +125,54 @@ pub fn open_store(
     snapshot: Arc<dyn Snapshot>,
     model: &SubOntologyModel,
 ) -> Result<Arc<dyn EntityStore>> {
-    let key_fields: std::collections::BTreeMap<String, String> = model
-        .entities()
-        .filter_map(|o| o.key_field().map(|k| (o.name.clone(), k.to_string())))
-        .collect();
     Ok(match storage {
         StorageConfig::Git { data_dir } => Arc::new(git::GitRecordStore::new(
             snapshot,
             crate::layout::join(&sub.dir, data_dir),
-            key_fields,
+            key_fields(model),
         )),
         StorageConfig::Markdown(config) => Arc::new(markdown::MarkdownStore::new(
-            snapshot, sub, config, key_fields,
+            snapshot,
+            sub,
+            config,
+            key_fields(model),
         )?),
+        StorageConfig::Postgres(_) | StorageConfig::Dynamodb(_) => {
+            open_database_store(sub, storage, model)?
+        }
+    })
+}
+
+/// Check a database-backed sub-ontology's storage settings the way
+/// [`open_store`] does, without connecting, so `check` reports what
+/// `serve` would refuse. Other storage kinds pass.
+pub fn validate_database_storage(
+    sub: &SubOntology,
+    storage: &StorageConfig,
+    model: &SubOntologyModel,
+) -> Result<()> {
+    match storage {
+        StorageConfig::Postgres(_) | StorageConfig::Dynamodb(_) => {
+            open_database_store(sub, storage, model).map(drop)
+        }
+        StorageConfig::Git { .. } | StorageConfig::Markdown(_) => Ok(()),
+    }
+}
+
+/// Each entity type → its key field.
+fn key_fields(model: &SubOntologyModel) -> std::collections::BTreeMap<String, String> {
+    model
+        .entities()
+        .filter_map(|o| o.key_field().map(|k| (o.name.clone(), k.to_string())))
+        .collect()
+}
+
+fn open_database_store(
+    sub: &SubOntology,
+    storage: &StorageConfig,
+    model: &SubOntologyModel,
+) -> Result<Arc<dyn EntityStore>> {
+    match storage {
         #[cfg(feature = "postgres")]
         StorageConfig::Postgres(config) => {
             let stored = model.stored_entities().map(|o| o.name.clone()).collect();
@@ -161,24 +196,61 @@ pub fn open_store(
                     (o.name.clone(), columns)
                 })
                 .collect();
-            Arc::new(postgres::PostgresStore::for_types(
-                &sub.name, config, key_fields, &stored, &fields,
-            )?)
+            Ok(Arc::new(postgres::PostgresStore::for_types(
+                &sub.name,
+                config,
+                key_fields(model),
+                &stored,
+                &fields,
+            )?))
         }
         #[cfg(not(feature = "postgres"))]
-        StorageConfig::Postgres(_) => return Err(feature_missing(&sub.name, "postgres")),
-        #[cfg(feature = "dynamodb")]
+        StorageConfig::Postgres(_) => Err(feature_missing(&sub.name, "postgres")),
         StorageConfig::Dynamodb(config) => {
-            Arc::new(dynamodb::DynamoStore::new(&sub.name, config, key_fields)?)
+            reserved_dynamodb_fields(sub, model)?;
+            #[cfg(feature = "dynamodb")]
+            return Ok(Arc::new(dynamodb::DynamoStore::new(
+                &sub.name,
+                config,
+                key_fields(model),
+            )?));
+            #[cfg(not(feature = "dynamodb"))]
+            {
+                let _ = config;
+                Err(feature_missing(&sub.name, "dynamodb"))
+            }
         }
-        #[cfg(not(feature = "dynamodb"))]
-        StorageConfig::Dynamodb(_) => return Err(feature_missing(&sub.name, "dynamodb")),
-    })
+        StorageConfig::Git { .. } | StorageConfig::Markdown(_) => Err(crate::error::Error::Store {
+            store: format!("{}:{}", storage.kind(), sub.name),
+            message: "not a database storage".into(),
+        }),
+    }
+}
+
+/// `pk` and `type` hold each `DynamoDB` item's key and entity type, so no
+/// stored field (or key) of a `DynamoDB`-backed sub-ontology may use them.
+fn reserved_dynamodb_fields(sub: &SubOntology, model: &SubOntologyModel) -> Result<()> {
+    for entity in model.entities() {
+        let reserved = entity.fields.iter().find(|f| {
+            (f.is_stored() || Some(f.name.as_str()) == entity.key_field())
+                && matches!(f.name.as_str(), "pk" | "type")
+        });
+        if let Some(field) = reserved {
+            return Err(crate::error::Error::Store {
+                store: format!("dynamodb:{}", sub.name),
+                message: format!(
+                    "`{}.{}`: `pk` and `type` are reserved attribute names in DynamoDB storage; rename the field",
+                    entity.name, field.name
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(any(not(feature = "postgres"), not(feature = "dynamodb")))]
-fn feature_missing(sub: &str, feature: &str) -> Error {
-    Error::Store {
+fn feature_missing(sub: &str, feature: &str) -> crate::error::Error {
+    crate::error::Error::Store {
         store: format!("{feature}:{sub}"),
         message: format!(
             "this build has no `{feature}` storage; rebuild with `--features {feature}`"
@@ -190,6 +262,47 @@ fn feature_missing(sub: &str, feature: &str) -> Error {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn dynamodb_reserves_pk_and_type() {
+        let sub = |sdl: &str| SubOntology {
+            name: "things".into(),
+            dir: "ontology/things".into(),
+            description: None,
+            owners: Vec::new(),
+            sdl: sdl.into(),
+            source: crate::registry::SubOntologySource::Local(StorageConfig::Dynamodb(
+                crate::manifest::DynamoConfig {
+                    table: "things".into(),
+                    region: None,
+                    endpoint_url_env: None,
+                },
+            )),
+        };
+        let storage = StorageConfig::Dynamodb(crate::manifest::DynamoConfig {
+            table: "things".into(),
+            region: None,
+            endpoint_url_env: None,
+        });
+        for field in ["type: String!", "pk: String"] {
+            let sdl = format!("type Thing @key(fields: \"id\") {{ id: ID! {field} }}");
+            let model = SubOntologyModel::parse(&sdl).unwrap();
+            let err = validate_database_storage(&sub(&sdl), &storage, &model)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("reserved attribute names"), "{field}: {err}");
+        }
+        // A derived field of that name stores nothing, so it is fine.
+        let sdl = "directive @inverse(of: String!) on FIELD_DEFINITION\ntype Thing @key(fields: \"id\") { id: ID! parent: Thing type: [Thing!]! @inverse(of: \"parent\") }";
+        let model = SubOntologyModel::parse(sdl).unwrap();
+        let result = validate_database_storage(&sub(sdl), &storage, &model);
+        assert!(
+            result
+                .as_ref()
+                .map_or_else(|e| !e.to_string().contains("reserved"), |()| true),
+            "{result:?}"
+        );
+    }
 
     #[test]
     fn references_filter_matches_scalar_and_list_fields() {

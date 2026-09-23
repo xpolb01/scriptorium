@@ -36,11 +36,18 @@ missing_panics_doc = "allow"
 default = []
 # Storage adapters that need a database client.
 postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-platform-verifier"]
-dynamodb = []
+dynamodb = ["dep:aws-config", "dep:aws-sdk-dynamodb"]
 
 [dependencies]
 async-graphql = { version = "7.2.1", default-features = false, features = ["dynamic-schema"] }
 async-trait = "0.1.92"
+# `dynamodb` storage (Apache-2.0). aws-config keeps its defaults so the whole
+# standard credential chain works (SSO, `credential_process`). The client's
+# default `rustls` feature is the legacy hyper 0.14 / rustls 0.21 stack;
+# `default-https-client` alone is the current one (hyper 1, rustls on
+# aws-lc-rs, which the root workspace's reqwest already uses).
+aws-config = { version = "1.12.0", optional = true }
+aws-sdk-dynamodb = { version = "1.127.0", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
 cynic-parser = "0.11.2"
