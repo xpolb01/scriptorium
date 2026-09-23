@@ -204,8 +204,11 @@ and becomes that note's key; links resolve by file stem, ignoring case. A
 frontmatter relation that names no note keeps its text as the key (an
 entity elsewhere, or a dangling reference `check` reports), and one naming
 an ambiguous stem (two notes share it) is an error, never a guess.
-`links_field` lists only notes: a body link to a note that does not exist
-(yet), or to an ambiguous stem, adds nothing, since body text links freely. Body links skip code and
+`links_field` lists only notes of the type its field lists: a body link to
+a note that does not exist (yet), to a note of another type, or to an
+ambiguous stem adds nothing, since body text links freely. Links inside
+inline code (`` ` `` or ``` `` ```-delimited) and fenced code blocks do not
+count. Body links skip code and
 `![[embeds]]`. With `links_field`, backlinks are an ordinary
 `@inverse(of: "related")`. Frontmatter opened with `---` must be closed by another `---` line; an
 unclosed block is an error rather than body text. `check` reads notes

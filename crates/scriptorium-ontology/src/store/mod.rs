@@ -135,7 +135,7 @@ pub fn open_store(
             snapshot,
             sub,
             config,
-            key_fields(model),
+            markdown::NoteTypes::of(model, config),
         )?),
         StorageConfig::Postgres(_) | StorageConfig::Dynamodb(_) => {
             open_database_store(sub, storage, model)?

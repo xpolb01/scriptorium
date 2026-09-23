@@ -1194,11 +1194,8 @@ fn validate_markdown_notes(
             problem,
         );
     }
-    let key_fields = model
-        .entities()
-        .filter_map(|o| o.key_field().map(|k| (o.name.clone(), k.to_string())))
-        .collect();
-    let (notes, problems) = match load_notes(snapshot, sub, config, key_fields) {
+    let schema = crate::store::markdown::NoteTypes::of(model, config);
+    let (notes, problems) = match load_notes(snapshot, sub, config, schema) {
         Ok(loaded) => loaded,
         Err(e) => {
             acc.push(

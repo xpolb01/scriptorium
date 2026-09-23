@@ -80,8 +80,47 @@ struct Settings {
     key: KeySource,
     body_field: Option<String>,
     links_field: Option<String>,
+    schema: NoteTypes,
+}
+
+/// What a markdown store needs to know of its sub-ontology's schema.
+#[derive(Debug, Clone, Default)]
+pub struct NoteTypes {
     /// Entity type → key field name, so every record carries its own key.
-    key_fields: BTreeMap<String, String>,
+    pub key_fields: BTreeMap<String, String>,
+    /// Entity type → the entity type its `links_field` lists: a body link
+    /// to a note of another type is prose, not that relation.
+    pub link_targets: BTreeMap<String, String>,
+}
+
+impl NoteTypes {
+    pub fn of(model: &crate::model::SubOntologyModel, config: &MarkdownConfig) -> Self {
+        let key_fields = model
+            .entities()
+            .filter_map(|o| o.key_field().map(|k| (o.name.clone(), k.to_string())))
+            .collect();
+        let link_targets = config
+            .links_field
+            .as_ref()
+            .map(|field| {
+                model
+                    .entities()
+                    .filter_map(|o| {
+                        let f = o.field(field)?;
+                        matches!(
+                            model.kind_of(&f.ty.named),
+                            crate::model::TypeKind::Entity(_)
+                        )
+                        .then(|| (o.name.clone(), f.ty.named.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            key_fields,
+            link_targets,
+        }
+    }
 }
 
 pub struct MarkdownStore {
@@ -97,9 +136,9 @@ pub fn load_notes(
     snapshot: &dyn Snapshot,
     sub: &SubOntology,
     config: &MarkdownConfig,
-    key_fields: BTreeMap<String, String>,
+    schema: NoteTypes,
 ) -> Result<(Vec<Note>, Vec<Problem>)> {
-    let settings = Settings::new(sub, config, key_fields)?;
+    let settings = Settings::new(sub, config, schema)?;
     let loaded = settings.load(snapshot)?;
     Ok((loaded.notes.into_values().collect(), loaded.problems))
 }
@@ -109,11 +148,11 @@ impl MarkdownStore {
         snapshot: Arc<dyn Snapshot>,
         sub: &SubOntology,
         config: &MarkdownConfig,
-        key_fields: BTreeMap<String, String>,
+        schema: NoteTypes,
     ) -> Result<Self> {
         Ok(Self {
             snapshot,
-            settings: Settings::new(sub, config, key_fields)?,
+            settings: Settings::new(sub, config, schema)?,
             loaded: OnceLock::new(),
             references: Mutex::new(HashMap::new()),
         })
@@ -177,11 +216,7 @@ impl MarkdownStore {
 }
 
 impl Settings {
-    fn new(
-        sub: &SubOntology,
-        config: &MarkdownConfig,
-        key_fields: BTreeMap<String, String>,
-    ) -> Result<Self> {
+    fn new(sub: &SubOntology, config: &MarkdownConfig, schema: NoteTypes) -> Result<Self> {
         let name = sub.name.as_str();
         let invalid = |message: &str| Error::Store {
             store: format!("markdown:{name}"),
@@ -212,7 +247,7 @@ impl Settings {
             key,
             body_field: config.body_field.clone(),
             links_field: config.links_field.clone(),
-            key_fields,
+            schema,
         })
     }
 
@@ -224,7 +259,7 @@ impl Settings {
         let mut parsed = Vec::new();
         let mut loaded = Loaded::default();
         for path in files {
-            match self.parse_file(snapshot, &path)? {
+            match self.parse_file(snapshot, &path) {
                 Ok(note) => parsed.push(note),
                 Err(message) => loaded.problems.push(Problem { path, message }),
             }
@@ -233,16 +268,13 @@ impl Settings {
         // Stems resolve `[[wikilinks]]` to keys. A stem shared by two notes
         // is ambiguous: a body link to it resolves to nothing, and a
         // frontmatter relation to it is a problem.
-        let mut stems: HashMap<String, Option<String>> = HashMap::new();
+        let mut stems: Stems = HashMap::new();
         for note in &parsed {
             stems
                 .entry(note.stem.to_lowercase())
-                .and_modify(|key| *key = None)
-                .or_insert_with(|| Some(note.key.clone()));
+                .and_modify(|note| *note = None)
+                .or_insert_with(|| Some((note.key.clone(), note.type_name.clone())));
         }
-        let resolve = |target: &str| -> Option<String> {
-            stems.get(&target.to_lowercase()).cloned().flatten()
-        };
 
         // Pass 2: resolve links, attach body and key.
         for ParsedNote {
@@ -269,13 +301,18 @@ impl Settings {
                 continue;
             }
             if let Some(field) = &self.links_field {
+                let wanted = self.schema.link_targets.get(&type_name);
                 let mut links: Vec<serde_json::Value> = Vec::new();
                 for target in wikilink_targets(&body) {
-                    if let Some(key) = resolve(&target) {
-                        let key = serde_json::Value::String(key);
-                        if !links.contains(&key) {
-                            links.push(key);
-                        }
+                    let Some(Some((key, linked))) = stems.get(&target.to_lowercase()) else {
+                        continue;
+                    };
+                    if wanted.is_some_and(|wanted| wanted != linked) {
+                        continue;
+                    }
+                    let key = serde_json::Value::String(key.clone());
+                    if !links.contains(&key) {
+                        links.push(key);
                     }
                 }
                 record.insert(field.clone(), serde_json::Value::Array(links));
@@ -283,7 +320,7 @@ impl Settings {
             if let Some(field) = &self.body_field {
                 record.insert(field.clone(), serde_json::Value::String(body));
             }
-            if let Some(key_field) = self.key_fields.get(&type_name) {
+            if let Some(key_field) = self.schema.key_fields.get(&type_name) {
                 record.insert(key_field.clone(), serde_json::Value::String(key.clone()));
             }
             let id = (type_name.clone(), key.clone());
@@ -326,29 +363,32 @@ impl Settings {
         Ok(())
     }
 
-    /// `Err` is a per-file problem; the outer `Result` is a read failure.
+    /// `Err` is a problem with this file alone.
     fn parse_file(
         &self,
         snapshot: &dyn Snapshot,
         path: &str,
-    ) -> Result<std::result::Result<ParsedNote, String>> {
-        let Some(text) = snapshot.read_string(path)? else {
-            return Ok(Err("file disappeared while loading".into()));
+    ) -> std::result::Result<ParsedNote, String> {
+        // One unreadable note is its own problem, not every note's.
+        let text = match snapshot.read(path) {
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => return Err("is not valid UTF-8".into()),
+            },
+            Ok(None) => return Err("file disappeared while loading".into()),
+            Err(e) => return Err(e.to_string()),
         };
         let stem = std::path::Path::new(path)
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or_default()
             .to_string();
-        let (record, body) = match split_frontmatter(&text) {
-            Ok(split) => split,
-            Err(message) => return Ok(Err(message)),
-        };
+        let (record, body) = split_frontmatter(&text)?;
         let type_name = match &self.types {
             TypeSource::Fixed(name) => name.clone(),
             TypeSource::Field(field) => match record.get(field).and_then(|v| v.as_str()) {
                 Some(name) => name.to_string(),
-                None => return Ok(Err(format!("no `{field}` field naming the entity type"))),
+                None => return Err(format!("no `{field}` field naming the entity type")),
             },
         };
         let key = match &self.key {
@@ -356,20 +396,20 @@ impl Settings {
             KeySource::Frontmatter(field) => match record.get(field) {
                 Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
                 Some(serde_json::Value::Number(n)) => n.to_string(),
-                _ => return Ok(Err(format!("no `{field}` field to use as the key"))),
+                _ => return Err(format!("no `{field}` field to use as the key")),
             },
         };
         if let Some(problem) = self.overridden_field(&type_name, &key, &record) {
-            return Ok(Err(problem));
+            return Err(problem);
         }
-        Ok(Ok(ParsedNote {
+        Ok(ParsedNote {
             path: path.to_string(),
             stem,
             type_name,
             key,
             record,
             body,
-        }))
+        })
     }
 }
 
@@ -378,7 +418,7 @@ impl Settings {
     /// frontmatter states another value for one would be served with a value
     /// it does not say.
     fn overridden_field(&self, type_name: &str, key: &str, record: &Record) -> Option<String> {
-        if let Some(key_field) = self.key_fields.get(type_name) {
+        if let Some(key_field) = self.schema.key_fields.get(type_name) {
             if let Some(stated) = record.get(key_field) {
                 let agrees = match stated {
                     serde_json::Value::String(s) => s == key,
@@ -547,16 +587,20 @@ fn whole_wikilink(value: &str) -> Option<&str> {
 /// stem. A link naming no note keeps its target as the key (another
 /// sub-ontology's entity, or a dangling reference `check` reports); one
 /// naming several notes is collected in `ambiguous`.
+/// Lowercased file stem → the one note with it (key and type), or `None`
+/// when several notes share it.
+type Stems = HashMap<String, Option<(String, String)>>;
+
 fn resolve_wikilink_values(
     value: &mut serde_json::Value,
-    stems: &HashMap<String, Option<String>>,
+    stems: &Stems,
     ambiguous: &mut Vec<String>,
 ) {
     match value {
         serde_json::Value::String(s) => {
             if let Some(target) = whole_wikilink(s) {
                 match stems.get(&target.to_lowercase()) {
-                    Some(Some(key)) => s.clone_from(key),
+                    Some(Some((key, _))) => s.clone_from(key),
                     Some(None) => ambiguous.push(target.to_string()),
                     None => *s = target.to_string(),
                 }
@@ -575,16 +619,17 @@ fn resolve_wikilink_values(
 /// blocks and inline code.
 fn wikilink_targets(body: &str) -> Vec<String> {
     let mut targets = Vec::new();
-    let mut fence: Option<&str> = None;
+    // The open code fence: its character and length.
+    let mut fence: Option<(char, usize)> = None;
     for line in body.lines() {
-        let trimmed = line.trim_start();
-        let marker = ["```", "~~~"].into_iter().find(|m| trimmed.starts_with(m));
-        match (fence, marker) {
-            (None, Some(m)) => {
-                fence = Some(m);
+        match (fence, code_fence(line)) {
+            (None, Some((c, len, _))) => {
+                fence = Some((c, len));
                 continue;
             }
-            (Some(open), Some(m)) if open == m => {
+            // As in `CommonMark`, only a fence of the same character, at
+            // least as long, and alone on its line closes one.
+            (Some((open, open_len)), Some((c, len, true))) if c == open && len >= open_len => {
                 fence = None;
                 continue;
             }
@@ -603,18 +648,53 @@ fn wikilink_targets(body: &str) -> Vec<String> {
     targets
 }
 
+/// A code fence on `line`: its character, its length, and whether nothing
+/// but spaces follows it (what a closing fence needs).
+fn code_fence(line: &str) -> Option<(char, usize, bool)> {
+    let trimmed = line.trim_start();
+    let c = trimmed.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let len = trimmed.chars().take_while(|x| *x == c).count();
+    (len >= 3).then(|| (c, len, trimmed[len..].trim().is_empty()))
+}
+
+/// `line` with its inline code spans blanked. As in `CommonMark`, a run of
+/// N backticks opens a span that the next run of exactly N closes, and a
+/// run nothing closes is literal text.
 fn strip_inline_code(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
-    let mut in_code = false;
-    for c in line.chars() {
-        if c == '`' {
-            in_code = !in_code;
+    let mut rest = line;
+    while let Some(start) = rest.find('`') {
+        out.push_str(&rest[..start]);
+        let run = rest[start..].bytes().take_while(|b| *b == b'`').count();
+        let after = &rest[start + run..];
+        if let Some(end) = backtick_run(after, run) {
             out.push(' ');
-        } else if !in_code {
-            out.push(c);
+            rest = &after[end + run..];
+        } else {
+            out.push_str(&rest[start..start + run]);
+            rest = after;
         }
     }
+    out.push_str(rest);
     out
+}
+
+/// Where the first run of exactly `len` backticks in `text` starts.
+fn backtick_run(text: &str, len: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'`' {
+            let run = bytes[at..].iter().take_while(|b| **b == b'`').count();
+            if run == len {
+                return Some(at);
+            }
+            at += run;
+        } else {
+            at += 1;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -648,9 +728,13 @@ mod tests {
             Arc::new(GitSnapshot::open(dir, "HEAD").unwrap()),
             &sub(),
             &config(extra),
-            keys.iter()
-                .map(|(t, k)| ((*t).to_string(), (*k).to_string()))
-                .collect(),
+            NoteTypes {
+                key_fields: keys
+                    .iter()
+                    .map(|(t, k)| ((*t).to_string(), (*k).to_string()))
+                    .collect(),
+                link_targets: BTreeMap::new(),
+            },
         )
         .unwrap()
     }
@@ -846,6 +930,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn body_links_keep_to_the_type_their_relation_lists() {
+        const SDL: &str = r#"
+type Topic @key(fields: "id") { id: ID! related: [Topic!]! }
+type Person @key(fields: "id") { id: ID! }
+type Query { topic(id: ID!): Topic }
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        commit_files(
+            dir.path(),
+            &[
+                (
+                    "notes/topic.md",
+                    "---\ntype: Topic\n---\nSee [[person]] and [[other]].\n",
+                ),
+                ("notes/other.md", "---\ntype: Topic\n---\n"),
+                ("notes/person.md", "---\ntype: Person\n---\n"),
+            ],
+            "init",
+        );
+        let config = config("type_field = \"type\"\nlinks_field = \"related\"");
+        let model = crate::model::SubOntologyModel::parse(SDL).unwrap();
+        let schema = NoteTypes::of(&model, &config);
+        assert_eq!(
+            schema.link_targets,
+            BTreeMap::from([("Topic".to_string(), "Topic".to_string())])
+        );
+        let s = MarkdownStore::new(
+            Arc::new(GitSnapshot::open(dir.path(), "HEAD").unwrap()),
+            &sub(),
+            &config,
+            schema,
+        )
+        .unwrap();
+        let topic = s.get("Topic", "topic").await.unwrap().unwrap();
+        assert_eq!(topic["related"], json!(["other"]), "not the Person note");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_note_is_its_own_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        commit_files(
+            dir.path(),
+            &[("notes/fine.md", "---\ntitle: Fine\n---\n")],
+            "init",
+        );
+        // A note that is not UTF-8, committed next to a fine one.
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("notes/latin1.md"),
+            b"---\ntitle: caf\xe9\n---\n",
+        )
+        .unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_path(std::path::Path::new("notes/latin1.md"))
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "latin1", &tree, &[&parent])
+            .unwrap();
+        let s = store(dir.path(), "type = \"Topic\"", &[("Topic", "id")]);
+        let (notes, problems) = s.notes().unwrap();
+        assert_eq!(notes.len(), 1, "the fine note still loads");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].path, "notes/latin1.md");
+        assert!(
+            problems[0].message.contains("UTF-8"),
+            "{}",
+            problems[0].message
+        );
+    }
+
+    #[tokio::test]
     async fn malformed_frontmatter_is_a_problem_not_an_empty_note() {
         let dir = tempfile::tempdir().unwrap();
         commit_files(
@@ -898,14 +1057,19 @@ mod tests {
             "type = \"A\"\nkey = \"frontmatter:\"",
         ] {
             assert!(
-                MarkdownStore::new(Arc::clone(&snap), &sub(), &config(extra), BTreeMap::new())
-                    .is_err(),
+                MarkdownStore::new(
+                    Arc::clone(&snap),
+                    &sub(),
+                    &config(extra),
+                    NoteTypes::default()
+                )
+                .is_err(),
                 "{extra}"
             );
         }
         let escaping: MarkdownConfig =
             toml::from_str("dir = \"../../../outside\"\ntype = \"A\"").unwrap();
-        assert!(MarkdownStore::new(snap, &sub(), &escaping, BTreeMap::new()).is_err());
+        assert!(MarkdownStore::new(snap, &sub(), &escaping, NoteTypes::default()).is_err());
     }
 
     #[test]
@@ -921,6 +1085,18 @@ mod tests {
         assert_eq!(
             wikilink_targets("[[first]][[second]] ![[embed]][[after-embed]]"),
             ["first", "second", "after-embed"]
+        );
+        // A fence closes only on its own kind, at least as long.
+        assert_eq!(
+            wikilink_targets(
+                "````\n```\n[[inside]]\n````\n[[after]]\n~~~\n[[tilde]]\n```\n[[still]]\n~~~\n"
+            ),
+            ["after"]
+        );
+        // Code spans are delimited by runs of equal length.
+        assert_eq!(
+            wikilink_targets("``[[a]]`` `[[b]]` ``x ` [[c]]`` [[d]] `[[e]]"),
+            ["d", "e"]
         );
     }
 }
