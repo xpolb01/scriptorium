@@ -247,25 +247,26 @@ Columns are named exactly like the fields (quote camelCase: `"createdAt"`);
 the key column is the entity's key field. Only the key and the columns of
 declared stored fields are read, so column-level `SELECT` grants on those
 are enough. The key, relation, and `ID` columns are read as text, so a wide
-`numeric` keeps every digit. Relations hold target keys in
-`text`, `text[]`, `integer`, or `integer[]` columns; `jsonb` columns hold
-value objects. Keys compare as text. Schema, table, and column names are at
-most 63 bytes, the most Postgres keeps (it cuts longer ones). Only types the sub-ontology stores
-fields of need a table: one it merely extends with derived fields reads as
-empty. Two types may not read the same table. `serve` checks at startup
-that every table exists with its key column declared unique and `NOT NULL`
-(a `PRIMARY KEY`, or a valid unique index), and that it can read the rows;
-views are refused, since they cannot guarantee unique keys. A duplicate or
-missing key read anyway is an error, never a guess.
+`numeric` keeps every digit. Relations hold target keys in `text`,
+`text[]`, `integer`, or `integer[]` columns; `jsonb` columns hold value
+objects. Keys compare as text. Schema, table, and column names are at most
+63 bytes, the most Postgres keeps (it cuts longer ones). Only types the
+sub-ontology stores fields of need a table: one it merely extends with
+derived fields reads as empty. Two types may not read the same table.
+`serve` checks at startup that every table exists with its key column
+declared unique and `NOT NULL` (a `PRIMARY KEY`, or a valid unique index),
+and that it can read the rows; views are refused, since they cannot
+guarantee unique keys. A duplicate or missing key read anyway is an error,
+never a guess.
 
 Any server other than a local one (`localhost`, a loopback address, a Unix
 socket; judged by the address actually contacted, so a `hostaddr` counts
-over its `host`) is reached over TLS, with its certificate and name verified against
-the system trust store: `sslmode=disable` is refused there, and `prefer`
-(the default) means `require`, so a server without TLS fails instead of
-downgrading. A local server is reached without TLS unless the connection
-string says `sslmode=require`. (`verify-full` is how `require` behaves
-here; write `require`.)
+over its `host`) is reached over TLS, with its certificate and name
+verified against the system trust store: `sslmode=disable` is refused
+there, and `prefer` (the default) means `require`, so a server without TLS
+fails instead of downgrading. A local server is reached without TLS unless
+the connection string says `sslmode=require`. (`verify-full` is how
+`require` behaves here; write `require`.)
 
 ### DynamoDB items
 
@@ -286,14 +287,15 @@ keys as S/N values, lists, or SS/NS sets (an integer wider than 64 bits, up
 to DynamoDB's 38 digits, is kept as its exact digits, and a `Float` field
 reads it as a float). Keys are strings or integers, so a decimal N in a
 relation is not a key: following it is an error, and inverse relations
-never list it. `pk` and `type` are reserved. An
-item may repeat its key in the key attribute (`id`), but it must match
-`pk`.
+never list it. `pk` and `type` are reserved. An item may repeat its key in
+the key attribute (`id`), but it must match `pk`.
+
 Credentials come from the standard AWS chain, and `serve` checks the key
 schema at startup and makes one `GetItem` and one `Scan`, so credentials
-that can describe the table but not read it fail there. Lookups use `GetItem`; lists and `@inverse` relations
-scan the table, reading items by `type` or by `pk` prefix, so an item whose
-two disagree is an error rather than a silent gap.
+that can describe the table but not read it fail there. Lookups use
+`GetItem`; lists and `@inverse` relations scan the table, reading items by
+`type` or by `pk` prefix, so an item whose two disagree is an error rather
+than a silent gap.
 
 ### Remote sub-ontologies
 
@@ -309,35 +311,39 @@ composes with the ontology at `HEAD`, writes
 `ontology/<name>/{subgraph.toml,schema.graphql}`, and commits them; it
 writes nothing if HEAD moved or the directory appeared while the remote
 answered, never writes over an existing file, and removes the directory
-again if the commit fails. `pull`
-refreshes pinned schemas; it writes nothing unless every fetch succeeds and
-the new set composes, and it refuses to overwrite a remote's directory that
-has uncommitted changes. It replaces every changed schema or none: nothing
-is written if HEAD or a pinned schema changed while the remotes answered,
-and a failed write, rename, or commit puts the previous pins back (each
-original is kept beside its replacement until the commit lands; staged
-files are created exclusively, under names no one can predict). Both
-commands commit only onto the commit they checked against, and run one at a
-time per clone (a lock in the git directory; `pull --dry-run` only reads). Both skip the commit when unrelated changes are
-staged, and take `--no-commit`.
+again if the commit fails.
 
-`--header NAME=ENV` sends header `NAME` with the value of `$ENV`. The
-binding (header and variable *names*, and the URL it was made for) stays
-in this clone's git directory, `.git/scriptorium-ontology/remotes.toml`
-(replaced whole on every change, never truncated in place), keyed by the
-remote's directory and URL, so two ontologies in one repository, or linked
-worktrees pinning one remote at different URLs, keep their own;
-nothing about credentials is committed. `pull` sends a remote's bound
-headers only while its manifest still points at that URL: a commit that
-repoints a remote gets an error instead, until you bind again with
-`pull <name> --header …`. A new binding is saved before the pin it
-opens is committed, and put back as it was if that fails, so no pin lands
-without its credential. Remote URLs may not carry a user, a password, a
-query, or a fragment (they are committed and copied into the supergraph).
-Headers go over plain `http` only to a loopback host, and then never
-through a proxy; redirects are not followed, and a response is capped at
-8 MiB. The supergraph carries no
-headers: give the gateway its own credentials for the remote.
+`pull` refreshes pinned schemas; it writes nothing unless every fetch
+succeeds and the new set composes, and it refuses to overwrite a remote's
+directory that has uncommitted changes. It replaces every changed schema or
+none: nothing is written if HEAD or a pinned schema changed while the
+remotes answered, and a failed write, rename, or commit puts the previous
+pins back (each original is kept beside its replacement until the commit
+lands; staged files are created exclusively, under names no one can
+predict).
+
+Both commands commit only onto the commit they checked against, and run
+one at a time per clone (a lock in the git directory; `pull --dry-run` only
+reads). Both skip the commit when unrelated changes are staged, and take
+`--no-commit`.
+
+`--header NAME=ENV` sends header `NAME` with the value of `$ENV`; a header
+named twice, in any case, is refused. The binding (header and variable
+*names*, and the URL it was made for) stays in this clone's git directory,
+`.git/scriptorium-ontology/remotes.toml` (replaced whole on every change,
+never truncated in place), keyed by the remote's directory and URL, so two
+ontologies in one repository, or linked worktrees pinning one remote at
+different URLs, keep their own; nothing about credentials is committed.
+`pull` sends a remote's bound headers only while its manifest still points
+at that URL: a commit that repoints a remote gets an error instead, until
+you bind again with `pull <name> --header …`. A new binding is saved
+before the pin it opens is committed, and put back as it was if that
+fails, so no pin lands without its credential. Remote URLs may not carry a
+user, a password, a query, or a fragment (they are committed and copied
+into the supergraph). Headers go over plain `http` only to a loopback
+host, and then never through a proxy; redirects are not followed, and a
+response is capped at 8 MiB. The supergraph carries no headers: give the
+gateway its own credentials for the remote.
 
 ## Install
 
@@ -366,7 +372,7 @@ and skip otherwise.
 | `scriptorium-ontology init` | Scaffold the example ontology (`core`, `research`, `software`, `notes`) and commit it |
 | `scriptorium-ontology list` | Sub-ontologies at a revision: storage, owners, types |
 | `scriptorium-ontology compose` | Compose the supergraph (`--out`, `--api` for the client-facing schema) |
-| `scriptorium-ontology check` | Composition + schema + git-record validation; non-zero exit on errors |
+| `scriptorium-ontology check` | Composition, schema, records (git records, markdown notes) and storage settings; non-zero exit on errors |
 | `scriptorium-ontology serve` | Serve local sub-ontologies as Federation v2 subgraphs over HTTP |
 | `scriptorium-ontology add-remote <name> <url>` | Pin a remote subgraph's schema as a sub-ontology and commit it |
 | `scriptorium-ontology pull [<name>…]` | Refresh pinned remote schemas (`--dry-run` shows the diff) |
@@ -375,18 +381,18 @@ and skip otherwise.
 malformed `subgraph.toml`, a missing schema), and `compose` also refuses
 when a local sub-ontology composes but could not be served: a supergraph
 that silently drops one, or routes to one that cannot start, would make its
-fields vanish from the gateway. `list` warns and
-`check` reports them. Before `compose --out` writes a supergraph, it asks
-each local subgraph at the base URL which commit it serves (`serve` sends
-it as the `scriptorium-ontology-revision` header) and what schema, and
-refuses when a running server is on another commit, even one that changed
-only records: restart it at the new commit first, or let
-`serve --supergraph` publish. Nothing
-listening yet (connection refused) is only a note; any other failure,
-TLS included, refuses, since then nothing is known about what runs there.
-It also asks each remote sub-ontology what it serves (sending the headers
-bound to it, if any, the way `pull` does) and refuses when that is no
-longer the pinned `schema.graphql`, or when the remote cannot be asked.
+fields vanish from the gateway. `list` warns and `check` reports them.
+
+Before `compose --out` writes a supergraph, it asks each local subgraph at
+the base URL which commit it serves (`serve` sends it as the
+`scriptorium-ontology-revision` header) and what schema, and refuses when a
+running server is on another commit, even one that changed only records:
+restart it at the new commit first, or let `serve --supergraph` publish.
+Nothing listening yet (connection refused) is only a note; any other
+failure, TLS included, refuses, since then nothing is known about what runs
+there. It also asks each remote sub-ontology what it serves (sending the
+headers bound to it, if any, the way `pull` does) and refuses when that is
+no longer the pinned `schema.graphql`, or when the remote cannot be asked.
 `--offline` skips both questions. `serve --supergraph` asks the remotes the
 same before it writes, and once it listens it asks its own subgraphs at the
 base URL the supergraph routes to: a `serve.base_url` that reaches another
@@ -403,15 +409,14 @@ accepts a request.
 All commands read from a git revision (`--rev`, default `HEAD`). Pass
 `--worktree` to read uncommitted files while editing (`list`, `check`, and
 `compose` to stdout; publishing with `compose --out` or `serve` reads a
-commit). Reads refuse symlinked files, in the working tree
-and in commits alike: a commit stores the link, not the file it names, so
-the two would disagree.
-A file name under the ontology that is not UTF-8 is an error, never
-skipped, and so is a git link (submodule) where a record would be, or a
-symlink where a sub-ontology's or a `data_dir`'s directory would be (git
-reads do not follow symlinks).
-Without `-C`, commands target the git repository containing the current
-directory; `init` never falls back to the default vault.
+commit). Reads refuse symlinked files, in the working tree and in commits
+alike: a commit stores the link, not the file it names, so the two would
+disagree. A file name under the ontology that is not UTF-8 is an error,
+never skipped, and so is a git link (submodule) where a record would be,
+or a symlink where a sub-ontology's, a `data_dir`'s, or a markdown `dir`'s
+directory would be (git reads do not follow symlinks). Without `-C`,
+commands target the git repository containing the current directory;
+`init` never falls back to the default vault.
 
 ### Running a federated query
 
@@ -502,21 +507,24 @@ the schema `compose` composed. Subgraphs do not answer introspection
    only, and none of the directives the server cannot honour yet
    (`@requires`, `@provides`, `@context`, `@fromContext`,
    `@interfaceObject`).
-4. **Records** (git storage) — every record's type is an entity of its
-   sub-ontology, every field is owned by it (not `@external`, not
-   `@inverse`), values match declared types, required fields are present,
-   and the key in the file name is valid (a key the record also stores must
-   be spelled the same and have the key's type). A relation stores the target's
-   key as that key's scalar: a string or an integer, and for an `Int` key a
-   32-bit integer in canonical form.
-5. **Existence** — for a type that git-backed sub-ontologies own, their
-   records are the entities. Errors: a reference to a key an owner lacks
-   (`ontology.record.dangling_ref`), a record for one
+4. **Records** (git records and markdown notes) — every record's type is
+   an entity of its sub-ontology, every field is owned by it (not
+   `@external`, not `@inverse`), values match declared types, required
+   fields are present, and the key is valid (for git records, the file
+   name; a key the record also stores must be spelled the same and have
+   the key's type). A relation stores the target's key as that key's
+   scalar: a string or an integer, and for an `Int` key a 32-bit integer in
+   canonical form. Notes are read leniently: frontmatter the schema does
+   not declare is ignored.
+5. **Existence** — for a type that git- or markdown-backed sub-ontologies
+   own, their records are the entities. Errors: a reference to a key an
+   owner lacks (`ontology.record.dangling_ref`), a record for one
    (`ontology.record.orphan`), and an extension that declares a required
    stored field (`rating: Int!`) with no record for some entity
-   (`ontology.record.missing`). For a type owned elsewhere these can only
-   be warnings: a reference no git-backed record matches, and a required
-   extension field whose entities check cannot enumerate.
+   (`ontology.record.missing`). For a type owned elsewhere (by a database
+   or a remote) these can only be warnings: a reference no record `check`
+   reads matches, and a required extension field whose entities `check`
+   cannot enumerate.
 6. **One resolver per field** — a non-key entity field is resolved by one
    local sub-ontology (`ontology.schema.shared_field`): the gateway may
    read a `@shareable` field from any sub-ontology that resolves it, and
