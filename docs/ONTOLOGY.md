@@ -219,7 +219,8 @@ what it names, so the notes behind it would be missing. `check` reads
 notes leniently: frontmatter the schema does not declare (Obsidian's
 `tags`, `aliases`, …) is ignored, but declared fields must have their
 declared types. A fixed `type` must be an entity of the sub-ontology, even
-before it has notes. `body_field` and `links_field` must name stored fields
+before it has notes, and a `dir` with no notes is a warning (git keeps no
+empty directories, so it may just be new, or misspelled). `body_field` and `links_field` must name stored fields
 the notes' type declares (a `String`, and a list of entities), other than
 its key, or `check` fails: a misspelling would fill a field nothing reads,
 and the key is filled last, over anything else; and with

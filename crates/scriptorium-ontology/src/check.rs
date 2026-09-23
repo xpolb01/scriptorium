@@ -1199,6 +1199,21 @@ fn validate_markdown_notes(
             return;
         }
     };
+    if notes.is_empty() && problems.is_empty() {
+        // Only a warning: git keeps no empty directories, so a sub-ontology
+        // with no notes yet looks just like a misspelled `dir`.
+        let dir = crate::layout::resolve_within(&sub.dir, &config.dir)
+            .unwrap_or_else(|| config.dir.clone());
+        acc.push(
+            Severity::Warning,
+            "ontology.storage",
+            Some(&sub.name),
+            Some(dir.clone()),
+            format!(
+                "no notes under `{dir}`, so none of this sub-ontology's entities are served; check `dir` if there should be"
+            ),
+        );
+    }
     for problem in problems {
         acc.push(
             Severity::Error,
@@ -2081,6 +2096,36 @@ type Query { thing(id: ID!): Thing }
         let found = problems(&NOTES_TOML.replace("\"body\"", "\"year\""));
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("fills `Topic.year`"), "{}", found[0]);
+    }
+
+    #[test]
+    fn a_markdown_sub_ontology_without_notes_is_a_warning() {
+        let warnings = |files: &[(&str, &str)]| -> Vec<String> {
+            run(files)
+                .issues
+                .into_iter()
+                .filter(|i| i.severity == Severity::Warning && i.rule == "ontology.storage")
+                .map(|i| i.message)
+                .collect()
+        };
+        let found = warnings(&[
+            ("ontology/notes/subgraph.toml", NOTES_TOML),
+            ("ontology/notes/schema.graphql", NOTES),
+        ]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("no notes under `ontology/notes/pages`"),
+            "{found:?}"
+        );
+        let found = warnings(&[
+            ("ontology/notes/subgraph.toml", NOTES_TOML),
+            ("ontology/notes/schema.graphql", NOTES),
+            (
+                "ontology/notes/pages/attention.md",
+                "---\ntitle: Attention\n---\n",
+            ),
+        ]);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
