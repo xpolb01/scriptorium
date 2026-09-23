@@ -830,7 +830,7 @@ mod tests {
     /// "hash-1" and "hash-2" should delete the hash-1 rows and leave
     /// hash-2 alone. This is the "stale content version" orphan case —
     /// a page that's still in the vault but whose body has been updated,
-    /// so the old content_hash rows are superseded.
+    /// so the old `content_hash` rows are superseded.
     #[test]
     fn retain_page_versions_removes_stale_content_versions_for_kept_page() {
         let store = EmbeddingsStore::in_memory().unwrap();

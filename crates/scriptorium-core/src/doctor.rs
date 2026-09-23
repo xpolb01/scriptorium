@@ -100,7 +100,7 @@ pub fn run_doctor(vault: &Vault, store: Option<&EmbeddingsStore>) -> DoctorRepor
     checks.push(check_learnings(vault));
     checks.push(crate::ingest_queue::queue_health_check(
         vault,
-        std::time::Duration::from_secs(3600),
+        std::time::Duration::from_hours(1),
     ));
 
     let status = if checks.iter().any(|c| c.status == CheckStatus::Fail) {
@@ -120,7 +120,7 @@ fn check_vault(vault: &Vault) -> DoctorCheck {
     let root_ok = vault.root().is_dir();
     let wiki_ok = vault.wiki_dir().is_dir();
     if root_ok && wiki_ok {
-        let page_count = vault.scan().map(|s| s.pages.len()).unwrap_or(0);
+        let page_count = vault.scan().map_or(0, |s| s.pages.len());
         DoctorCheck::ok(
             "vault_exists",
             format!("Vault at {}, {page_count} wiki pages", vault.root()),
@@ -184,7 +184,7 @@ fn check_sqlite(store: Option<&EmbeddingsStore>) -> DoctorCheck {
 }
 
 fn check_embedding_coverage(vault: &Vault, store: &EmbeddingsStore) -> DoctorCheck {
-    let page_count = vault.scan().map(|s| s.pages.len()).unwrap_or(0);
+    let page_count = vault.scan().map_or(0, |s| s.pages.len());
     if page_count == 0 {
         return DoctorCheck::ok("embedding_coverage", "No pages to embed");
     }
@@ -360,7 +360,7 @@ mod tests {
         assert_eq!(schema_check.status, CheckStatus::Warn);
     }
 
-    /// No embeddings store → skip embed checks, warn on sqlite_db.
+    /// No embeddings store → skip embed checks, warn on `sqlite_db`.
     #[test]
     fn doctor_no_embeddings() {
         let dir = tempfile::tempdir().unwrap();
@@ -378,7 +378,7 @@ mod tests {
         assert!(report.checks.iter().all(|c| c.name != "embedding_coverage"));
     }
 
-    /// Vault with a broken link → warn on broken_links.
+    /// Vault with a broken link → warn on `broken_links`.
     #[test]
     fn doctor_reports_broken_links() {
         let dir = tempfile::tempdir().unwrap();

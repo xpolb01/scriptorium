@@ -171,7 +171,7 @@ async fn dispatch(
 ) -> Result<Value, JsonRpcError> {
     let rpc_method = req.method.as_str();
     let rpc_request_id = match &req.id {
-        Some(id) => format!("{}", id),
+        Some(id) => format!("{id}"),
         None => "null".to_string(),
     };
     let request_span = tracing::info_span!(
@@ -262,7 +262,7 @@ async fn tools_call(
 
         let t0 = std::time::Instant::now();
         let result = registry.invoke(&name, arguments, context).await;
-        let duration_ms = t0.elapsed().as_millis() as u64;
+        let duration_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         match &result {
             Ok(text) => {

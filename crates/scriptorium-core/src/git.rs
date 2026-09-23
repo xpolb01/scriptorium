@@ -203,7 +203,7 @@ mod tests {
 
     /// Regression test for the "empty commit on new subdirectory" bug.
     ///
-    /// VaultTx::commit was producing git commits with the correct message
+    /// `VaultTx::commit` was producing git commits with the correct message
     /// but ZERO file changes when an ingest wrote pages into a subdirectory
     /// that did not exist in the index yet (e.g. `wiki/notes/`,
     /// `wiki/patterns/` on a vault whose index only knew about
@@ -233,7 +233,8 @@ mod tests {
         let nested_file = nested_dir.join("page.md");
         std::fs::write(&nested_file, "nested body\n").unwrap();
 
-        let oid = commit_paths(dir.path(), &[nested_file.clone()], "add nested").unwrap();
+        let oid =
+            commit_paths(dir.path(), std::slice::from_ref(&nested_file), "add nested").unwrap();
 
         // Inspect the resulting commit's tree. It MUST contain the new
         // file at `nested/deep/page.md`; an empty commit fails the test.
@@ -338,7 +339,7 @@ mod tests {
     ///    commit) — this simulates the schema update I made directly
     ///    before the ingests.
     /// 3. Write a new page at wiki/notes/bar.md (brand-new subdir).
-    /// 4. Call commit_paths with ONLY [wiki/notes/bar.md].
+    /// 4. Call `commit_paths` with ONLY [wiki/notes/bar.md].
     /// 5. Assert the resulting commit tree contains bar.md.
     #[test]
     fn commits_new_subdir_file_when_working_tree_has_dirty_unrelated_files() {
@@ -368,7 +369,7 @@ mod tests {
         std::fs::write(&bar, "bar body\n").unwrap();
 
         // Step 4: commit ONLY the new file — not CLAUDE.md.
-        let oid = commit_paths(root, &[bar.clone()], "ingest bar").unwrap();
+        let oid = commit_paths(root, std::slice::from_ref(&bar), "ingest bar").unwrap();
 
         // Step 5: the resulting commit tree MUST contain wiki/notes/bar.md.
         let repo = Repository::open(root).unwrap();
@@ -548,7 +549,7 @@ mod tests {
 
         // Commit ONLY log.md. The untracked sources/articles file is
         // deliberately NOT in the pathspec — it should stay untracked.
-        let oid = commit_paths(root, &[log_md.clone()], "append to log").unwrap();
+        let oid = commit_paths(root, std::slice::from_ref(&log_md), "append to log").unwrap();
 
         let repo = Repository::open(root).unwrap();
         let commit = repo

@@ -18,9 +18,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::missing_panics_doc)]
 
+#[cfg(feature = "dashboard")]
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command as StdCommand, Stdio};
+use std::process::Command as StdCommand;
+#[cfg(feature = "dashboard")]
+use std::process::{Child, Stdio};
+#[cfg(feature = "dashboard")]
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
@@ -51,6 +55,7 @@ fn scriptorium_cmd(home: &Path) -> Command {
 }
 
 /// Pick a free TCP port by binding to 0 and immediately closing.
+#[cfg(feature = "dashboard")]
 fn pick_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let p = l.local_addr().unwrap().port();
@@ -59,6 +64,7 @@ fn pick_port() -> u16 {
 }
 
 /// Poll `predicate` every 50ms until true or `timeout` elapses.
+#[cfg(feature = "dashboard")]
 fn poll_until<F: FnMut() -> bool>(timeout: Duration, mut predicate: F) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -72,7 +78,9 @@ fn poll_until<F: FnMut() -> bool>(timeout: Duration, mut predicate: F) -> bool {
 
 /// RAII guard that kills a child process on drop. Used to ensure the
 /// dashboard subprocess never leaks when a test panics.
+#[cfg(feature = "dashboard")]
 struct ChildGuard(Option<Child>);
+#[cfg(feature = "dashboard")]
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(mut c) = self.0.take() {
@@ -288,8 +296,7 @@ fn e2e_dashboard_live_update() {
             std::process::Command::new("curl")
                 .args(["-fsS", "-o", "/dev/null", &format!("{base}/api/health")])
                 .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
+                .is_ok_and(|s| s.success())
         }),
         "dashboard never became reachable on {base}"
     );
@@ -411,7 +418,7 @@ fn e2e_concurrent_writers() {
 #[test]
 fn e2e_payload_cap() {
     let (home, db) = fresh_home();
-    let big_body: String = std::iter::repeat('A').take(32 * 1024).collect();
+    let big_body: String = "A".repeat(32 * 1024);
     let payload = serde_json::json!({
         "source": "cli",
         "severity": "INFO",

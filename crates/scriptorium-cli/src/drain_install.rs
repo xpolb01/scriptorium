@@ -7,6 +7,7 @@
 //! jobs run without a Security Server session and `security
 //! find-generic-password` returns empty.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -121,11 +122,12 @@ fn build_env_vars_xml(injected: &mut Vec<String>) -> String {
     let mut xml = String::new();
     for (env_var, service) in KEYCHAIN_SPECS {
         if let Some(value) = scriptorium_core::keychain::resolve_key(env_var, service) {
-            xml.push_str(&format!(
-                "    <key>{}</key><string>{}</string>\n",
+            let _ = writeln!(
+                xml,
+                "    <key>{}</key><string>{}</string>",
                 env_var,
                 xml_escape(&value)
-            ));
+            );
             injected.push((*env_var).to_string());
         }
     }

@@ -236,9 +236,9 @@ fn prompt_meridian(
     let _ = input.read_line(&mut line);
     let answer = line.trim().to_ascii_lowercase();
     let enabled = match answer.as_str() {
-        "" => default_yes,
         "y" | "yes" => true,
         "n" | "no" => false,
+        // Empty (just Enter) or unrecognized input keeps the default.
         _ => default_yes,
     };
     MeridianConfig {

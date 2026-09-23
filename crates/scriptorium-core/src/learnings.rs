@@ -146,7 +146,7 @@ pub fn search(vault: &Vault, query: &str) -> Result<Vec<Learning>> {
 /// List the N most recent learnings (by timestamp).
 pub fn list_recent(vault: &Vault, limit: usize) -> Result<Vec<Learning>> {
     let mut all = load_deduped(vault)?;
-    all.sort_by(|a, b| b.ts.cmp(&a.ts));
+    all.sort_by_key(|l| std::cmp::Reverse(l.ts));
     all.truncate(limit);
     Ok(all)
 }

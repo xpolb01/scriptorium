@@ -582,6 +582,8 @@ async fn ingest_commit_is_non_empty_and_contains_both_source_and_wiki_page() {
         .expect("sources/articles/ tree")
         .id();
     let articles_tree = repo.find_tree(articles_oid).unwrap();
+    // Interned sources are written with a lowercase `.md` suffix; match it exactly.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
     let any_source = (0..articles_tree.len())
         .map(|i| articles_tree.get(i).unwrap())
         .find(|entry| {
@@ -605,7 +607,7 @@ async fn ingest_commit_is_non_empty_and_contains_both_source_and_wiki_page() {
 }
 
 /// Regression for the second ingest scenario: `empty_test_vault` uses an
-/// absolute TempDir path, but the production failure happened when the
+/// absolute `TempDir` path, but the production failure happened when the
 /// CLI ran from inside the vault with `-C .`. This test explicitly
 /// exercises a `Vault` opened via a relative path to cover that code
 /// path at the e2e level.

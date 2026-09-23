@@ -321,7 +321,7 @@ mod tests {
     fn discover_skips_oversized_files() {
         let dir = tempfile::tempdir().unwrap();
         // Create a file larger than 5MB.
-        let big = vec![b'x'; (MAX_FILE_SIZE + 1) as usize];
+        let big = vec![b'x'; usize::try_from(MAX_FILE_SIZE + 1).unwrap()];
         std::fs::write(dir.path().join("big.md"), &big).unwrap();
         std::fs::write(dir.path().join("small.md"), "small").unwrap();
         let files = discover_files(dir.path()).unwrap();

@@ -253,6 +253,8 @@ enum Command {
     /// Import a Claude or ChatGPT conversations.json export as markdown
     /// transcripts under sources/ (default sources/chats), ready for
     /// normal ingest.
+    // clap prints this doc verbatim as `--help` text; backticks would show up there.
+    #[allow(clippy::doc_markdown)]
     ImportChat {
         /// Path to the export file (conversations.json).
         file: PathBuf,
@@ -766,11 +768,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         // --- commands that don't need vault resolution ---
         Command::VaultMgmt(sub) => handle_vault_command(sub),
         Command::Log(cmd) => {
-            log_cmd::run(cmd, default_hooks_db_path())?;
+            log_cmd::run(cmd, &default_hooks_db_path())?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Trace(cmd) => {
-            trace_cmd::run(cmd, default_hooks_db_path())?;
+            trace_cmd::run(cmd, &default_hooks_db_path())?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Hooks(sub) => {
@@ -1609,21 +1611,19 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     let llm =
                         build_chat_provider(provider.unwrap_or_else(|| provider_from(&cfg)), &cfg)?;
                     let scan = vault.scan().into_diagnostic()?;
-                    let mut pages: Vec<&scriptorium_core::Page> = match &page {
-                        Some(stem) => scan
-                            .pages
+                    let mut pages: Vec<&scriptorium_core::Page> = if let Some(stem) = &page {
+                        scan.pages
                             .iter()
                             .filter(|p| p.path.file_stem() == Some(stem.as_str()))
-                            .collect(),
-                        None => {
-                            let mut all: Vec<_> = scan
-                                .pages
-                                .iter()
-                                .filter(|p| !p.frontmatter.sources.is_empty())
-                                .collect();
-                            all.sort_by(|a, b| b.frontmatter.updated.cmp(&a.frontmatter.updated));
-                            all
-                        }
+                            .collect()
+                    } else {
+                        let mut all: Vec<_> = scan
+                            .pages
+                            .iter()
+                            .filter(|p| !p.frontmatter.sources.is_empty())
+                            .collect();
+                        all.sort_by_key(|p| std::cmp::Reverse(p.frontmatter.updated));
+                        all
                     };
                     pages.truncate(limit.max(1));
                     if pages.is_empty() {
@@ -2445,6 +2445,8 @@ fn hooks_log_inner(
     let store = scriptorium_core::hooks_store::HooksStore::open(&path)
         .map_err(|e| format!("open hooks db: {e}"))?;
 
+    // Legacy hook_events write path; moving to `insert_log` would change behavior.
+    #[allow(deprecated)]
     store
         .insert_event_idempotent(&event)
         .map_err(|e| format!("insert event: {e}"))?;
