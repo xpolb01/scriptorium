@@ -468,6 +468,38 @@ async fn hook_summary_handler(
     })))
 }
 
+/// The dashboard's routes behind a localhost-only CORS layer.
+fn router(state: Arc<AppState>) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(
+            |origin: &HeaderValue, _parts: &_| {
+                origin.as_bytes().starts_with(b"http://127.0.0.1")
+                    || origin.as_bytes().starts_with(b"http://localhost")
+            },
+        ))
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any)
+        // tower-http 0.7 derives `Vary` from the settings above (origin
+        // only); pin the full preflight list that 0.6 always sent.
+        .vary(tower_http::cors::preflight_request_headers().collect::<Vec<_>>());
+
+    Router::new()
+        .route("/", get(index_handler))
+        .route("/api/summary", get(summary_handler))
+        .route("/api/events", get(events_handler))
+        .route("/api/errors", get(errors_handler))
+        .route("/api/health", get(health_handler))
+        .route("/api/logs", get(logs_handler))
+        .route("/api/spans", get(spans_handler))
+        .route("/api/traces/{trace_id}", get(trace_handler))
+        .route("/api/timeline", get(timeline_handler))
+        .route("/api/cli/summary", get(cli_summary_handler))
+        .route("/api/mcp/summary", get(mcp_summary_handler))
+        .route("/api/hook/summary", get(hook_summary_handler))
+        .layer(cors)
+        .with_state(state)
+}
+
 // ── Public entry point ───────────────────────────────────────────────────
 
 /// Start the hooks health dashboard web server.
@@ -507,31 +539,7 @@ pub async fn start_dashboard(
         telemetry,
     });
 
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(
-            |origin: &HeaderValue, _parts: &_| {
-                origin.as_bytes().starts_with(b"http://127.0.0.1")
-                    || origin.as_bytes().starts_with(b"http://localhost")
-            },
-        ))
-        .allow_methods(tower_http::cors::Any)
-        .allow_headers(tower_http::cors::Any);
-
-    let app = Router::new()
-        .route("/", get(index_handler))
-        .route("/api/summary", get(summary_handler))
-        .route("/api/events", get(events_handler))
-        .route("/api/errors", get(errors_handler))
-        .route("/api/health", get(health_handler))
-        .route("/api/logs", get(logs_handler))
-        .route("/api/spans", get(spans_handler))
-        .route("/api/traces/:trace_id", get(trace_handler))
-        .route("/api/timeline", get(timeline_handler))
-        .route("/api/cli/summary", get(cli_summary_handler))
-        .route("/api/mcp/summary", get(mcp_summary_handler))
-        .route("/api/hook/summary", get(hook_summary_handler))
-        .layer(cors)
-        .with_state(state);
+    let app = router(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     eprintln!("Scriptorium Hooks Dashboard: http://127.0.0.1:{port}");
@@ -731,5 +739,38 @@ mod tests {
                 .is_some_and(|s| s.contains("RFC3339")),
             "error response detail must mention RFC3339: {error_json:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn production_router_serves_trace_route_with_cors() {
+        // Building the real router panics if a route still uses the
+        // pre-axum-0.8 `/:param` capture syntax.
+        let app = router(tmp_state("router-t1.sqlite"));
+        let trace_id = "0af7651916cd43dd8448eb211c80319c";
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/traces/{trace_id}"))
+                    .header("origin", "http://localhost:3000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(
+            headers["access-control-allow-origin"],
+            "http://localhost:3000"
+        );
+        assert_eq!(
+            headers["vary"],
+            "origin, access-control-request-method, access-control-request-headers"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["trace_id"], trace_id);
     }
 }

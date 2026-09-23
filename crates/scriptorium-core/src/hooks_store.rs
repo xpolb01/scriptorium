@@ -425,7 +425,7 @@ impl HooksStore {
     pub fn hash_raw(raw: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(raw.as_bytes());
-        format!("{:x}", hasher.finalize())
+        crate::hex::lower(&hasher.finalize())
     }
 
     /// Insert a hook event with `SQLITE_BUSY` retry (3 retries, 100ms backoff).

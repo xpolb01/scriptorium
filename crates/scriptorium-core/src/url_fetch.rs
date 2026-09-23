@@ -339,4 +339,17 @@ mod tests {
             doc.markdown.len()
         );
     }
+    #[test]
+    fn padded_absolute_links_are_trimmed() {
+        // Held at dom_smoothie 0.17: 0.18 keeps the whitespace around an
+        // absolute href, producing `[text](< https://… >)`.
+        let html = r#"<html><head><title>T</title></head><body><article><h1>T</h1><p>Some long enough paragraph text to be kept by readability, with a <a href=" https://example.com/page ">padded link</a> in the middle of it. More text here to make it an article worth keeping around for the extractor heuristics.</p><p>Another paragraph with enough words to look like content, content, content, content, content.</p></article></body></html>"#;
+        let doc = convert(html, "https://example.com/a", Utc::now()).unwrap();
+        assert!(
+            doc.markdown
+                .contains("[padded link](https://example.com/page)"),
+            "{}",
+            doc.markdown
+        );
+    }
 }

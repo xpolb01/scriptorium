@@ -423,7 +423,7 @@ fn deterministic_dedup(kind: &str, raw_json_hash: &str) -> String {
     h.update(kind.as_bytes());
     h.update(b":");
     h.update(raw_json_hash.as_bytes());
-    format!("{:x}", h.finalize())
+    crate::hex::lower(&h.finalize())
 }
 
 /// Derive deterministic OTel-shaped `(trace_id, span_id)` from the

@@ -169,7 +169,7 @@ mod tests {
         let repo = Repository::open(dir.path()).unwrap();
         let head = repo.head().unwrap();
         assert!(head.is_branch());
-        assert_eq!(head.shorthand(), Some("main"));
+        assert_eq!(head.shorthand().ok(), Some("main"));
     }
 
     #[test]

@@ -269,7 +269,7 @@ fn safe_utf8_truncate(s: &str, max_bytes: usize) -> usize {
 fn compute_sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    crate::hex::lower(&hasher.finalize())
 }
 
 #[cfg(test)]

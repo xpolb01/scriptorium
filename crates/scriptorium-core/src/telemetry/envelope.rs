@@ -26,8 +26,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
+use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 
 /// Canonical deterministic attribute map.
@@ -273,7 +274,7 @@ impl TraceId {
     #[must_use]
     pub fn new_random() -> Self {
         let mut buf = [0u8; 16];
-        OsRng.fill_bytes(&mut buf);
+        UnwrapErr(SysRng).fill_bytes(&mut buf);
         Self(buf)
     }
 
@@ -316,7 +317,7 @@ impl SpanId {
     #[must_use]
     pub fn new_random() -> Self {
         let mut buf = [0u8; 8];
-        OsRng.fill_bytes(&mut buf);
+        UnwrapErr(SysRng).fill_bytes(&mut buf);
         Self(buf)
     }
 
