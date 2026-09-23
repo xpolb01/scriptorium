@@ -1438,9 +1438,25 @@ fn type_ref(ty: &TypeExpr) -> TypeRef {
     }
 }
 
+/// A store failure as a client sees it: that the store could not answer,
+/// and a reference to the log line with the details. The details (a
+/// database's schema, tables, and own errors) are the operator's.
 fn gql_error(e: &Error) -> async_graphql::Error {
-    tracing::warn!(error = %e, "ontology store error");
-    async_graphql::Error::new(e.to_string())
+    let reference = error_reference();
+    tracing::error!(error = %e, %reference, "ontology store error");
+    async_graphql::Error::new(format!(
+        "the ontology store could not answer (reference {reference}; the server log has the details)"
+    ))
+}
+
+/// An opaque reference for one logged error: unique within the process,
+/// and saying nothing about how many came before it.
+fn error_reference() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    format!("{:016x}", hasher.finish())
 }
 
 #[cfg(test)]
@@ -1736,6 +1752,49 @@ type Query {
         // A short alias fits.
         let data = run(&schema, "{ papers(first: 3) { t: title } }").await;
         assert_eq!(data["papers"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn store_failures_reach_clients_without_their_details() {
+        struct Failing;
+        #[async_trait::async_trait]
+        impl EntityStore for Failing {
+            fn describe(&self) -> String {
+                "postgres:internal_schema@$DB_URL".into()
+            }
+            async fn get(&self, _: &str, _: &str) -> Result<Option<Arc<Record>>> {
+                Err(Error::Store {
+                    store: self.describe(),
+                    message: "relation \"internal_schema.paper\" does not exist".into(),
+                })
+            }
+            async fn list(&self, _: &str, _: &ListQuery) -> Result<Vec<Arc<Record>>> {
+                Err(Error::Store {
+                    store: self.describe(),
+                    message: "permission denied for table paper".into(),
+                })
+            }
+        }
+        let schema = build_schema("research", RESEARCH, Arc::new(Failing)).unwrap();
+        let mut references = std::collections::HashSet::new();
+        for query in [
+            r#"{ paper(id: "x") { title } }"#,
+            "{ papers(first: 1) { title } }",
+            r#"{ _entities(representations: [{__typename: "Paper", id: "x"}]) { ... on Paper { title } } }"#,
+        ] {
+            let response = execute(&schema, query.into()).await;
+            assert!(!response.errors.is_empty(), "{query}");
+            for error in &response.errors {
+                let message = &error.message;
+                assert!(message.contains("could not answer"), "{query}: {message}");
+                for detail in ["internal_schema", "permission", "relation", "DB_URL"] {
+                    assert!(!message.contains(detail), "{query}: {message}");
+                }
+                references.insert(message.clone());
+            }
+        }
+        // Each failure gets its own reference.
+        assert_eq!(references.len(), 3, "{references:?}");
     }
 
     #[tokio::test]

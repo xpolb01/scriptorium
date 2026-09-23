@@ -404,7 +404,9 @@ on a wildcard address (`0.0.0.0`, `::`); bind a wildcard with
 `serve.base_url` set to the address it is reached at. `compose --out` also
 checks that every store is reachable (the database, its tables), unless
 `--offline`; `serve` always does, before it publishes a supergraph or
-accepts a request.
+accepts a request. A store that fails later, while answering, gives the
+client only a generic error with a reference; `serve` logs the details
+(for a database, its own error, schema, and tables) under that reference.
 
 All commands read from a git revision (`--rev`, default `HEAD`). Pass
 `--worktree` to read uncommitted files while editing (`list`, `check`, and
