@@ -50,7 +50,9 @@ backoff.workspace = true
 chrono.workspace = true
 
 # URL ingest pipeline (fetch + readability + html→md). Used by `core::url_fetch`.
-dom_smoothie = "0.18.2"
+# Held at 0.17: 0.18 keeps surrounding whitespace in absolute link URLs, so
+# ingested pages would get `[text](< https://… >)` links.
+dom_smoothie = "0.17.0"
 html2md = { package = "fast_html2md", version = "0.0.63" }
 tempfile = "3.27.0"
 

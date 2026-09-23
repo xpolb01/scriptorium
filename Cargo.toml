@@ -29,7 +29,9 @@ serde_yml = "0.0.12"
 toml = "1.1.6"
 
 # Frontmatter
-gray_matter = { version = "0.3.2", default-features = false, features = ["yaml"] }
+# Held at 0.2: 0.3's YAML parser (yaml-rust2) reads unquoted `True`/`False`
+# as booleans, which makes pages titled `True` unparseable.
+gray_matter = { version = "0.2.9", default-features = false, features = ["yaml"] }
 
 # Markdown + links
 pulldown-cmark = { version = "0.13.4", default-features = false }
