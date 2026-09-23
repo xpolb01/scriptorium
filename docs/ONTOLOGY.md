@@ -1,7 +1,6 @@
 # Federated ontology (experimental)
 
-> Status: **experiment** on `feat/no-ticket/git-federated-ontology`. Formats
-> and commands may change without notice.
+> Status: **experiment**. Formats and commands may change without notice.
 
 Scriptorium's wiki is untyped: pages, tags, and a small fixed vocabulary of
 `relations`. This experiment adds a typed **ontology** layer on top of the
@@ -97,7 +96,8 @@ owners = ["@xpolb01"]
 
 # Local sub-ontology: served by `scriptorium-ontology serve`.
 [storage]
-kind = "git"          # YAML records in git (default data_dir = "data"; a relative path inside the sub-ontology)
+kind = "git"          # YAML records in git (default data_dir = "data", a relative path inside the sub-ontology);
+                      # also "markdown", "postgres", "dynamodb" (see below)
 
 # …or a remote sub-ontology served elsewhere (exactly one of the two):
 # [remote]
@@ -105,8 +105,9 @@ kind = "git"          # YAML records in git (default data_dir = "data"; a relati
 ```
 
 For a remote sub-ontology, `schema.graphql` is a pinned snapshot of the
-remote subgraph's SDL. Composition always reads the pinned copy, so a
-remote schema change shows up as a git diff before it reaches the gateway.
+remote subgraph's SDL (see [Remote sub-ontologies](#remote-sub-ontologies)).
+Composition always reads the pinned copy, so a remote schema change shows
+up as a git diff before it reaches the gateway.
 
 ### `schema.graphql`
 
@@ -183,6 +184,154 @@ every X. `check` reports a reference to a key an owner lacks
 (`ontology.record.orphan`): an extension's record does not make the entity
 exist.
 
+### Markdown notes
+
+`storage.kind = "markdown"` makes each `.md` file (searched recursively)
+one entity, with its YAML frontmatter as the fields:
+
+```toml
+[storage]
+kind = "markdown"
+dir = "pages"            # relative to the sub-ontology; "../../wiki" reads the vault's pages
+type = "Topic"           # or type_field = "type" to read each note's type from frontmatter
+key = "stem"             # the file name; or "frontmatter:id"
+body_field = "body"      # optional: receives the markdown body
+links_field = "related"  # optional: receives the keys of the notes the body links to
+```
+
+A frontmatter string that is exactly one `[[wikilink]]` names another note
+and becomes that note's key; links resolve by file stem, ignoring case. A
+frontmatter relation that names no note keeps its text as the key (an
+entity elsewhere, or a dangling reference `check` reports), and one naming
+an ambiguous stem (two notes share it) is an error, never a guess.
+`links_field` lists only notes: a body link to a note that does not exist
+(yet), or to an ambiguous stem, adds nothing, since body text links freely. Body links skip code and
+`![[embeds]]`. With `links_field`, backlinks are an ordinary
+`@inverse(of: "related")`. Frontmatter opened with `---` must be closed by another `---` line; an
+unclosed block is an error rather than body text. `check` reads notes
+leniently: frontmatter the
+schema does not declare (Obsidian's `tags`, `aliases`, …) is ignored, but
+declared fields must have their declared types. `body_field` and
+`links_field` must name stored fields the notes' type declares (a `String`,
+and a list of entities), or `check` fails: a misspelling would fill a
+field nothing reads; and with `type_field`, a note whose type does not
+declare them may not have a body or links. The store fills the key
+field, `body_field`, and `links_field` itself, so a note whose frontmatter
+sets one of them differently (`id: bar` in `foo.md` keyed by stem) is an
+error, and is not served. A markdown sub-ontology
+owns its types the way a git one does: its notes are the entities. `init`
+scaffolds `notes`, a markdown sub-ontology of topics that link papers.
+
+### Postgres records
+
+`storage.kind = "postgres"` (build with `--features postgres`) reads one
+table per entity type:
+
+```toml
+[storage]
+kind = "postgres"
+url_env = "RESEARCH_DB_URL"  # variable holding the connection string; never commit the URL
+schema = "public"            # default
+[storage.tables]
+Paper = "papers"             # default: the type name in snake_case (`PaperKind` → `paper_kind`)
+```
+
+Columns are named exactly like the fields (quote camelCase: `"createdAt"`);
+the key column is the entity's key field. Only the key and the columns of
+declared stored fields are read, so column-level `SELECT` grants on those
+are enough. The key, relation, and `ID` columns are read as text, so a wide
+`numeric` keeps every digit. Relations hold target keys in
+`text`, `text[]`, `integer`, or `integer[]` columns; `jsonb` columns hold
+value objects. Keys compare as text. Schema, table, and column names are at
+most 63 bytes, the most Postgres keeps (it cuts longer ones). Only types the sub-ontology stores
+fields of need a table: one it merely extends with derived fields reads as
+empty. Two types may not read the same table. `serve` checks at startup
+that every table exists with its key column declared unique and `NOT NULL`
+(a `PRIMARY KEY`, or a valid unique index), and that it can read the rows;
+views are refused, since they cannot guarantee unique keys. A duplicate or
+missing key read anyway is an error, never a guess.
+
+Any server other than a local one (`localhost`, a loopback address, a Unix
+socket; judged by the address actually contacted, so a `hostaddr` counts
+over its `host`) is reached over TLS, with its certificate and name verified against
+the system trust store: `sslmode=disable` is refused there, and `prefer`
+(the default) means `require`, so a server without TLS fails instead of
+downgrading. A local server is reached without TLS unless the connection
+string says `sslmode=require`. (`verify-full` is how `require` behaves
+here; write `require`.)
+
+### DynamoDB items
+
+`storage.kind = "dynamodb"` (build with `--features dynamodb`) keeps a
+sub-ontology's instances in one table:
+
+```toml
+[storage]
+kind = "dynamodb"
+table = "ontology-research"
+region = "eu-central-1"                          # optional; default from the AWS config
+endpoint_url_env = "ONTOLOGY_DYNAMODB_ENDPOINT"  # optional; unset = the AWS endpoint; https, or http to this machine
+```
+
+The table's only key is a HASH key `pk` (S) holding `"<Type>#<key>"`. Each
+item also has `type` (S) and one attribute per field. Relations hold target
+keys as S/N values, lists, or SS/NS sets (an integer wider than 64 bits, up
+to DynamoDB's 38 digits, is kept as its exact digits, and a `Float` field
+reads it as a float). Keys are strings or integers, so a decimal N in a
+relation is not a key: following it is an error, and inverse relations
+never list it. `pk` and `type` are reserved. An
+item may repeat its key in the key attribute (`id`), but it must match
+`pk`.
+Credentials come from the standard AWS chain, and `serve` checks the key
+schema at startup and makes one `GetItem` and one `Scan`, so credentials
+that can describe the table but not read it fail there. Lookups use `GetItem`; lists and `@inverse` relations
+scan the table, reading items by `type` or by `pk` prefix, so an item whose
+two disagree is an error rather than a silent gap.
+
+### Remote sub-ontologies
+
+```sh
+scriptorium-ontology add-remote partner https://partner.example.com/graphql \
+  --header Authorization=PARTNER_TOKEN
+scriptorium-ontology pull --dry-run   # what changed upstream, as a diff
+scriptorium-ontology pull             # refresh every remote (or name some)
+```
+
+`add-remote` fetches the subgraph's `_service { sdl }`, checks that it
+composes with the ontology at `HEAD`, writes
+`ontology/<name>/{subgraph.toml,schema.graphql}`, and commits them; it
+writes nothing if HEAD moved or the directory appeared while the remote
+answered, never writes over an existing file, and removes the directory
+again if the commit fails. `pull`
+refreshes pinned schemas; it writes nothing unless every fetch succeeds and
+the new set composes, and it refuses to overwrite a remote's directory that
+has uncommitted changes. It replaces every changed schema or none: nothing
+is written if HEAD or a pinned schema changed while the remotes answered,
+and a failed write, rename, or commit puts the previous pins back (each
+original is kept beside its replacement until the commit lands; staged
+files are created exclusively, under names no one can predict). Both
+commands commit only onto the commit they checked against, and run one at a
+time per clone (a lock in the git directory; `pull --dry-run` only reads). Both skip the commit when unrelated changes are
+staged, and take `--no-commit`.
+
+`--header NAME=ENV` sends header `NAME` with the value of `$ENV`. The
+binding (header and variable *names*, and the URL it was made for) stays
+in this clone's git directory, `.git/scriptorium-ontology/remotes.toml`
+(replaced whole on every change, never truncated in place), keyed by the
+remote's directory and URL, so two ontologies in one repository, or linked
+worktrees pinning one remote at different URLs, keep their own;
+nothing about credentials is committed. `pull` sends a remote's bound
+headers only while its manifest still points at that URL: a commit that
+repoints a remote gets an error instead, until you bind again with
+`pull <name> --header …`. A new binding is saved before the pin it
+opens is committed, and put back as it was if that fails, so no pin lands
+without its credential. Remote URLs may not carry a user, a password, a
+query, or a fragment (they are committed and copied into the supergraph).
+Headers go over plain `http` only to a loopback host, and then never
+through a proxy; redirects are not followed, and a response is capped at
+8 MiB. The supergraph carries no
+headers: give the gateway its own credentials for the remote.
+
 ## Install
 
 The ontology is its own Cargo workspace and binary, `scriptorium-ontology`.
@@ -192,20 +341,28 @@ across a workspace: linked into `scriptorium`, it would change
 scriptorium-core's JSON key order, and with it page content hashes.
 
 ```sh
-cargo install --path crates/scriptorium-ontology
+cargo install --path crates/scriptorium-ontology                      # git and markdown storage
+cargo install --path crates/scriptorium-ontology --features postgres,dynamodb
 # or, for development:
 cargo test --manifest-path crates/scriptorium-ontology/Cargo.toml
 ```
+
+It needs Rust 1.94.1 or newer. The database adapters' integration tests
+run when `SCRIPTORIUM_ONTOLOGY_TEST_POSTGRES_URL` (a disposable database)
+or `SCRIPTORIUM_ONTOLOGY_TEST_DYNAMODB_ENDPOINT` (DynamoDB Local) is set,
+and skip otherwise.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `scriptorium-ontology init` | Scaffold the example ontology (`core`, `research`, `software`) and commit it |
+| `scriptorium-ontology init` | Scaffold the example ontology (`core`, `research`, `software`, `notes`) and commit it |
 | `scriptorium-ontology list` | Sub-ontologies at a revision: storage, owners, types |
 | `scriptorium-ontology compose` | Compose the supergraph (`--out`, `--api` for the client-facing schema) |
 | `scriptorium-ontology check` | Composition + schema + git-record validation; non-zero exit on errors |
 | `scriptorium-ontology serve` | Serve local sub-ontologies as Federation v2 subgraphs over HTTP |
+| `scriptorium-ontology add-remote <name> <url>` | Pin a remote subgraph's schema as a sub-ontology and commit it |
+| `scriptorium-ontology pull [<name>…]` | Refresh pinned remote schemas (`--dry-run` shows the diff) |
 
 `compose` and `serve` refuse to run when any sub-ontology fails to load (a
 malformed `subgraph.toml`, a missing schema), and `compose` also refuses
@@ -220,18 +377,20 @@ only records: restart it at the new commit first, or let
 `serve --supergraph` publish. Nothing
 listening yet (connection refused) is only a note; any other failure,
 TLS included, refuses, since then nothing is known about what runs there.
-It also asks each remote sub-ontology what it serves (no credentials are
-sent) and refuses when that is no longer the pinned `schema.graphql`, or
-when the remote cannot be asked. `--offline` skips both questions.
-`serve --supergraph` asks the remotes the same before it writes, and once
-it listens it asks its own subgraphs at the base URL the supergraph routes
-to: a `serve.base_url` that reaches another (older) server, or nothing, is
-refused. `serve --supergraph --offline` skips both. An answer to any of
-these questions that fails (not 2xx), or is larger than 8 MiB, refuses
-publishing. So does, even `--offline`, a subgraph URL a gateway cannot
-connect to: not an absolute http(s) URL, or on a wildcard address
-(`0.0.0.0`, `::`); bind a wildcard with `serve.base_url` set to the address
-it is reached at.
+It also asks each remote sub-ontology what it serves (sending the headers
+bound to it, if any, the way `pull` does) and refuses when that is no
+longer the pinned `schema.graphql`, or when the remote cannot be asked.
+`--offline` skips both questions. `serve --supergraph` asks the remotes the
+same before it writes, and once it listens it asks its own subgraphs at the
+base URL the supergraph routes to: a `serve.base_url` that reaches another
+(older) server, or nothing, is refused. `serve --supergraph --offline`
+skips both. An answer to any of these questions that fails (not 2xx), or
+is larger than 8 MiB, refuses publishing. So does, even `--offline`, a
+subgraph URL a gateway cannot connect to: not an absolute http(s) URL, or
+on a wildcard address (`0.0.0.0`, `::`); bind a wildcard with
+`serve.base_url` set to the address it is reached at. `serve` also checks
+that every store is reachable (the database, its tables) before it
+publishes a supergraph or accepts a request.
 
 All commands read from a git revision (`--rev`, default `HEAD`). Pass
 `--worktree` to read uncommitted files while editing (`list`, `check`, and
@@ -249,7 +408,7 @@ directory; `init` never falls back to the default vault.
 ### Running a federated query
 
 ```sh
-scriptorium-ontology -C ~/onto init          # example: core, research, software
+scriptorium-ontology -C ~/onto init          # example: core, research, software, notes
 scriptorium-ontology -C ~/onto serve --supergraph /tmp/supergraph.graphql
 npx @graphql-hive/gateway supergraph /tmp/supergraph.graphql
 curl -s localhost:4000/graphql -H 'content-type: application/json' \
@@ -309,6 +468,11 @@ the schema `compose` composed. Subgraphs do not answer introspection
 - **Inverse relations do not paginate.** `@inverse` lookups use a reverse
   index built per commit on first use (git storage), and more than 1000
   matches is a query error rather than a silently truncated list.
+- **Database adapters.** Postgres integer-key lookups and `@inverse`
+  relations scan the table, and lists follow the database's collation;
+  client certificates are not supported. DynamoDB lists and `@inverse`
+  relations scan the whole table. Keep database-backed sub-ontologies small
+  for now.
 - **Missing entities.** `async-graphql`'s dynamic executor cannot return a
   `null` member of `_entities`, so the HTTP handler replaces missing owned
   entities with `null` after execution (one error each, at
@@ -367,6 +531,10 @@ the schema `compose` composed. Subgraphs do not answer introspection
    be moved that way, since nothing is stored to compare, and neither can a
    relation the old sub-ontology derives an inverse from, which would keep
    reading its records.
+7. **Storage** — database-backed sub-ontologies' settings are checked the
+   way `serve` opens them, without connecting (`ontology.storage`): a
+   `tables` entry for a type the sub-ontology does not store, a DynamoDB
+   field named `pk` or `type`, or a build without the storage's feature.
 
 ## Why these libraries
 
@@ -382,14 +550,13 @@ the schema `compose` composed. Subgraphs do not answer introspection
 
 ## Roadmap
 
-1. Registry, composition, checks, git-backed subgraph serving. *(this
-   iteration)*
-2. Markdown storage (typed notes; a read-only `Page` entity bridging the
-   wiki).
-3. Remote sub-ontologies: `ontology add-remote <name> <url>` and
-   `ontology pull` pin a remote subgraph's SDL into git.
-4. Postgres and DynamoDB storage adapters.
-5. Mutations as validated git commits; branch-targeted writes as ontology
+1. Registry, composition, checks, git-backed subgraph serving.
+   *(iteration 1)*
+2. Markdown, Postgres, and DynamoDB storage; remote sub-ontologies pinned
+   with `add-remote` and `pull`. *(iteration 2)*
+3. A read-only `Page` entity over the vault's wiki pages (markdown storage
+   with `dir = "../../wiki"`, `key = "frontmatter:id"`).
+4. Mutations as validated git commits; branch-targeted writes as ontology
    change proposals; `ontology diff <rev> <rev>` with breaking-change
    classification.
-6. MCP tools and lint integration.
+5. MCP tools and lint integration.
