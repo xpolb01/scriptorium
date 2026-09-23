@@ -26,6 +26,7 @@ use async_trait::async_trait;
 
 use crate::error::{Error, Result};
 use crate::manifest::StorageConfig;
+use crate::model::SubOntologyModel;
 use crate::registry::SubOntology;
 use crate::snapshot::Snapshot;
 
@@ -112,10 +113,9 @@ pub trait EntityStore: Send + Sync {
     }
 }
 
-/// Open the store a local sub-ontology's manifest asks for.
-///
-/// `key_fields` maps each entity type to its key field so adapters can
-/// return records that include their own key.
+/// Open the store a local sub-ontology's manifest asks for, for the
+/// entity types `model` declares (adapters return records that include
+/// their own key).
 ///
 /// Opening never touches the network: database stores connect lazily (see
 /// [`EntityStore::ready`]).
@@ -123,8 +123,12 @@ pub fn open_store(
     sub: &SubOntology,
     storage: &StorageConfig,
     snapshot: Arc<dyn Snapshot>,
-    key_fields: std::collections::BTreeMap<String, String>,
+    model: &SubOntologyModel,
 ) -> Result<Arc<dyn EntityStore>> {
+    let key_fields: std::collections::BTreeMap<String, String> = model
+        .entities()
+        .filter_map(|o| o.key_field().map(|k| (o.name.clone(), k.to_string())))
+        .collect();
     Ok(match storage {
         StorageConfig::Git { data_dir } => Arc::new(git::GitRecordStore::new(
             snapshot,
@@ -136,7 +140,30 @@ pub fn open_store(
         )?),
         #[cfg(feature = "postgres")]
         StorageConfig::Postgres(config) => {
-            Arc::new(postgres::PostgresStore::new(&sub.name, config, key_fields)?)
+            let stored = model.stored_entities().map(|o| o.name.clone()).collect();
+            let fields = model
+                .stored_entities()
+                .map(|o| {
+                    let columns = o
+                        .fields
+                        .iter()
+                        .filter(|f| f.is_stored() && f.args.is_empty())
+                        .map(|f| postgres::Column {
+                            name: f.name.clone(),
+                            text: (f.ty.named == "ID"
+                                || matches!(
+                                    model.kind_of(&f.ty.named),
+                                    crate::model::TypeKind::Entity(_)
+                                ))
+                            .then(|| f.ty.is_list()),
+                        })
+                        .collect();
+                    (o.name.clone(), columns)
+                })
+                .collect();
+            Arc::new(postgres::PostgresStore::for_types(
+                &sub.name, config, key_fields, &stored, &fields,
+            )?)
         }
         #[cfg(not(feature = "postgres"))]
         StorageConfig::Postgres(_) => return Err(feature_missing(&sub.name, "postgres")),

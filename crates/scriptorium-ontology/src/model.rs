@@ -353,6 +353,20 @@ impl SubOntologyModel {
     pub fn entities(&self) -> impl Iterator<Item = &ObjectType> {
         self.domain_objects().filter(|o| o.key.is_some())
     }
+
+    /// Entity types this sub-ontology keeps data for: every type it owns
+    /// (its records decide which entities exist), and every type it extends
+    /// with a stored field. An extension that only adds derived
+    /// (`@inverse`) or `@external` fields has nothing to store.
+    pub fn stored_entities(&self) -> impl Iterator<Item = &ObjectType> {
+        self.entities().filter(|o| {
+            let key = o.key_field();
+            !o.extension
+                || o.fields
+                    .iter()
+                    .any(|f| f.is_stored() && Some(f.name.as_str()) != key)
+        })
+    }
 }
 
 fn field_def(
@@ -766,6 +780,19 @@ type Query { product(id: ID!, lang: String @fromContext(field: "$ctx { lang }"))
         .unwrap();
         let first = &m.object("Query").unwrap().field("ts").unwrap().args[0];
         assert_eq!(first.default, Some(Json::from(10)));
+    }
+
+    #[test]
+    fn stored_entities_skip_extensions_without_stored_fields() {
+        let m = SubOntologyModel::parse(
+            r#"directive @inverse(of: String!) on FIELD_DEFINITION
+               type Paper @key(fields: "id") { id: ID! authors: [Person!]! }
+               extend type Person @key(fields: "id") { id: ID! papers: [Paper!]! @inverse(of: "authors") }
+               extend type Venue @key(fields: "id") { id: ID! rank: Int }"#,
+        )
+        .unwrap();
+        let stored: Vec<&str> = m.stored_entities().map(|o| o.name.as_str()).collect();
+        assert_eq!(stored, ["Paper", "Venue"]);
     }
 
     #[test]

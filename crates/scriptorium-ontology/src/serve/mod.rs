@@ -52,11 +52,7 @@ pub fn build_subgraphs(registry: &Registry, snapshot: &Arc<dyn Snapshot>) -> Res
         };
         let model = SubOntologyModel::parse(&sub.sdl)
             .map_err(|e| Error::serve(&sub.name, format!("{}: {e}", sub.schema_path())))?;
-        let key_fields = model
-            .entities()
-            .filter_map(|o| o.key_field().map(|k| (o.name.clone(), k.to_string())))
-            .collect();
-        let store = open_store(sub, storage, Arc::clone(snapshot), key_fields)?;
+        let store = open_store(sub, storage, Arc::clone(snapshot), &model)?;
         // Index every inverse relation up front, before any request arrives.
         for object in model.domain_objects() {
             for field in &object.fields {

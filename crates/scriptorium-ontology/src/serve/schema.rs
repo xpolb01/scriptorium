@@ -1363,6 +1363,19 @@ fn item_value(model: &SubOntologyModel, named: &str, raw: Json) -> GqlResult<Fie
             })?;
             FieldValue::value(Value::from(n))
         }
+        // Database stores hand over numbers too wide for a JSON number (a
+        // NUMERIC, a 38-digit N) as their exact text.
+        TypeKind::Scalar if named == "Float" && raw.is_string() => {
+            let text = raw.as_str().unwrap_or_default();
+            let n = text
+                .parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite())
+                .ok_or_else(|| {
+                    async_graphql::Error::new(format!("`{text}` is not a valid Float"))
+                })?;
+            FieldValue::value(Value::from(n))
+        }
         TypeKind::Scalar => FieldValue::value(
             Value::from_json(raw).map_err(|e| async_graphql::Error::new(e.to_string()))?,
         ),
