@@ -590,13 +590,10 @@ impl EntityNode {
         node
     }
 
-    fn not_found(&self, store: &dyn EntityStore) -> async_graphql::Error {
-        async_graphql::Error::new(format!(
-            "{}:{} does not exist in {}",
-            self.type_name,
-            self.key,
-            store.describe()
-        ))
+    /// Which store was asked is the operator's to know, not the client's:
+    /// a database store names its schema or table.
+    fn not_found(&self) -> async_graphql::Error {
+        async_graphql::Error::new(format!("{}:{} does not exist", self.type_name, self.key))
     }
 
     fn loaded(type_name: &str, key: String, record: Arc<Record>) -> Self {
@@ -622,7 +619,7 @@ impl Node {
         let len = |record: &Record| record.get(field).and_then(Json::as_array).map(Vec::len);
         match self {
             Node::Inline(map) => Ok(len(map)),
-            Node::Entity(entity) if entity.missing => Err(entity.not_found(store)),
+            Node::Entity(entity) if entity.missing => Err(entity.not_found()),
             Node::Entity(entity) => Ok(entity.record(store).await?.and_then(|r| len(&r))),
         }
     }
@@ -638,7 +635,7 @@ impl Node {
             Node::Inline(map) => Ok(map.get(field).cloned()),
             Node::Entity(entity) => {
                 if entity.missing {
-                    return Err(entity.not_found(store));
+                    return Err(entity.not_found());
                 }
                 if key_field == Some(field) {
                     return Ok(Some(Json::String(entity.key.clone())));
@@ -860,14 +857,20 @@ fn stored_field(rt: &Arc<Runtime>, parent: &ObjectType, field: &FieldDef) -> Fie
                 // An absent list reads as empty; an explicit `null` stays null.
                 None if ty.is_list() => Ok(Some(FieldValue::list(Vec::<FieldValue>::new()))),
                 None | Some(Json::Null) if ty.non_null => {
-                    // Say which entity and store instead of a bare non-null error.
+                    // Say which entity instead of a bare non-null error; which
+                    // store holds it (a schema, a table) goes to the log.
                     let subject = match node {
                         Node::Entity(e) => format!("{}:{}", e.type_name, e.key),
                         Node::Inline(_) => format!("a `{parent_name}` value"),
                     };
+                    tracing::warn!(
+                        store = %rt.store.describe(),
+                        %subject,
+                        field = %format!("{parent_name}.{name}"),
+                        "a required field has no stored value"
+                    );
                     Err(async_graphql::Error::new(format!(
-                        "{subject} has no value for required field `{parent_name}.{name}` in {}",
-                        rt.store.describe()
+                        "{subject} has no value for required field `{parent_name}.{name}`"
                     )))
                 }
                 None | Some(Json::Null) => Ok(None),
@@ -942,7 +945,7 @@ fn inverse_field(
                 ));
             };
             if entity.missing {
-                return Err(entity.not_found(rt.store.as_ref()));
+                return Err(entity.not_found());
             }
             let query = ListQuery {
                 references: Some((of.clone(), entity.key.clone())),
@@ -1198,7 +1201,7 @@ async fn resolve_entities<'a>(
         } else {
             let node = EntityNode::missing(type_name, key);
             if let Some(state) = state {
-                let message = node.not_found(rt.store.as_ref()).message;
+                let message = node.not_found().message;
                 // Its error names the field by its alias, which is as long
                 // as the client likes: charged before it is copied.
                 charge_bytes(
@@ -1618,7 +1621,7 @@ type Query {
             assert!(
                 error
                     .message
-                    .contains(&format!("{typename}:missing does not exist in git:")),
+                    .ends_with(&format!("{typename}:missing does not exist")),
                 "{}",
                 error.message
             );
@@ -1795,6 +1798,43 @@ type Query {
         }
         // Each failure gets its own reference.
         assert_eq!(references.len(), 3, "{references:?}");
+    }
+
+    #[tokio::test]
+    async fn missing_entities_and_values_do_not_name_the_store() {
+        /// Knows one paper, stored without its required `title`.
+        struct Sparse;
+        #[async_trait::async_trait]
+        impl EntityStore for Sparse {
+            fn describe(&self) -> String {
+                "postgres:internal_schema@$DB_URL".into()
+            }
+            async fn get(&self, _: &str, key: &str) -> Result<Option<Arc<Record>>> {
+                Ok((key == "x").then(|| {
+                    let mut record = Record::new();
+                    record.insert("id".into(), Json::String("x".into()));
+                    Arc::new(record)
+                }))
+            }
+            async fn list(&self, _: &str, _: &ListQuery) -> Result<Vec<Arc<Record>>> {
+                Ok(Vec::new())
+            }
+        }
+        let schema = build_schema("research", RESEARCH, Arc::new(Sparse)).unwrap();
+        for (query, expected) in [
+            (
+                r#"{ paper(id: "x") { title } }"#,
+                "Paper:x has no value for required field `Paper.title`",
+            ),
+            (
+                r#"{ _entities(representations: [{__typename: "Paper", id: "gone"}]) { ... on Paper { title } } }"#,
+                "Paper:gone does not exist",
+            ),
+        ] {
+            let response = execute(&schema, query.into()).await;
+            let messages: Vec<&str> = response.errors.iter().map(|e| e.message.as_str()).collect();
+            assert_eq!(messages, [expected], "{query}");
+        }
     }
 
     #[tokio::test]

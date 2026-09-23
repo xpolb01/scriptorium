@@ -1715,13 +1715,11 @@ type Query {
             ]})
         );
         assert_eq!(response.errors.len(), 1, "{:?}", response.errors);
-        assert!(
-            response.errors[0].message.contains(&format!(
-                "Paper:missing does not exist in postgres:{}@$",
-                db.schema
-            )),
+        // The schema and the variable naming the database stay out of it.
+        assert_eq!(
+            response.errors[0].message, "Paper:missing does not exist",
             "{}",
-            response.errors[0].message
+            db.schema
         );
         db.finish().await;
     }

@@ -835,8 +835,8 @@ async fn serves_a_subgraph_from_a_dynamodb_manifest() {
     );
     assert_eq!(response.errors.len(), 1, "{:?}", response.errors);
     assert_eq!(
-        response.errors[0].message,
-        format!("Paper:missing does not exist in dynamodb:{}", table.name)
+        response.errors[0].message, "Paper:missing does not exist",
+        "the table is the operator's to know"
     );
     table.delete().await;
 }
