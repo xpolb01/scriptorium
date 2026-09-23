@@ -663,6 +663,10 @@ async fn add_remote(
     let dir = crate::layout::normalize_dir(dir);
     let sub_dir = crate::layout::join(&dir, name);
     crate::scaffold::confine(root, &sub_dir).into_diagnostic()?;
+    // The pins lock and the header bindings live in the git directory, so
+    // a directory that is not a repository yet becomes one first, as the
+    // pin's commit would make it.
+    crate::snapshot::ensure_repository(root).into_diagnostic()?;
     let _pins = lock_pins(root)?;
     let registry = head_registry(root, &dir)?;
     if registry.get(name).is_some() || root.join(&sub_dir).exists() {

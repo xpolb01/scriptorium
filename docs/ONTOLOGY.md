@@ -314,7 +314,9 @@ composes with the ontology at `HEAD`, writes
 `ontology/<name>/{subgraph.toml,schema.graphql}`, and commits them; it
 writes nothing if HEAD moved or the directory appeared while the remote
 answered, never writes over an existing file, and removes the directory
-again if the commit fails.
+again if the commit fails. In a directory that is not a git repository
+yet, it starts one first, as its commit would: the lock below and header
+bindings live in the git directory.
 
 `pull` refreshes pinned schemas; it writes nothing unless every fetch
 succeeds and the new set composes, and it refuses to overwrite a remote's

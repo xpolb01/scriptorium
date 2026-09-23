@@ -1207,6 +1207,37 @@ fn add_remote_pins_a_schema_but_not_its_credential() {
 }
 
 #[test]
+fn add_remote_with_headers_starts_a_repository_where_there_is_none() {
+    let home = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let fresh = parent.path().join("onto");
+    std::fs::create_dir(&fresh).unwrap();
+    let subgraph = fake_subgraph(VENUES, "Bearer s3cret");
+    let out = scriptorium(home.path(), parent.path())
+        .arg("-C")
+        .arg(&fresh)
+        .args([
+            "add-remote",
+            "venues",
+            subgraph.url.as_str(),
+            "--header",
+            "Authorization=VENUES_TOKEN",
+        ])
+        .env("VENUES_TOKEN", "Bearer s3cret")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read_to_string(fresh.join("ontology/venues/schema.graphql")).unwrap(),
+        VENUES
+    );
+    let bindings =
+        std::fs::read_to_string(fresh.join(".git/scriptorium-ontology/remotes.toml")).unwrap();
+    assert!(bindings.contains("VENUES_TOKEN"), "{bindings}");
+    assert!(head_message(&fresh).starts_with("ontology: pin remote sub-ontology venues"));
+}
+
+#[test]
 fn add_remote_refuses_credentials_in_urls_and_paths_outside_the_repo() {
     let remote = Remote::new();
     for url in [

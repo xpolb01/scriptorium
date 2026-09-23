@@ -409,6 +409,12 @@ pub fn commit_paths_onto(
     commit_index(&repo, paths, message, parent.as_ref())
 }
 
+/// Make `repo_root` a git repository if it is not one yet, as its first
+/// commit would; an existing repository is left as it is.
+pub fn ensure_repository(repo_root: &Path) -> Result<()> {
+    open_or_init(repo_root).map(|_| ())
+}
+
 fn open_or_init(repo_root: &Path) -> Result<Repository> {
     match Repository::open(repo_root) {
         Ok(repo) => Ok(repo),
