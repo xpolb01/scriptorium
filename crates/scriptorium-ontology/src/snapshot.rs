@@ -301,6 +301,37 @@ fn linked(path: &str) -> Error {
     }
 }
 
+/// Why `path` under `dir` holds none of the `what` read there, when part of
+/// it exists but is a symlink or a file: git reads do not follow symlinks,
+/// so what is behind one would read as nothing. `None` when every part is a
+/// directory, or is missing.
+pub fn not_a_directory(
+    snapshot: &dyn Snapshot,
+    dir: &str,
+    path: &str,
+    what: &str,
+) -> Result<Option<String>> {
+    let mut parent = dir.to_string();
+    for part in path.split('/').filter(|p| !p.is_empty()) {
+        let Some(entry) = snapshot.list(&parent)?.into_iter().find(|e| e.name == part) else {
+            return Ok(None);
+        };
+        let path = crate::layout::join(&parent, part);
+        if entry.is_symlink {
+            return Ok(Some(format!(
+                "`{path}` is a symlink; git reads do not follow it, so the {what} behind it would read as none"
+            )));
+        }
+        if !entry.is_dir {
+            return Ok(Some(format!(
+                "`{path}` is not a directory, so it holds no {what}"
+            )));
+        }
+        parent = path;
+    }
+    Ok(None)
+}
+
 /// The error for a file name that is not UTF-8 (shown lossily).
 fn unnamed(dir: &str, lossy: &str) -> Error {
     Error::Invalid {

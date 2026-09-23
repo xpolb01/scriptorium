@@ -982,7 +982,8 @@ fn data_root_is_readable(
     data_dir: &str,
     acc: &mut Accumulator,
 ) -> Result<bool> {
-    let Some(problem) = not_a_directory(snapshot, &sub.dir, data_dir)? else {
+    let Some(problem) = crate::snapshot::not_a_directory(snapshot, &sub.dir, data_dir, "records")?
+    else {
         return Ok(true);
     };
     acc.push(
@@ -993,28 +994,6 @@ fn data_root_is_readable(
         problem,
     );
     Ok(false)
-}
-
-fn not_a_directory(snapshot: &dyn Snapshot, dir: &str, data_dir: &str) -> Result<Option<String>> {
-    let mut parent = dir.to_string();
-    for part in data_dir.split('/').filter(|p| !p.is_empty()) {
-        let Some(entry) = snapshot.list(&parent)?.into_iter().find(|e| e.name == part) else {
-            return Ok(None);
-        };
-        let path = join(&parent, part);
-        if entry.is_symlink {
-            return Ok(Some(format!(
-                "`{path}` is a symlink; git reads do not follow it, so the records behind it would read as none"
-            )));
-        }
-        if !entry.is_dir {
-            return Ok(Some(format!(
-                "`{path}` is not a directory, so it holds no records"
-            )));
-        }
-        parent = path;
-    }
-    Ok(None)
 }
 
 fn validate_git_records(

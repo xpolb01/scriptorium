@@ -252,12 +252,20 @@ impl Settings {
     }
 
     fn load(&self, snapshot: &dyn Snapshot) -> Result<Loaded> {
+        // Notes behind a symlink would be missing, not wrong: refuse it.
+        if let Some(problem) = crate::snapshot::not_a_directory(snapshot, "", &self.dir, "notes")? {
+            return Err(Error::Invalid {
+                what: "markdown notes directory",
+                path: self.dir.clone(),
+                message: problem,
+            });
+        }
         let mut files = Vec::new();
-        Self::walk(snapshot, &self.dir, &mut files)?;
+        let mut loaded = Loaded::default();
+        Self::walk(snapshot, &self.dir, &mut files, &mut loaded.problems)?;
 
         // Pass 1: frontmatter, type, key.
         let mut parsed = Vec::new();
-        let mut loaded = Loaded::default();
         for path in files {
             match self.parse_file(snapshot, &path) {
                 Ok(note) => parsed.push(note),
@@ -347,15 +355,27 @@ impl Settings {
         Ok(loaded)
     }
 
-    fn walk(snapshot: &dyn Snapshot, dir: &str, out: &mut Vec<String>) -> Result<()> {
+    fn walk(
+        snapshot: &dyn Snapshot,
+        dir: &str,
+        out: &mut Vec<String>,
+        problems: &mut Vec<Problem>,
+    ) -> Result<()> {
         for entry in snapshot.list(dir)? {
             // Obsidian keeps its own state in dot-directories.
             if entry.name.starts_with('.') {
                 continue;
             }
             let path = join(dir, &entry.name);
-            if entry.is_dir {
-                Self::walk(snapshot, &path, out)?;
+            if entry.is_symlink {
+                // Git stores the link, not what it names, so a linked
+                // directory's notes would be missing without a word.
+                problems.push(Problem {
+                    path,
+                    message: "is a symlink; git reads do not follow it, so what it links to is not read; replace it with the note or directory".into(),
+                });
+            } else if entry.is_dir {
+                Self::walk(snapshot, &path, out, problems)?;
             } else if is_markdown(&entry.name) {
                 out.push(path);
             }
@@ -1098,5 +1118,72 @@ type Query { topic(id: ID!): Topic }
             wikilink_targets("``[[a]]`` `[[b]]` ``x ` [[c]]`` [[d]] `[[e]]"),
             ["d", "e"]
         );
+    }
+
+    /// Commit a symlink at `link` naming `target`: git stores the link.
+    #[cfg(unix)]
+    fn commit_link(root: &std::path::Path, link: &str, target: &str) {
+        std::os::unix::fs::symlink(target, root.join(link)).unwrap();
+        let repo = git2::Repository::open(root).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(link)).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "link", &tree, &[&parent])
+            .unwrap();
+    }
+
+    /// `root` at HEAD, and as its working tree.
+    #[cfg(unix)]
+    fn views(root: &std::path::Path) -> [Arc<dyn Snapshot>; 2] {
+        [
+            Arc::new(GitSnapshot::open(root, "HEAD").unwrap()),
+            Arc::new(crate::snapshot::WorktreeSnapshot::new(root)),
+        ]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_among_the_notes_are_problems_not_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        commit_files(
+            root,
+            &[("notes/a.md", "# A\n"), ("elsewhere/b.md", "# B\n")],
+            "init",
+        );
+        commit_link(root, "notes/linked", "../elsewhere");
+        commit_link(root, "notes/alias.md", "a.md");
+        for view in views(root) {
+            let s = MarkdownStore::new(view, &sub(), &config("type = \"A\""), NoteTypes::default())
+                .unwrap();
+            let (notes, problems) = s.notes().unwrap();
+            let keys: Vec<&str> = notes.iter().map(|n| n.key.as_str()).collect();
+            assert_eq!(keys, ["a"]);
+            let mut linked: Vec<&str> = problems
+                .iter()
+                .filter(|p| p.message.contains("symlink"))
+                .map(|p| p.path.as_str())
+                .collect();
+            linked.sort_unstable();
+            assert_eq!(linked, ["notes/alias.md", "notes/linked"], "{problems:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_notes_directory_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        commit_files(root, &[("real/a.md", "# A\n")], "init");
+        commit_link(root, "notes", "real");
+        for view in views(root) {
+            let s = MarkdownStore::new(view, &sub(), &config("type = \"A\""), NoteTypes::default())
+                .unwrap();
+            let err = s.notes().unwrap_err().to_string();
+            assert!(err.contains("`notes` is a symlink"), "{err}");
+        }
     }
 }

@@ -211,7 +211,9 @@ inline code (`` ` `` or ``` `` ```-delimited) and fenced code blocks do not
 count. Body links skip code and
 `![[embeds]]`. With `links_field`, backlinks are an ordinary
 `@inverse(of: "related")`. Frontmatter opened with `---` must be closed by another `---` line; an
-unclosed block is an error rather than body text. `check` reads notes
+unclosed block is an error rather than body text. A symlink among the
+notes, or on the way to them, is an error too: git stores the link, not
+what it names, so the notes behind it would be missing. `check` reads notes
 leniently: frontmatter the
 schema does not declare (Obsidian's `tags`, `aliases`, …) is ignored, but
 declared fields must have their declared types. `body_field` and
