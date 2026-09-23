@@ -34,7 +34,7 @@ use crate::telemetry::resource::Resource;
 use crate::telemetry::schema::apply_migrations;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use rand::Rng;
+use rand::RngExt as _;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -545,7 +545,7 @@ impl TelemetryStore {
         let body_bytes = log.body.as_bytes();
         let take = body_bytes.len().min(256);
         hasher.update(&body_bytes[..take]);
-        format!("{:x}", hasher.finalize())
+        crate::hex::lower(&hasher.finalize())
     }
 
     /// Record a dropped event. Increments `GLOBAL_STATS.dropped_count`
@@ -623,8 +623,7 @@ impl TelemetryStore {
                 Ok(v) => return Ok(v),
                 Err(e) if is_retryable(&e) && attempt + 1 < MAX_WRITE_ATTEMPTS => {
                     GLOBAL_STATS.retry_count.fetch_add(1, Ordering::Relaxed);
-                    let jitter_ms =
-                        rand::thread_rng().gen_range(BASE_BACKOFF_MS..BASE_BACKOFF_MS * 2);
+                    let jitter_ms = rand::rng().random_range(BASE_BACKOFF_MS..BASE_BACKOFF_MS * 2);
                     let backoff = Duration::from_millis(jitter_ms * (1u64 << attempt).min(8));
                     thread::sleep(backoff);
                     attempt += 1;
@@ -1094,7 +1093,7 @@ const MARKER_ATTRS_JSON: &str = r#"{"service.name":"scriptorium-telemetry-marker
 fn marker_attrs_hash() -> String {
     let mut h = Sha256::new();
     h.update(MARKER_ATTRS_JSON.as_bytes());
-    format!("{:x}", h.finalize())
+    crate::hex::lower(&h.finalize())
 }
 
 fn ensure_marker_resource(conn: &Connection) -> rusqlite::Result<i64> {
@@ -1118,7 +1117,7 @@ fn compute_span_dedup_hash(span: &Span) -> String {
     let mut h = Sha256::new();
     h.update(span.span_id.to_string().as_bytes());
     h.update(span.start_time_unix_nano.to_le_bytes());
-    format!("{:x}", h.finalize())
+    crate::hex::lower(&h.finalize())
 }
 
 fn is_retryable(e: &rusqlite::Error) -> bool {

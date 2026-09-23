@@ -50,16 +50,16 @@ backoff.workspace = true
 chrono.workspace = true
 
 # URL ingest pipeline (fetch + readability + html→md). Used by `core::url_fetch`.
-dom_smoothie = "0.17"
-html2md = { package = "fast_html2md", version = "0.0.61" }
-tempfile = "3"
+dom_smoothie = "0.18.2"
+html2md = { package = "fast_html2md", version = "0.0.63" }
+tempfile = "3.27.0"
 
 # Optional: HNSW vector index for O(log n) nearest-neighbor search at scale.
 # Requires C++ toolchain at build time. Enable via `--features hnsw`.
-usearch = { version = "2", optional = true }
+usearch = { version = "2.26.2", optional = true }
 
 [dev-dependencies]
-pretty_assertions = "1"
-proptest = "1"
+pretty_assertions = "1.4.1"
+proptest = "1.11.0"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 git2 = { workspace = true }

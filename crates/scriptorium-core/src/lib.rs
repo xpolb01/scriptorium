@@ -26,6 +26,7 @@ pub mod eval;
 pub mod extract;
 pub mod git;
 pub mod global_config;
+mod hex;
 pub mod hooks;
 pub mod hooks_check;
 pub mod hooks_store;

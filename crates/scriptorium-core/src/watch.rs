@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use notify::{EventKind, RecursiveMode, Watcher};
+use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebouncedEvent};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -65,7 +65,6 @@ pub async fn watch(
     let mut debouncer = new_debouncer(DEBOUNCE, None, std_tx)
         .map_err(|e| Error::Other(anyhow::anyhow!("watcher setup: {e}")))?;
     debouncer
-        .watcher()
         .watch(&sources_dir, RecursiveMode::Recursive)
         .map_err(|e| Error::Other(anyhow::anyhow!("watch {}: {e}", sources_dir.display())))?;
     info!(dir = %sources_dir.display(), "watch: started");

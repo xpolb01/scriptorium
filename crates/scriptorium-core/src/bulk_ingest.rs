@@ -285,7 +285,7 @@ fn content_hash_prefix(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let digest = hasher.finalize();
-    format!("{digest:x}")[..12].to_string()
+    crate::hex::lower(&digest)[..12].to_string()
 }
 
 fn load_checkpoint(path: &Path) -> Option<Checkpoint> {

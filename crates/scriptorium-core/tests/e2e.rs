@@ -1227,7 +1227,7 @@ async fn enqueue_drain_dedup_e2e() {
         .filter_map(|oid| {
             let oid = oid.ok()?;
             let commit = repo.find_commit(oid).ok()?;
-            let msg = commit.message()?.to_string();
+            let msg = commit.message().ok()?.to_string();
             if msg.contains("e2e ingest") {
                 Some(())
             } else {

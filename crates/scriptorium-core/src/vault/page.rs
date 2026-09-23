@@ -14,7 +14,7 @@ use std::path::Path;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::{DateTime, Utc};
-use gray_matter::{engine::YAML, Matter};
+use gray_matter::{engine::YAML, Matter, Pod};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
@@ -34,7 +34,7 @@ pub struct PageId(Ulid);
 impl PageId {
     /// Generate a fresh, monotonic-time-ordered ID.
     pub fn new() -> Self {
-        Self(Ulid::new())
+        Self(Ulid::generate())
     }
 
     /// Construct from a Crockford-base32 string (the ULID textual form).
@@ -136,28 +136,36 @@ impl Page {
     /// `parse(to_markdown(p)) == p` hold for any normalized page.
     pub fn parse(path: impl Into<Utf8PathBuf>, input: &str) -> Result<Self> {
         let path = path.into();
+        let schema_mismatch = |path: &Utf8PathBuf| Error::Frontmatter {
+            path: path.clone().into_std_path_buf(),
+            message: "frontmatter does not match required schema \
+                      (id, title, created, updated)"
+                .into(),
+        };
         let matter = Matter::<YAML>::new();
-        // First pass: detect "no frontmatter at all" so we can produce a more
-        // specific error than "schema mismatch".
-        let raw = matter.parse(input);
-        if raw.data.is_none() {
+        // A YAML syntax error can never match the schema, so it gets the
+        // schema-mismatch error rather than the missing-delimiters one.
+        let Ok(raw) = matter.parse::<Pod>(input) else {
+            return Err(schema_mismatch(&path));
+        };
+        // Detect "no frontmatter at all" so we can produce a more specific
+        // error than "schema mismatch".
+        let Some(data) = raw.data else {
             return Err(Error::Frontmatter {
                 path: path.into_std_path_buf(),
                 message: "missing or malformed YAML frontmatter delimiters".into(),
             });
-        }
-        let parsed = matter
-            .parse_with_struct::<Frontmatter>(input)
-            .ok_or_else(|| Error::Frontmatter {
-                path: path.clone().into_std_path_buf(),
-                message: "frontmatter does not match required schema \
-                          (id, title, created, updated)"
-                    .into(),
-            })?;
+        };
+        // Deserialize through `serde_json::Value`, whose objects iterate in
+        // sorted key order. gray_matter's own `Pod` deserializer walks a
+        // `HashMap`, which would make the key order of nested mappings in
+        // `extra` — and so `to_markdown` / `content_hash` — nondeterministic.
+        let frontmatter: Frontmatter =
+            serde_json::from_value(pod_to_json(data)).map_err(|_| schema_mismatch(&path))?;
         Ok(Self {
             path,
-            frontmatter: parsed.data,
-            body: normalize_body(&parsed.content),
+            frontmatter,
+            body: normalize_body(&raw.content),
         })
     }
 
@@ -213,6 +221,25 @@ fn normalize_body(body: &str) -> String {
         String::new()
     } else {
         format!("{trimmed}\n")
+    }
+}
+
+/// `Pod` → `serde_json::Value`, matching the conversion `gray_matter` 0.2 used
+/// internally (non-finite floats become `null`).
+fn pod_to_json(pod: Pod) -> serde_json::Value {
+    use serde_json::Value;
+    match pod {
+        Pod::Null => Value::Null,
+        Pod::String(s) => Value::String(s),
+        Pod::Integer(i) => Value::from(i),
+        Pod::Float(f) => serde_json::Number::from_f64(f).map_or(Value::Null, Value::Number),
+        Pod::Boolean(b) => Value::Bool(b),
+        Pod::Array(items) => Value::Array(items.into_iter().map(pod_to_json).collect()),
+        Pod::Hash(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, pod_to_json(value)))
+                .collect(),
+        ),
     }
 }
 
@@ -272,6 +299,36 @@ Body text.
             Error::Frontmatter { .. } => {}
             other => panic!("expected Frontmatter, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn malformed_yaml_reports_schema_mismatch() {
+        let input = "---\nid: 01ARZ3NDEKTSV4RRFFQ69G5FAV\ntitle: [unclosed\n---\nbody\n";
+        let err = Page::parse("wiki/x.md", input).unwrap_err();
+        let Error::Frontmatter { message, .. } = err else {
+            panic!("expected Frontmatter, got {err:?}");
+        };
+        assert!(
+            message.contains("does not match required schema"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn nested_extra_mappings_render_in_sorted_key_order() {
+        // gray_matter keeps parsed mappings in a `HashMap`; the rendered
+        // frontmatter (and so `content_hash`) must not depend on its order.
+        let input = "---\nid: 01ARZ3NDEKTSV4RRFFQ69G5FAV\ntitle: T\n\
+                     created: 2026-04-06T12:00:00Z\nupdated: 2026-04-06T12:00:00Z\n\
+                     relations:\n- f: 6\n  e: 5\n  d: 4\n  c: 3\n  b: 2\n  a: 1\n---\nbody\n";
+        let rendered = Page::parse("wiki/t.md", input)
+            .unwrap()
+            .to_markdown()
+            .unwrap();
+        assert!(
+            rendered.contains("relations:\n- a: 1\n  b: 2\n  c: 3\n  d: 4\n  e: 5\n  f: 6\n"),
+            "nested mapping not rendered in sorted key order:\n{rendered}"
+        );
     }
 
     #[test]

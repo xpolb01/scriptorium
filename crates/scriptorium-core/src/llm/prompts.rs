@@ -19,7 +19,9 @@
 
 use std::fmt::Write;
 
-use schemars::{schema_for, JsonSchema};
+use schemars::generate::SchemaSettings;
+use schemars::transform::{transform_subschemas, Transform};
+use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 
 use crate::vault::Page;
@@ -50,6 +52,9 @@ use super::{CompletionRequest, Message, Role};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[serde(try_from = "IngestPlanRaw")]
+// schemars >= 1 honours `try_from` and would describe `IngestPlanRaw`;
+// `!try_from` keeps the schema on this struct (see above).
+#[schemars(!try_from)]
 pub struct IngestPlan {
     /// One-line human summary of what the source contained.
     pub summary: String,
@@ -134,6 +139,8 @@ fn derive_log_entry(summary: &str, pages: &[IngestPageAction]) -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(try_from = "IngestPageActionRaw")]
+// Describe the canonical flat shape, not the lenient raw wrapper.
+#[schemars(!try_from)]
 pub struct IngestPageAction {
     pub action: IngestAction,
     /// Vault-relative path, e.g. `wiki/concepts/attention.md`. Must end in
@@ -222,8 +229,53 @@ impl IngestPlan {
     /// JSON Schema for the ingest response, used to force structured output
     /// at providers that support it. Computed lazily via `schemars`.
     pub fn schema() -> serde_json::Value {
-        serde_json::to_value(schema_for!(IngestPlan)).expect("schemars produces valid JSON")
+        draft07_schema::<IngestPlan>()
     }
+}
+
+/// Root JSON Schema for `T`, laid out the way schemars 0.8 produced it: the
+/// draft-07 dialect (`definitions`, `#/definitions/...` refs) that the
+/// provider adapters normalize, doc-comment paragraphs reflowed onto one
+/// line, and `required` sorted. schemars 1.x defaults to draft 2020-12, keeps
+/// doc line breaks and lists `required` in field order; this keeps the schema
+/// sent to providers byte-identical across the upgrade.
+fn draft07_schema<T: JsonSchema>() -> serde_json::Value {
+    let schema = SchemaSettings::draft07()
+        .with_transform(Schemars08Layout)
+        .into_generator()
+        .into_root_schema_for::<T>();
+    serde_json::to_value(schema).expect("schemars produces valid JSON")
+}
+
+#[derive(Clone)]
+struct Schemars08Layout;
+
+impl Transform for Schemars08Layout {
+    fn transform(&mut self, schema: &mut Schema) {
+        if let Some(obj) = schema.as_object_mut() {
+            if let Some(serde_json::Value::String(desc)) = obj.get_mut("description") {
+                *desc = merge_doc_lines(desc);
+            }
+            if let Some(serde_json::Value::Array(required)) = obj.get_mut("required") {
+                required.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+            }
+        }
+        transform_subschemas(self, schema);
+    }
+}
+
+/// schemars 0.8's doc-comment handling: trim every line, then join the lines
+/// of each blank-line-separated paragraph with single spaces.
+fn merge_doc_lines(doc: &str) -> String {
+    doc.lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .split("\n\n")
+        .map(|para| para.trim().replace('\n', " "))
+        .filter(|para| !para.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// The structured response the query prompt demands from the LLM.
@@ -329,7 +381,7 @@ mod confidence_salvage_tests {
 
 impl QueryAnswer {
     pub fn schema() -> serde_json::Value {
-        serde_json::to_value(schema_for!(QueryAnswer)).expect("schemars produces valid JSON")
+        draft07_schema::<QueryAnswer>()
     }
 }
 
@@ -715,6 +767,43 @@ mod tests {
         );
         assert!(names.contains(&"summary"));
         assert!(names.contains(&"pages"));
+    }
+
+    #[test]
+    fn schemas_keep_schemars_08_layout() {
+        // The provider adapters and prompts were built on schemars 0.8
+        // output: draft-07 `definitions`, sorted `required`, one-line doc
+        // paragraphs, and the target structs rather than the `*Raw` wrappers.
+        let draft07 = "http://json-schema.org/draft-07/schema#";
+        let plan = IngestPlan::schema();
+        assert_eq!(plan["$schema"], draft07);
+        assert_eq!(
+            plan["properties"]["pages"]["items"]["$ref"],
+            "#/definitions/IngestPageAction"
+        );
+        assert_eq!(
+            plan["required"],
+            serde_json::json!(["log_entry", "pages", "summary"])
+        );
+        assert!(plan["description"].as_str().unwrap().starts_with(
+            "The structured response the ingest prompt demands from the LLM.\n\n\
+                 One plan may create zero or more new pages and update zero or more \
+                 existing ones. "
+        ));
+        let action = &plan["definitions"]["IngestPageAction"];
+        assert_eq!(
+            action["required"],
+            serde_json::json!(["action", "body", "path", "title"])
+        );
+        assert_eq!(
+            action["properties"]["path"]["description"],
+            "Vault-relative path, e.g. `wiki/concepts/attention.md`. Must end in \
+             `.md` and live under `wiki/`."
+        );
+
+        let answer = QueryAnswer::schema();
+        assert_eq!(answer["$schema"], draft07);
+        assert_eq!(answer["required"], serde_json::json!(["answer"]));
     }
 
     #[test]
