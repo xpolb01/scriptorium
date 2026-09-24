@@ -456,11 +456,16 @@ fn commit_index(
 }
 
 /// Reset the index entries for `paths` to HEAD: undoes a [`commit_paths`]
-/// that staged them but could not commit.
+/// that staged them but could not commit. Before the first commit there is
+/// no HEAD to reset to, so the entries are removed.
 pub fn unstage_paths(repo_root: &Path, paths: &[PathBuf]) -> Result<()> {
     let repo = Repository::open(repo_root)?;
-    let head = repo.head()?.peel(ObjectType::Commit)?;
-    repo.reset_default(Some(&head), paths.iter().map(PathBuf::as_path))?;
+    let head = match repo.head() {
+        Ok(head) => Some(head.peel(ObjectType::Commit)?),
+        Err(e) if matches!(e.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => None,
+        Err(e) => return Err(e.into()),
+    };
+    repo.reset_default(head.as_ref(), paths.iter().map(PathBuf::as_path))?;
     Ok(())
 }
 
@@ -611,6 +616,29 @@ mod tests {
         let err = head.read("b.txt").unwrap_err().to_string();
         assert!(err.contains("symlink"), "{err}");
         assert_eq!(head.read("a.txt").unwrap().unwrap(), b"real");
+    }
+
+    #[test]
+    fn unstaging_before_the_first_commit_clears_the_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let repo = Repository::init(root).unwrap();
+        std::fs::write(root.join("pin.txt"), "staged").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("pin.txt")).unwrap();
+        index.write().unwrap();
+        assert!(has_staged_changes(root).unwrap());
+        unstage_paths(root, &[PathBuf::from("pin.txt")]).unwrap();
+        assert!(!has_staged_changes(root).unwrap());
+        // After a commit, entries go back to what HEAD holds.
+        commit_files(root, &[("pin.txt", "committed")], "init");
+        std::fs::write(root.join("pin.txt"), "changed").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("pin.txt")).unwrap();
+        index.write().unwrap();
+        assert!(has_staged_changes(root).unwrap());
+        unstage_paths(root, &[PathBuf::from("pin.txt")]).unwrap();
+        assert!(!has_staged_changes(root).unwrap());
     }
 
     #[test]
