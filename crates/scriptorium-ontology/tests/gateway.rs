@@ -8,9 +8,12 @@
 //! - Hive Router (Rust): `cargo install --locked hive-router`, then its
 //!   `hive_router` binary;
 //! - Hive Gateway (JavaScript): `npm install @graphql-hive/gateway`, then
-//!   `node_modules/.bin/hive-gateway`.
+//!   `node_modules/.bin/hive-gateway`;
+//! - Apollo Router (Rust): the `router` binary of a release.
 //!
-//! The two plan queries with planners written apart; run the suite with each.
+//! The binary's name says which it is, or
+//! `SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY_KIND` does. Each plans queries with a
+//! planner written apart from the others'; run the suite with each.
 
 mod gateway_support;
 

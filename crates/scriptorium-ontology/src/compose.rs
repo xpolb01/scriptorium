@@ -64,7 +64,7 @@ pub fn compose(registry: &Registry, local_base_url: &str) -> Composition {
                 "# Supergraph composed by scriptorium from `{}/` at {}.\n# Generated file: recompose with `scriptorium-ontology compose`.\n\n",
                 registry.ontology_dir, registry.source
             );
-            out.supergraph = Some(header + &join_root_query(&sdl, registry));
+            out.supergraph = Some(header + &complete_definitions(&join_root_query(&sdl, registry)));
         }
         Err(e) => out.errors.push(format!("rendering supergraph failed: {e}")),
     }
@@ -163,9 +163,171 @@ fn join_root_query(supergraph: &str, registry: &Registry) -> String {
     out
 }
 
+/// The definitions of the specs a supergraph uses (link v1.0, join v0.3,
+/// inaccessible v0.2, tag v0.3), as Apollo's composition writes them: the
+/// spec, the name, and the definition.
+const SPEC_DIRECTIVES: &[(&str, &str, &str)] = &[
+    ("link", "link", "directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA"),
+    ("join", "join__graph", "directive @join__graph(name: String!, url: String!) on ENUM_VALUE"),
+    ("join", "join__type", "directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR"),
+    ("join", "join__field", "directive @join__field(graph: join__Graph, requires: join__FieldSet, provides: join__FieldSet, type: String, external: Boolean, override: String, usedOverridden: Boolean) repeatable on FIELD_DEFINITION | INPUT_FIELD_DEFINITION"),
+    ("join", "join__implements", "directive @join__implements(graph: join__Graph!, interface: String!) repeatable on OBJECT | INTERFACE"),
+    ("join", "join__unionMember", "directive @join__unionMember(graph: join__Graph!, member: String!) repeatable on UNION"),
+    ("join", "join__enumValue", "directive @join__enumValue(graph: join__Graph!) repeatable on ENUM_VALUE"),
+    ("inaccessible", "inaccessible", "directive @inaccessible on FIELD_DEFINITION | OBJECT | INTERFACE | UNION | ARGUMENT_DEFINITION | SCALAR | ENUM | ENUM_VALUE | INPUT_OBJECT | INPUT_FIELD_DEFINITION"),
+    ("tag", "tag", "directive @tag(name: String!) repeatable on FIELD_DEFINITION | OBJECT | INTERFACE | UNION | ARGUMENT_DEFINITION | SCALAR | ENUM | ENUM_VALUE | INPUT_OBJECT | INPUT_FIELD_DEFINITION | SCHEMA"),
+];
+const SPEC_TYPES: &[(&str, &str, &str)] = &[
+    ("link", "link__Import", "scalar link__Import"),
+    (
+        "link",
+        "link__Purpose",
+        "enum link__Purpose {\n  SECURITY\n  EXECUTION\n}",
+    ),
+    ("join", "join__FieldSet", "scalar join__FieldSet"),
+];
+
+/// `supergraph` as a valid GraphQL document that defines every spec it
+/// uses in full, which is what strict gateways check before they plan
+/// (Apollo Router refuses to start otherwise). graphql-composition declares
+/// the join directives that repeat without `repeatable`, defines neither
+/// `@link` nor `@inaccessible` and `@tag`, and leaves out the join
+/// directives the graph does not use. Each is completed from its spec; a
+/// definition already there is kept.
+fn complete_definitions(supergraph: &str) -> String {
+    use cynic_parser::type_system::Definition;
+    let Ok(doc) = cynic_parser::parse_type_system_document(supergraph) else {
+        return supergraph.to_string();
+    };
+    let mut directives = std::collections::HashSet::new();
+    let mut types = std::collections::HashSet::new();
+    let mut inserts: Vec<(usize, String)> = Vec::new();
+    let mut after_schema = None;
+    for definition in doc.definitions() {
+        match definition {
+            Definition::Directive(directive) => {
+                directives.insert(directive.name());
+                if !repeats(directive.name()) || directive.is_repeatable() {
+                    continue;
+                }
+                // After the closing parenthesis of the arguments (past the
+                // last one, whose default could hold one), or the name.
+                let at = match directive.arguments().next_back() {
+                    Some(last) => {
+                        let end = last.span().end;
+                        supergraph[end..].find(')').map(|at| end + at + 1)
+                    }
+                    None => Some(directive.name_span().end),
+                };
+                if let Some(at) = at {
+                    inserts.push((at, " repeatable".to_string()));
+                }
+            }
+            Definition::Type(ty) => {
+                types.insert(ty.name());
+            }
+            Definition::Schema(schema) => after_schema = Some(schema.span().end),
+            _ => {}
+        }
+    }
+    let used = used_directives(&doc);
+    // A spec in use is defined in full: Apollo's planner looks up every join
+    // directive, whether the graph uses it or not.
+    let needed = |spec: &str| {
+        SPEC_DIRECTIVES
+            .iter()
+            .any(|(of, name, _)| *of == spec && used.contains(name))
+    };
+    let missing: Vec<&str> = SPEC_DIRECTIVES
+        .iter()
+        .filter(|(spec, name, _)| needed(spec) && !directives.contains(name))
+        .chain(
+            SPEC_TYPES
+                .iter()
+                .filter(|(spec, name, _)| needed(spec) && !types.contains(name)),
+        )
+        .map(|(_, _, definition)| *definition)
+        .collect();
+    // Between the schema definition and the next one: no description can
+    // be split from what it describes there.
+    if !missing.is_empty() {
+        match after_schema {
+            Some(at) => inserts.push((at, format!("\n\n{}", missing.join("\n\n")))),
+            None => inserts.push((0, format!("{}\n\n", missing.join("\n\n")))),
+        }
+    }
+    inserts.sort_unstable_by_key(|(at, _)| *at);
+    let added: usize = inserts.iter().map(|(_, text)| text.len()).sum();
+    let mut out = String::with_capacity(supergraph.len() + added);
+    let mut from = 0;
+    for (at, text) in inserts {
+        out.push_str(&supergraph[from..at]);
+        out.push_str(&text);
+        from = at;
+    }
+    out.push_str(&supergraph[from..]);
+    out
+}
+
+/// Whether the spec defining directive `name` declares it `repeatable`:
+/// one location may carry several, like the `@join__type` of each subgraph
+/// that defines a type.
+fn repeats(name: &str) -> bool {
+    SPEC_DIRECTIVES.iter().any(|(_, spec_name, definition)| {
+        *spec_name == name && definition.contains(" repeatable on ")
+    })
+}
+
+/// The directive list of every location in `doc` that carries directives:
+/// the schema, types, fields, arguments, enum values, and input fields.
+fn directive_lists(
+    doc: &cynic_parser::TypeSystemDocument,
+) -> Vec<cynic_parser::type_system::iter::Iter<'_, cynic_parser::type_system::Directive<'_>>> {
+    use cynic_parser::type_system::{Definition, TypeDefinition};
+    let mut lists = Vec::new();
+    for definition in doc.definitions() {
+        match definition {
+            Definition::Schema(schema) | Definition::SchemaExtension(schema) => {
+                lists.push(schema.directives());
+            }
+            Definition::Type(ty) | Definition::TypeExtension(ty) => {
+                lists.push(ty.directives());
+                let fields = match ty {
+                    TypeDefinition::Object(object) => Some(object.fields()),
+                    TypeDefinition::Interface(interface) => Some(interface.fields()),
+                    _ => None,
+                };
+                for field in fields.into_iter().flatten() {
+                    lists.push(field.directives());
+                    lists.extend(field.arguments().map(|argument| argument.directives()));
+                }
+                if let TypeDefinition::Enum(definition) = ty {
+                    lists.extend(definition.values().map(|value| value.directives()));
+                }
+                if let TypeDefinition::InputObject(input) = ty {
+                    lists.extend(input.fields().map(|field| field.directives()));
+                }
+            }
+            Definition::Directive(directive) => {
+                lists.extend(directive.arguments().map(|argument| argument.directives()));
+            }
+        }
+    }
+    lists
+}
+
+/// The name of every directive `doc` uses.
+fn used_directives(doc: &cynic_parser::TypeSystemDocument) -> std::collections::HashSet<&str> {
+    directive_lists(doc)
+        .into_iter()
+        .flatten()
+        .map(|directive| directive.name())
+        .collect()
+}
+
 /// Whether the subgraph `sdl` defines (or extends) its root query type
-/// with at least one field. Read as the model reads it (cynic-parser takes
-/// descriptions on type extensions, which the scaffold writes).
+/// with at least one field. Read as the model reads it: cynic-parser takes
+/// descriptions on type extensions, which GraphQL does not allow.
 fn defines_root_query_fields(sdl: &str) -> bool {
     crate::model::SubOntologyModel::parse(sdl).is_ok_and(|model| {
         model
@@ -267,7 +429,8 @@ type Query { paper(id: ID!): Paper }
 extend schema @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
 type Person @key(fields: "id") { id: ID! nickname: String }
 "#;
-        // A description on a type extension, as the scaffold writes them.
+        // A description on a type extension, which GraphQL does not allow
+        // but cynic-parser reads.
         const SHELVES: &str = r#"
 extend schema @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
 "Shelf marks for core's Person."
@@ -322,6 +485,125 @@ type Query @tag(name: "{internal}")
             "{joined}"
         );
         cynic_parser::parse_type_system_document(&joined).unwrap();
+    }
+
+    /// What a strict gateway (Apollo Router) checks a supergraph for: every
+    /// directive it uses has a definition, one that a location carries more
+    /// than once is `repeatable`, and the join spec is defined in full.
+    fn assert_strictly_valid(supergraph: &str) {
+        use cynic_parser::type_system::Definition;
+        let doc = cynic_parser::parse_type_system_document(supergraph).unwrap();
+        let repeatable: std::collections::HashMap<&str, bool> = doc
+            .definitions()
+            .filter_map(|definition| match definition {
+                Definition::Directive(d) => Some((d.name(), d.is_repeatable())),
+                _ => None,
+            })
+            .collect();
+        for list in directive_lists(&doc) {
+            let mut seen = std::collections::HashMap::new();
+            for directive in list {
+                let name = directive.name();
+                if ["deprecated", "specifiedBy", "oneOf"].contains(&name) {
+                    continue;
+                }
+                let Some(&repeats) = repeatable.get(name) else {
+                    panic!("@{name} has no definition:\n{supergraph}");
+                };
+                let count = seen.entry(name).or_insert(0);
+                *count += 1;
+                assert!(
+                    *count == 1 || repeats,
+                    "@{name} repeats but is not repeatable:\n{supergraph}"
+                );
+            }
+        }
+        for (spec, name, _) in SPEC_DIRECTIVES {
+            if ["link", "join"].contains(spec) {
+                assert!(repeatable.contains_key(name), "no @{name}:\n{supergraph}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_supergraph_defines_every_directive_it_uses() {
+        // No enum, so graphql-composition leaves @join__enumValue out; and
+        // @inaccessible, @tag, and @override are used.
+        const VAULT: &str = r#"
+extend schema @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key", "@inaccessible", "@tag", "@override"])
+type Note @key(fields: "id") @tag(name: "public") {
+  id: ID!
+  title: String! @tag(name: "public") @tag(name: "listed")
+  draft: String @inaccessible
+}
+type Paper @key(fields: "id") { id: ID! year: Int @override(from: "research") }
+type Query { note(id: ID!): Note }
+"#;
+        let c = compose(
+            &registry(&[("core", CORE), ("research", RESEARCH), ("vault", VAULT)]),
+            "http://h:1",
+        );
+        assert!(c.is_ok(), "{:?}", c.errors);
+        let supergraph = c.supergraph.unwrap();
+        assert_strictly_valid(&supergraph);
+        assert!(
+            supergraph.contains("directive @join__enumValue("),
+            "{supergraph}"
+        );
+        // Completed once.
+        let body = supergraph.split_once("\n\n").unwrap().1;
+        assert_eq!(complete_definitions(body), body);
+    }
+
+    #[test]
+    fn definitions_are_completed_around_what_is_there() {
+        // A default holding parentheses, and a right definition to keep.
+        let supergraph = r#"schema
+  @link(url: "https://specs.apollo.dev/link/v1.0")
+  @link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+{
+  query: Query
+}
+
+"""Joins (types)."""
+directive @join__type(graph: join__Graph, key: join__FieldSet = "(id)") on OBJECT
+
+directive @join__graph(name: String!, url: String) on ENUM_VALUE
+
+scalar join__FieldSet
+
+enum join__Graph {
+  CORE @join__graph(name: "core", url: "http://h:1/core/graphql")
+  RESEARCH @join__graph(name: "research", url: "http://h:1/research/graphql")
+}
+
+type Person @join__type(graph: CORE, key: "id") @join__type(graph: RESEARCH, key: "id") {
+  id: ID!
+}
+
+type Query @join__type(graph: CORE) {
+  person(id: ID!): Person
+}
+"#;
+        let completed = complete_definitions(supergraph);
+        assert!(
+            completed.contains(
+                "\"\"\"Joins (types).\"\"\"\ndirective @join__type(graph: join__Graph, key: join__FieldSet = \"(id)\") repeatable on OBJECT\n"
+            ),
+            "{completed}"
+        );
+        assert!(
+            completed
+                .contains("directive @join__graph(name: String!, url: String) on ENUM_VALUE\n"),
+            "{completed}"
+        );
+        assert_eq!(completed.matches("directive @join__graph(").count(), 1);
+        assert!(
+            completed.starts_with("schema\n  @link(url: \"https://specs.apollo.dev/link/v1.0\")\n  @link(url: \"https://specs.apollo.dev/join/v0.3\", for: EXECUTION)\n{\n  query: Query\n}\n\ndirective @link("),
+            "{completed}"
+        );
+        assert_strictly_valid(&completed);
+        assert_eq!(complete_definitions(&completed), completed);
     }
 
     #[test]

@@ -17,30 +17,60 @@ use scriptorium_ontology::{check, Registry, Snapshot};
 use serde_json::{json, Value};
 
 const GATEWAY_ENV: &str = "SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY";
+const KIND_ENV: &str = "SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY_KIND";
 
-/// Which gateway `SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY` names, by its file name.
+/// Which gateway `SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY` names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     HiveRouter,
     HiveGateway,
+    ApolloRouter,
+}
+
+impl Kind {
+    /// The kind `SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY_KIND` names, else the
+    /// one the binary's name says: `hive_router`, `hive-gateway`, or
+    /// Apollo's `router`.
+    fn of(binary: &Path) -> Self {
+        let name = std::env::var(KIND_ENV)
+            .ok()
+            .filter(|kind| !kind.is_empty())
+            .or_else(|| {
+                binary
+                    .file_stem()
+                    .map(|n| n.to_string_lossy().to_lowercase())
+            })
+            .unwrap_or_default();
+        match name.as_str() {
+            "hive-router" | "hive_router" => Self::HiveRouter,
+            "hive-gateway" | "hive_gateway" => Self::HiveGateway,
+            "apollo-router" | "router" => Self::ApolloRouter,
+            other => panic!(
+                "which gateway is {} (`{other}`)? Set {KIND_ENV} to hive-router, hive-gateway, or apollo-router",
+                binary.display()
+            ),
+        }
+    }
+
+    /// Where a started gateway says it is ready to plan.
+    fn readiness(self) -> &'static str {
+        match self {
+            Self::HiveRouter | Self::HiveGateway => "/readiness",
+            Self::ApolloRouter => "/health?ready",
+        }
+    }
 }
 
 /// The gateway binary, or `None` after a note saying why `test` skips.
 pub fn gateway(test: &str) -> Option<(PathBuf, Kind)> {
     let Some(path) = std::env::var_os(GATEWAY_ENV).filter(|p| !p.is_empty()) else {
-        eprintln!("skipping {test}: set {GATEWAY_ENV} to a Hive Router or Hive Gateway binary");
+        eprintln!(
+            "skipping {test}: set {GATEWAY_ENV} to a Hive Router, Hive Gateway, or Apollo Router binary"
+        );
         return None;
     };
     let path = PathBuf::from(path);
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    let kind = if name.contains("router") {
-        Kind::HiveRouter
-    } else {
-        Kind::HiveGateway
-    };
+    let kind = Kind::of(&path);
     Some((path, kind))
 }
 
@@ -177,7 +207,7 @@ impl Gateway {
             match ready(
                 &mut process,
                 &client,
-                &format!("{base}/readiness"),
+                &format!("{base}{}", kind.readiness()),
                 dir.path(),
             )
             .await
@@ -257,6 +287,26 @@ fn spawn(binary: &Path, kind: Kind, dir: &Path, port: u16) -> Running {
                 "--port",
                 &port.to_string(),
             ]);
+        }
+        Kind::ApolloRouter => {
+            // Queries and the health check on one port, at the path the
+            // other gateways use; introspection on, since the tests
+            // introspect; no anonymous usage reports.
+            let config = dir.join("router.yaml");
+            std::fs::write(
+                &config,
+                format!(
+                    "supergraph:\n  listen: 127.0.0.1:{port}\n  path: /graphql\n  introspection: true\nhealth_check:\n  listen: 127.0.0.1:{port}\nhomepage:\n  enabled: false\n"
+                ),
+            )
+            .unwrap();
+            command
+                .arg("--supergraph")
+                .arg(&file)
+                .arg("--config")
+                .arg(&config)
+                .args(["--log", "warn"])
+                .env("APOLLO_TELEMETRY_DISABLED", "true");
         }
     }
     Running(

@@ -22,9 +22,9 @@ source of truth, mechanical checks before anything lands:
   Federation-compliant subgraph served by someone else.
 - **Runtime is a real federation.** `scriptorium-ontology serve` exposes
   every local sub-ontology as a spec-compliant subgraph over HTTP; any
-  Federation v2 gateway (tested with Hive Gateway) routes queries across
-  local and remote sub-ontologies using the supergraph scriptorium composes
-  from git.
+  Federation v2 gateway (tested with Hive Router, Hive Gateway, and Apollo
+  Router) routes queries across local and remote sub-ontologies using the
+  supergraph scriptorium composes from git.
 
 ```mermaid
 flowchart LR
@@ -376,8 +376,11 @@ and skip otherwise.
 The gateway suites (`tests/gateway.rs`, `tests/gateway_stores.rs`) run a
 real federation gateway on the composed supergraph, so its own query
 planner decides the fetches, and skip unless
-`SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY` names one. Their planners are written
-apart, so run the suites with both:
+`SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY` names one: Hive Router, Hive Gateway,
+or Apollo Router, told apart by the binary's name (`hive_router`,
+`hive-gateway`, `router`) or by `SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY_KIND`
+(`hive-router`, `hive-gateway`, `apollo-router`). Their planners are
+written apart, so run the suites with each:
 
 ```sh
 cargo install --locked hive-router --root target/tools          # Hive Router (Rust)
@@ -386,7 +389,12 @@ SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY=$PWD/target/tools/bin/hive_router \
 npm install --prefix target/tools @graphql-hive/gateway          # Hive Gateway (JavaScript)
 SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY=$PWD/target/tools/node_modules/.bin/hive-gateway \
   cargo test --manifest-path crates/scriptorium-ontology/Cargo.toml --test gateway --test gateway_stores
+# Apollo Router (Rust): a `router` binary from github.com/apollographql/router/releases
+SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY=$PWD/target/tools/router \
+  cargo test --manifest-path crates/scriptorium-ontology/Cargo.toml --test gateway --test gateway_stores
 ```
+
+The tests run Apollo Router with its anonymous usage reports turned off.
 
 `tests/gateway.rs` plans across every sub-ontology of the example and
 through fixtures for `Int` keys, `@override`, `@inaccessible`, a remote
@@ -595,10 +603,15 @@ the schema `compose` composed. Subgraphs do not answer introspection
   dynamic schemas (MIT/Apache-2.0), which implement `_service` and
   `_entities`.
 - **Gateway:** not bundled. The supergraph is the standard `join__` format,
-  tested with Hive Router (Rust, MIT) and Hive Gateway (JavaScript, MIT).
-  graphql-composition leaves the root query type without `@join__type`,
-  which planners that follow the join spec need, so `compose` adds one for
-  each subgraph with root fields.
+  tested with Hive Router (Rust, MIT), Hive Gateway (JavaScript, MIT), and
+  Apollo Router (Rust, Elastic License 2.0, which the tests run but nothing
+  links). graphql-composition leaves the root query type without
+  `@join__type`, which planners that follow the join spec need, so
+  `compose` adds one for each subgraph with root fields. It also declares
+  the join directives that repeat without `repeatable`, and leaves out the
+  definitions of `@link`, of `@inaccessible` and `@tag`, and of the join
+  directives a graph does not use; Apollo Router refuses such a supergraph,
+  so `compose` completes them from their specs.
 
 ## Roadmap
 
