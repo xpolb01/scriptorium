@@ -23,9 +23,10 @@
 //! `url_env`; it is never logged or put in an error. The store connects on
 //! first use (`serve` calls [`EntityStore::ready`] at startup), shares one
 //! connection between all queries, and reconnects once it has closed or a
-//! query on it went unanswered for 30 s. A connection attempt gives up after
-//! its `connect_timeout` (10 s unless the connection string sets one), TLS
-//! and the startup exchange included.
+//! query on it went unanswered for 30 s (its socket is then closed, not
+//! left waiting). A connection attempt gets `connect_timeout` (10 s unless
+//! the connection string sets one) per address it may try, TLS and the
+//! startup exchange included.
 //!
 //! **TLS.** Any server other than a local one (`localhost`, a loopback
 //! address, a Unix socket) is reached over TLS (rustls), with its
@@ -86,9 +87,18 @@ pub struct PostgresStore {
     unstored: BTreeSet<String>,
     /// The connection every query shares: opened on first use, replaced
     /// once closed or once a query on it got no answer.
-    client: tokio::sync::Mutex<Option<Arc<Client>>>,
+    client: tokio::sync::Mutex<Option<Session>>,
     /// [`QUERY_TIMEOUT`]; shorter in tests.
     query_timeout: std::time::Duration,
+}
+
+/// An open connection: its client, and the task driving its socket.
+struct Session {
+    client: Arc<Client>,
+    /// Aborted when a query on it gets no answer: dropping the client is not
+    /// enough, since the task would wait for that answer, holding its socket,
+    /// as long as the server stalls.
+    driver: tokio::task::AbortHandle,
 }
 
 /// One entity type's table, and its queries.
@@ -288,15 +298,16 @@ impl PostgresStore {
     /// closed. Concurrent callers wait for one connection attempt.
     async fn client(&self) -> Result<Arc<Client>> {
         let mut slot = self.client.lock().await;
-        if let Some(client) = slot.as_ref().filter(|client| !client.is_closed()) {
-            return Ok(Arc::clone(client));
+        if let Some(session) = slot.as_ref().filter(|s| !s.client.is_closed()) {
+            return Ok(Arc::clone(&session.client));
         }
-        let client = Arc::new(self.connect().await?);
-        *slot = Some(Arc::clone(&client));
+        let session = self.connect().await?;
+        let client = Arc::clone(&session.client);
+        *slot = Some(session);
         Ok(client)
     }
 
-    async fn connect(&self) -> Result<Client> {
+    async fn connect(&self) -> Result<Session> {
         let url = std::env::var(&self.url_env).map_err(|e| {
             self.error(match e {
                 std::env::VarError::NotPresent => format!(
@@ -311,17 +322,9 @@ impl PostgresStore {
         self.connect_to(&url).await
     }
 
-    async fn connect_to(&self, url: &str) -> Result<Client> {
+    async fn connect_to(&self, url: &str) -> Result<Session> {
         let config = connection_config(&self.url_env, url).map_err(|m| self.error(m))?;
-        // tokio-postgres bounds only the socket connect by `connect_timeout`;
-        // TLS and the startup exchange get it too, per destination tried.
-        let per_destination = config
-            .get_connect_timeout()
-            .copied()
-            .unwrap_or(CONNECT_TIMEOUT);
-        let destinations = config.get_hosts().len().max(config.get_hostaddrs().len());
-        let limit =
-            per_destination.saturating_mul(u32::try_from(destinations.max(1)).unwrap_or(u32::MAX));
+        let limit = connect_budget(&config, address_count(&config).await);
         match tokio::time::timeout(limit, self.open(&config)).await {
             Ok(opened) => opened,
             Err(_) => Err(self.error(format!(
@@ -332,7 +335,7 @@ impl PostgresStore {
         }
     }
 
-    async fn open(&self, config: &Config) -> Result<Client> {
+    async fn open(&self, config: &Config) -> Result<Session> {
         let failed = |e: tokio_postgres::Error| {
             self.error(format!(
                 "connecting with `{}`: {}",
@@ -344,21 +347,25 @@ impl PostgresStore {
         if config.get_ssl_mode() == SslMode::Require {
             let tls = tls_connector().map_err(|m| self.error(m))?;
             let (client, connection) = config.connect(tls).await.map_err(failed)?;
-            drive(store, connection);
-            Ok(client)
+            Ok(Session {
+                client: Arc::new(client),
+                driver: drive(store, connection),
+            })
         } else {
             // Only a local server gets here (see `connection_config`).
             let (client, connection) = config
                 .connect(tokio_postgres::NoTls)
                 .await
                 .map_err(failed)?;
-            drive(store, connection);
-            Ok(client)
+            Ok(Session {
+                client: Arc::new(client),
+                driver: drive(store, connection),
+            })
         }
     }
 
     /// Wait for `query` over `client` for at most `query_timeout`. With no
-    /// answer by then, the request fails and the connection is dropped, so
+    /// answer by then, the request fails and the connection is closed, so
     /// the next query reconnects instead of queueing behind this one.
     async fn within<T>(
         &self,
@@ -370,11 +377,8 @@ impl PostgresStore {
             return Ok(answered);
         }
         let mut slot = self.client.lock().await;
-        if slot
-            .as_ref()
-            .is_some_and(|current| std::ptr::eq(Arc::as_ptr(current), client))
-        {
-            *slot = None;
+        if let Some(stalled) = slot.take_if(|s| std::ptr::eq(Arc::as_ptr(&s.client), client)) {
+            stalled.driver.abort();
         }
         Err(self.error(format!(
             "{what}: no answer within {}s",
@@ -729,8 +733,12 @@ fn is_local(host: &Host) -> bool {
     }
 }
 
-/// Run a connection's I/O in the background until it closes.
-fn drive<S, T>(store: String, connection: tokio_postgres::Connection<S, T>)
+/// Run a connection's I/O in the background until it closes (or the
+/// returned handle aborts it).
+fn drive<S, T>(
+    store: String,
+    connection: tokio_postgres::Connection<S, T>,
+) -> tokio::task::AbortHandle
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -739,7 +747,51 @@ where
         if let Err(e) = connection.await {
             tracing::warn!(store = %store, error = %error_chain(&e), "postgres connection closed");
         }
-    });
+    })
+    .abort_handle()
+}
+
+/// How many addresses connecting may try: each `hostaddr`; else each
+/// address a host name resolves to (one when it does not resolve, and
+/// connecting will say why); one for a socket path.
+async fn address_count(config: &Config) -> usize {
+    let (hosts, addrs, ports) = (
+        config.get_hosts(),
+        config.get_hostaddrs(),
+        config.get_ports(),
+    );
+    let mut count = 0;
+    for i in 0..hosts.len().max(addrs.len()) {
+        count += match (addrs.get(i), hosts.get(i)) {
+            (None, Some(Host::Tcp(name))) => {
+                // One port for every host, or one each (tokio-postgres's rule).
+                let port = ports
+                    .get(i)
+                    .or_else(|| ports.first())
+                    .copied()
+                    .unwrap_or(5432);
+                let lookup = tokio::net::lookup_host((name.as_str(), port));
+                match tokio::time::timeout(CONNECT_TIMEOUT, lookup).await {
+                    Ok(Ok(found)) => found.count().max(1),
+                    _ => 1,
+                }
+            }
+            _ => 1,
+        };
+    }
+    count.max(1)
+}
+
+/// How long a connection attempt may take. tokio-postgres gives each
+/// address `connect_timeout` for its socket, but TLS and the startup
+/// exchange no bound at all; the whole attempt gets `connect_timeout` per
+/// address, so a stalled handshake ends and failover keeps its time.
+fn connect_budget(config: &Config, addresses: usize) -> std::time::Duration {
+    let per_address = config
+        .get_connect_timeout()
+        .copied()
+        .unwrap_or(CONNECT_TIMEOUT);
+    per_address.saturating_mul(u32::try_from(addresses.max(1)).unwrap_or(u32::MAX))
 }
 
 /// TLS through rustls (aws-lc-rs), verifying servers against the system
@@ -977,6 +1029,36 @@ mod tests {
             config.get_connect_timeout(),
             Some(&std::time::Duration::from_secs(3))
         );
+    }
+
+    #[tokio::test]
+    async fn every_address_tried_gets_its_connect_timeout() {
+        let count = |url: &'static str| async move {
+            address_count(&connection_config("DB_URL", url).unwrap()).await
+        };
+        assert_eq!(count("host=127.0.0.1,127.0.0.1 user=u").await, 2);
+        assert_eq!(
+            count("host=a,b,c hostaddr=127.0.0.1,127.0.0.1,127.0.0.1 user=u").await,
+            3
+        );
+        assert_eq!(count("host=/tmp user=u").await, 1);
+        // Not resolvable: one attempt, which will say why.
+        assert_eq!(count("host=nowhere.invalid user=u").await, 1);
+        // A name counts every address it resolves to (`localhost` is often
+        // both ::1 and 127.0.0.1), not one per name.
+        let resolved = tokio::net::lookup_host(("localhost", 5432))
+            .await
+            .unwrap()
+            .count();
+        assert_eq!(count("host=localhost user=u").await, resolved.max(1));
+        let config =
+            connection_config("DB_URL", "postgres://u@localhost/db?connect_timeout=2").unwrap();
+        assert_eq!(
+            connect_budget(&config, 3),
+            std::time::Duration::from_secs(6)
+        );
+        let config = connection_config("DB_URL", "postgres://u@localhost/db").unwrap();
+        assert_eq!(connect_budget(&config, 2), CONNECT_TIMEOUT * 2);
     }
 
     #[tokio::test]
@@ -1535,7 +1617,7 @@ mod tests {
             admin.get_dbname().unwrap_or("postgres"),
         );
         let store = db.store(&[], &[("Secret", "id", &[])]);
-        let client = store.connect_to(&restricted).await.unwrap();
+        let client = store.connect_to(&restricted).await.unwrap().client;
         let err = store.check_tables(&client).await.unwrap_err().to_string();
         assert!(
             err.contains("cannot read") && err.contains("permission denied"),
@@ -1575,7 +1657,7 @@ mod tests {
         );
         // The schema declares `title` only: its grant is enough.
         let store = db.store(&[], &[("Note", "id", &["title"])]);
-        let client = store.connect_to(&restricted).await.unwrap();
+        let client = store.connect_to(&restricted).await.unwrap().client;
         store.check_tables(&client).await.unwrap();
         let row = client
             .query_typed(&store.tables["Note"].get, &[(&"n1", Type::TEXT)])
@@ -1710,6 +1792,7 @@ type Query { wide(id: ID!): Wide wides(first: Int): [Wide!]! }
         store.query_timeout = std::time::Duration::from_secs(1);
         assert!(store.get("Paper", "a").await.unwrap().is_some());
         let first = store.client().await.unwrap();
+        let driver = store.client.lock().await.as_ref().unwrap().driver.clone();
 
         // Another session holds the table, so reads wait for its lock: the
         // server is up, but this read gets no answer.
@@ -1735,6 +1818,16 @@ type Query { wide(id: ID!): Wide wides(first: Int): [Wide!]! }
             .to_string();
         assert!(err.contains("no answer within 1s"), "{err}");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // Its socket is closed while the lock is still held: left running,
+        // the task would wait for that answer as long as the server stalls.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !driver.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stalled connection's task still runs"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         locker.batch_execute("ROLLBACK").await.unwrap();
 
         // The stalled connection was dropped: the next read opens another.

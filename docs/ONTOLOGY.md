@@ -274,12 +274,13 @@ fails instead of downgrading. A local server is reached without TLS unless
 the connection string says `sslmode=require`. (`verify-full` is how
 `require` behaves here; write `require`.)
 
-A connection attempt gives up after the connection string's
-`connect_timeout` (10 s if it sets none), TLS and the startup exchange
-included, and a query after 30 s. The request then fails (for a client,
-with a reference), the connection is dropped, and the next request
-reconnects: a server that stalls, or a proxy that keeps a dead connection
-open, cannot hold `serve`'s startup or its requests.
+A connection attempt gets the connection string's `connect_timeout` (10 s
+if it sets none) for each address it may try, a host name's every
+resolved address included, TLS and the startup exchange included; a query
+gets 30 s. The request then fails (for a client, with a reference), the
+connection is closed, and the next request reconnects: a server that
+stalls, or a proxy that keeps a dead connection open, cannot hold
+`serve`'s startup or its requests.
 
 ### DynamoDB items
 
