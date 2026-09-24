@@ -308,7 +308,9 @@ schema at startup and makes one `GetItem` and one `Scan`, so credentials
 that can describe the table but not read it fail there. Lookups use
 `GetItem`; lists and `@inverse` relations scan the table, reading items by
 `type` or by `pk` prefix, so an item whose two disagree is an error rather
-than a silent gap.
+than a silent gap. Connecting gives up after 10 s, and each request to
+DynamoDB, retries included, after 30 s, so an endpoint that stops answering
+cannot hold `serve`'s startup or its requests.
 
 ### Remote sub-ontologies
 

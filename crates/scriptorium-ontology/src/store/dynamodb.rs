@@ -77,6 +77,14 @@ const MAX_PK_BYTES: usize = 2048;
 const READY_PROBE: &str = "scriptorium-ontology#ready";
 
 /// A sub-ontology's entities in one `DynamoDB` table.
+/// How long connecting to the endpoint may take.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one request to `DynamoDB`, retries included, may take. An
+/// endpoint that stops answering must not hold a request, or `serve`'s
+/// startup, forever; the SDK bounds only the connect by default.
+const OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct DynamoStore {
     sub: String,
     table: String,
@@ -87,6 +95,8 @@ pub struct DynamoStore {
     /// Built on first use, so opening the store needs neither network nor
     /// credentials.
     client: OnceCell<Client>,
+    /// [`OPERATION_TIMEOUT`]; shorter in tests.
+    operation_timeout: std::time::Duration,
 }
 
 impl DynamoStore {
@@ -115,6 +125,7 @@ impl DynamoStore {
             endpoint_url_env: config.endpoint_url_env.clone(),
             key_fields,
             client: OnceCell::new(),
+            operation_timeout: OPERATION_TIMEOUT,
         })
     }
 
@@ -140,7 +151,12 @@ impl DynamoStore {
     async fn client(&self) -> Result<&Client> {
         self.client
             .get_or_try_init(|| async {
-                let mut loader = aws_config::defaults(BehaviorVersion::latest());
+                let timeouts = aws_config::timeout::TimeoutConfig::builder()
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .operation_timeout(self.operation_timeout)
+                    .build();
+                let mut loader =
+                    aws_config::defaults(BehaviorVersion::latest()).timeout_config(timeouts);
                 if let Some(region) = &self.region {
                     loader = loader.region(Region::new(region.clone()));
                 }
@@ -667,6 +683,48 @@ mod tests {
     use aws_sdk_dynamodb::primitives::Blob;
     use aws_sdk_dynamodb::types::KeySchemaElement;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn an_endpoint_that_never_answers_is_given_up_on() {
+        // It accepts the connection, then says nothing.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        // Static credentials, and no config files: the lookup waits on no
+        // metadata service. Nothing else in this binary reads these.
+        let var = format!(
+            "SCRIPTORIUM_ONTOLOGY_TEST_SILENT_ENDPOINT_{}",
+            std::process::id()
+        );
+        let nowhere = std::env::temp_dir().join("scriptorium-ontology-test-no-aws-config");
+        std::env::set_var(&var, &url);
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        std::env::set_var("AWS_CONFIG_FILE", &nowhere);
+        std::env::set_var("AWS_SHARED_CREDENTIALS_FILE", &nowhere);
+        let config = DynamoConfig {
+            table: "papers".into(),
+            region: Some("eu-central-1".into()),
+            endpoint_url_env: Some(var),
+        };
+        let keys = BTreeMap::from([("Paper".to_string(), "id".to_string())]);
+        let mut store = DynamoStore::new("research", &config, keys).unwrap();
+        store.operation_timeout = std::time::Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(15), store.get("Paper", "a"))
+            .await
+            .expect("the request ends on its own")
+            .unwrap_err()
+            .to_string();
+        assert!(err.to_lowercase().contains("timeout"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(8));
+        silent.abort();
+    }
 
     fn s(value: &str) -> AttributeValue {
         AttributeValue::S(value.to_string())
