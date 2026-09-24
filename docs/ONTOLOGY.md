@@ -127,7 +127,7 @@ type Paper @key(fields: "id") {
   authors: [Person!]!
 }
 
-"research adds authorship to core's Person; core owns Person records."
+# research adds authorship to core's Person; core owns Person records.
 extend type Person @key(fields: "id") {
   id: ID!
   papers: [Paper!]! @inverse(of: "authors")
@@ -542,7 +542,11 @@ the schema `compose` composed. Subgraphs do not answer introspection
    exists.
 2. **Composition** — federation composition of every sub-ontology.
    Conflicting field types, unshareable fields defined twice, and invalid
-   keys are errors, and so is a composed ontology with no Query field.
+   keys are errors, and so is a composed ontology with no Query field. A
+   description on a type extension (`"…" extend type X`) is a warning
+   (`ontology.schema.extension_description`): GraphQL gives descriptions to
+   definitions only, and strict parsers, Apollo's composition among them,
+   reject such a schema; write a `#` comment instead.
 3. **Servability** — every local sub-ontology builds as a subgraph: one
    single-field ID/String/Int key per entity, lookup and list root fields
    only, and none of the directives the server cannot honour yet

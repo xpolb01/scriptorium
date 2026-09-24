@@ -16,7 +16,7 @@ type Topic @key(fields: "id") {
   backlinks: [Topic!]! @inverse(of: "related")
 }
 
-"notes adds topics to research's Paper."
+# notes adds topics to research's Paper.
 extend type Paper @key(fields: "id") {
   id: ID!
   topics: [Topic!]! @inverse(of: "papers")

@@ -134,6 +134,7 @@ pub fn check(snapshot: &dyn Snapshot, ontology_dir: &str) -> Result<CheckReport>
     acc.check_override_coverage();
     check_single_resolvers(&registry, &mut acc);
     check_root_fields(&registry, &mut acc);
+    check_extension_descriptions(&registry, &mut acc);
 
     let mut issues = acc.issues;
     issues.sort_by(|a, b| {
@@ -742,6 +743,40 @@ struct Resolver {
 /// A root field names no entity whose answers could be compared, so it is
 /// resolved by one sub-ontology, and cannot move with `@override` unless
 /// neither side is local (two remotes moving one is their business).
+/// GraphQL gives descriptions to definitions only: `"…" extend type X` is
+/// not GraphQL. graphql-composition and `serve` read it, but Apollo's
+/// composition and other strict parsers reject the whole schema, and each
+/// subgraph serves its schema verbatim (`_service`), so a gateway that
+/// composes from the running subgraphs could not.
+fn check_extension_descriptions(registry: &Registry, acc: &mut Accumulator) {
+    use cynic_parser::type_system::Definition;
+    for sub in &registry.sub_ontologies {
+        let Ok(doc) = cynic_parser::parse_type_system_document(&sub.sdl) else {
+            continue;
+        };
+        for definition in doc.definitions() {
+            let extended = match definition {
+                Definition::TypeExtension(ty) if ty.description().is_some() => {
+                    format!("type {}", ty.name())
+                }
+                Definition::SchemaExtension(schema) if schema.description().is_some() => {
+                    "schema".to_string()
+                }
+                _ => continue,
+            };
+            acc.push(
+                Severity::Warning,
+                "ontology.schema.extension_description",
+                Some(&sub.name),
+                Some(sub.schema_path()),
+                format!(
+                    "the description on `extend {extended}` is not GraphQL (only definitions take one), so strict parsers such as Apollo's composition reject this schema; make it a `#` comment"
+                ),
+            );
+        }
+    }
+}
+
 fn check_root_fields(registry: &Registry, acc: &mut Accumulator) {
     let is_remote = |name: &str| {
         registry
@@ -1736,6 +1771,35 @@ type Query { paper(id: ID!): Paper }
     }
 
     #[test]
+    fn descriptions_on_extensions_are_warned_about() {
+        let research = RESEARCH.replace(
+            "extend type Person",
+            "\"research adds papers to core's Person.\"\nextend type Person",
+        );
+        let report = run_with_research(&research);
+        assert_eq!(
+            rules(&report),
+            ["ontology.schema.extension_description"],
+            "{:#?}",
+            report.issues
+        );
+        let issue = &report.issues[0];
+        assert_eq!(issue.severity, Severity::Warning);
+        assert!(
+            issue.message.contains("`extend type Person`"),
+            "{}",
+            issue.message
+        );
+        // A comment there is fine, and so is a description on a definition.
+        let commented = RESEARCH.replace(
+            "extend type Person",
+            "# research adds papers to core's Person.\nextend type Person",
+        );
+        let report = run_with_research(&commented);
+        assert!(report.issues.is_empty(), "{:#?}", report.issues);
+    }
+
+    #[test]
     fn ownership_and_derivation_are_enforced() {
         let report = run(&[
             // research does not own Person.name, and papers is derived
@@ -1948,6 +2012,18 @@ extend type Person @key(fields: "id") { id: ID! rating: Int! }
             report.issues
         );
         assert_eq!(report.issues[0].severity, Severity::Warning);
+    }
+
+    /// `check` over the base files with research's schema replaced.
+    fn run_with_research(research: &str) -> CheckReport {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files: Vec<(&str, &str)> = base_files()
+            .into_iter()
+            .filter(|(p, _)| *p != "ontology/research/schema.graphql")
+            .collect();
+        files.push(("ontology/research/schema.graphql", research));
+        commit_files(dir.path(), &files, "init");
+        check(&GitSnapshot::open(dir.path(), "HEAD").unwrap(), "ontology").unwrap()
     }
 
     /// `check` over the base files with core's schema replaced, plus `extra`.
