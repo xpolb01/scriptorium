@@ -6,9 +6,10 @@
 //!   field (`type_field = "type"`).
 //! - The **key** is the file stem, or a frontmatter field
 //!   (`key = "frontmatter:id"`, e.g. scriptorium's page ULIDs).
-//! - **Fields** are the frontmatter keys. A string that is exactly a
-//!   `[[wikilink]]` names another note and is replaced by that note's key,
-//!   so Obsidian-style relations (`authors: ["[[vaswani]]"]`) just work.
+//! - **Fields** are the frontmatter keys. In a relation, a string that is
+//!   exactly a `[[wikilink]]` names a note of the relation's type and is
+//!   replaced by its key, so Obsidian-style relations
+//!   (`authors: ["[[vaswani]]"]`) just work.
 //! - `body_field` receives the markdown body; `links_field` receives the
 //!   keys of the notes the body links to, which makes backlinks an ordinary
 //!   `@inverse(of: "<links_field>")`.
@@ -16,7 +17,7 @@
 //! The whole directory is loaded once per store and indexed in memory.
 //! Files that cannot be loaded are skipped and reported by `check`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
@@ -91,9 +92,10 @@ pub struct NoteTypes {
     /// Entity type → the entity type its `links_field` lists: a body link
     /// to a note of another type is prose, not that relation.
     pub link_targets: BTreeMap<String, String>,
-    /// Entity type → the fields its schema declares. Only these hold
-    /// relations; other frontmatter (Obsidian's `aliases`, …) is ignored.
-    pub fields: BTreeMap<String, BTreeSet<String>>,
+    /// Entity type → its relations (fields typed as an entity) → the entity
+    /// type each lists. Only these resolve `[[wikilinks]]`; other
+    /// frontmatter (Obsidian's `aliases`, a `String`) is left as it is.
+    pub relations: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl NoteTypes {
@@ -119,17 +121,27 @@ impl NoteTypes {
                     .collect()
             })
             .unwrap_or_default();
-        let fields = model
+        let relations = model
             .entities()
             .map(|o| {
-                let names = o.fields.iter().map(|f| f.name.clone()).collect();
-                (o.name.clone(), names)
+                let targets = o
+                    .fields
+                    .iter()
+                    .filter(|f| {
+                        matches!(
+                            model.kind_of(&f.ty.named),
+                            crate::model::TypeKind::Entity(_)
+                        )
+                    })
+                    .map(|f| (f.name.clone(), f.ty.named.clone()))
+                    .collect();
+                (o.name.clone(), targets)
             })
             .collect();
         Self {
             key_fields,
             link_targets,
-            fields,
+            relations,
         }
     }
 }
@@ -295,11 +307,17 @@ impl Settings {
         // is ambiguous: a body link to it resolves to nothing, and a
         // frontmatter relation to it is a problem.
         let mut stems: Stems = HashMap::new();
+        // And per type: a relation links only notes of the type it lists.
+        let mut typed_stems: TypedStems = HashMap::new();
         for note in &parsed {
             stems
                 .entry(note.stem.to_lowercase())
                 .and_modify(|note| *note = None)
                 .or_insert_with(|| Some((note.key.clone(), note.type_name.clone())));
+            typed_stems
+                .entry((note.type_name.clone(), note.stem.to_lowercase()))
+                .and_modify(|key| *key = None)
+                .or_insert_with(|| Some(note.key.clone()));
         }
 
         // Pass 2: resolve links, attach body and key.
@@ -312,23 +330,8 @@ impl Settings {
             body,
         } in parsed
         {
-            // Undeclared frontmatter is ignored, as `check` ignores it, even
-            // when it names an ambiguous stem.
-            let declared = self.schema.fields.get(&type_name);
-            let mut ambiguous = Vec::new();
-            for (field, value) in &mut record {
-                if declared.is_some_and(|fields| fields.contains(field)) {
-                    resolve_wikilink_values(value, &stems, &mut ambiguous);
-                }
-            }
-            if !ambiguous.is_empty() {
-                loaded.problems.push(Problem {
-                    path,
-                    message: format!(
-                        "[[{}]] names more than one note (by file name); rename one, or link by a unique name",
-                        ambiguous.join("]], [[")
-                    ),
-                });
+            if let Err(message) = self.resolve_relations(&type_name, &mut record, &typed_stems) {
+                loaded.problems.push(Problem { path, message });
                 continue;
             }
             if let Some(field) = &self.links_field {
@@ -376,6 +379,33 @@ impl Settings {
             );
         }
         Ok(loaded)
+    }
+
+    /// Resolve the `[[wikilinks]]` in the relations of a `type_name` note,
+    /// each among notes of the type it lists. Other frontmatter is left as it
+    /// is, as `check` leaves it. `Err` says which links name several notes.
+    fn resolve_relations(
+        &self,
+        type_name: &str,
+        record: &mut Record,
+        stems: &TypedStems,
+    ) -> std::result::Result<(), String> {
+        let Some(relations) = self.schema.relations.get(type_name) else {
+            return Ok(());
+        };
+        let mut ambiguous = Vec::new();
+        for (field, value) in record.iter_mut() {
+            if let Some(target) = relations.get(field) {
+                resolve_wikilink_values(value, target, stems, &mut ambiguous);
+            }
+        }
+        if ambiguous.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{} note (by file name); rename one, or link by a unique name",
+            ambiguous.join(" note, and ")
+        ))
     }
 
     fn walk(
@@ -626,32 +656,40 @@ fn whole_wikilink(value: &str) -> Option<&str> {
     (!target.is_empty()).then_some(target)
 }
 
-/// Replace each `[[wikilink]]` value with the key of the note it names by
-/// stem. A link naming no note keeps its target as the key (another
-/// sub-ontology's entity, or a dangling reference `check` reports); one
-/// naming several notes is collected in `ambiguous`.
 /// Lowercased file stem → the one note with it (key and type), or `None`
 /// when several notes share it.
 type Stems = HashMap<String, Option<(String, String)>>;
 
+/// `(type, lowercased file stem)` → the one note of that type with it
+/// (its key), or `None` when several share it.
+type TypedStems = HashMap<(String, String), Option<String>>;
+
+/// Replace each `[[wikilink]]` in a relation listing `target`s with the key
+/// of the `target` note it names by stem. A link naming no such note keeps
+/// its text as the key (another sub-ontology's entity, or a dangling
+/// reference `check` reports), never another type's note; one naming
+/// several is collected in `ambiguous`.
 fn resolve_wikilink_values(
     value: &mut serde_json::Value,
-    stems: &Stems,
+    target: &str,
+    stems: &TypedStems,
     ambiguous: &mut Vec<String>,
 ) {
     match value {
         serde_json::Value::String(s) => {
-            if let Some(target) = whole_wikilink(s) {
-                match stems.get(&target.to_lowercase()) {
-                    Some(Some((key, _))) => s.clone_from(key),
-                    Some(None) => ambiguous.push(target.to_string()),
-                    None => *s = target.to_string(),
+            if let Some(link) = whole_wikilink(s) {
+                match stems.get(&(target.to_string(), link.to_lowercase())) {
+                    Some(Some(key)) => s.clone_from(key),
+                    Some(None) => {
+                        ambiguous.push(format!("[[{link}]] names more than one `{target}`"));
+                    }
+                    None => *s = link.to_string(),
                 }
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                resolve_wikilink_values(item, stems, ambiguous);
+                resolve_wikilink_values(item, target, stems, ambiguous);
             }
         }
         _ => {}
@@ -737,9 +775,12 @@ mod tests {
         }
     }
 
-    /// A store over `dir` at HEAD for `types`: each entity type, its key
-    /// field, and the fields its schema declares.
-    fn store(dir: &std::path::Path, extra: &str, types: &[(&str, &str, &[&str])]) -> MarkdownStore {
+    /// An entity type, its key field, and its relations with the type each
+    /// lists.
+    type TypeSpec<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+    /// A store over `dir` at HEAD for `types`.
+    fn store(dir: &std::path::Path, extra: &str, types: &[TypeSpec<'_>]) -> MarkdownStore {
         MarkdownStore::new(
             Arc::new(GitSnapshot::open(dir, "HEAD").unwrap()),
             &sub(),
@@ -750,11 +791,14 @@ mod tests {
                     .map(|(t, k, _)| ((*t).to_string(), (*k).to_string()))
                     .collect(),
                 link_targets: BTreeMap::new(),
-                fields: types
+                relations: types
                     .iter()
-                    .map(|(t, _, fields)| {
-                        let names = fields.iter().map(ToString::to_string).collect();
-                        ((*t).to_string(), names)
+                    .map(|(t, _, relations)| {
+                        let targets = relations
+                            .iter()
+                            .map(|(f, target)| ((*f).to_string(), (*target).to_string()))
+                            .collect();
+                        ((*t).to_string(), targets)
                     })
                     .collect(),
             },
@@ -778,7 +822,7 @@ mod tests {
         let s = store(
             dir.path(),
             "type = \"Person\"\nbody_field = \"body\"\nlinks_field = \"links\"",
-            &[("Person", "id", &["name", "friends", "body", "links"])],
+            &[("Person", "id", &[("friends", "Person")])],
         );
         let v = s.get("Person", "vaswani").await.unwrap().unwrap();
         assert_eq!(v["id"], json!("vaswani"));
@@ -841,7 +885,7 @@ mod tests {
         let s = store(
             dir.path(),
             "type_field = \"type\"\nkey = \"frontmatter:id\"",
-            &[("Paper", "id", &["title", "cites"])],
+            &[("Paper", "id", &[("cites", "Paper")])],
         );
         let a = s.get("Paper", "01AAA").await.unwrap().unwrap();
         assert_eq!(
@@ -887,7 +931,7 @@ mod tests {
         let s = store(
             dir.path(),
             "type = \"Topic\"\nbody_field = \"body\"\nlinks_field = \"links\"",
-            &[("Topic", "id", &["title", "body", "links"])],
+            &[("Topic", "id", &[])],
         );
         let (notes, problems) = s.notes().unwrap();
         let mut bad: Vec<(&str, &str)> = problems
@@ -914,7 +958,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_declared_fields_hold_relations() {
+    async fn relation_links_resolve_among_notes_of_their_type() {
+        let dir = tempfile::tempdir().unwrap();
+        commit_files(
+            dir.path(),
+            &[
+                // A Person and a Topic that share a key.
+                ("notes/alice.md", "---\ntype: Person\nid: T1\n---\n"),
+                ("notes/t1.md", "---\ntype: Topic\nid: T1\n---\n"),
+                // A Person and a Topic that share a stem.
+                ("notes/p/bob.md", "---\ntype: Person\nid: P2\n---\n"),
+                ("notes/t/bob.md", "---\ntype: Topic\nid: T2\n---\n"),
+                (
+                    "notes/x.md",
+                    "---\ntype: Topic\nid: X\nrel: [\"[[alice]]\", \"[[bob]]\"]\n---\n",
+                ),
+            ],
+            "init",
+        );
+        let s = store(
+            dir.path(),
+            "type_field = \"type\"\nkey = \"frontmatter:id\"",
+            &[("Topic", "id", &[("rel", "Topic")]), ("Person", "id", &[])],
+        );
+        // Not the Topic that shares Alice's key: [[alice]] names no Topic,
+        // so its text is the key, which `check` reports as dangling.
+        let x = s.get("Topic", "X").await.unwrap().expect("X loads");
+        assert_eq!(x["rel"], json!(["alice", "T2"]));
+        let (_, problems) = s.notes().unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[tokio::test]
+    async fn only_relations_resolve_links() {
         let dir = tempfile::tempdir().unwrap();
         commit_files(
             dir.path(),
@@ -923,7 +999,7 @@ mod tests {
                 ("notes/b/foo.md", "---\nid: B\n---\n"),
                 (
                     "notes/x.md",
-                    "---\nid: X\naliases: [\"[[foo]]\"]\nrel: [\"[[y]]\"]\n---\n",
+                    "---\nid: X\ntitle: \"[[y]]\"\naliases: [\"[[foo]]\"]\nrel: [\"[[y]]\"]\n---\n",
                 ),
                 ("notes/y.md", "---\nid: Y\n---\n"),
             ],
@@ -932,12 +1008,13 @@ mod tests {
         let s = store(
             dir.path(),
             "type = \"Topic\"\nkey = \"frontmatter:id\"",
-            &[("Topic", "id", &["rel"])],
+            &[("Topic", "id", &[("rel", "Topic")])],
         );
-        // An ambiguous stem in metadata the schema never reads is not a
-        // problem, and is left as it was.
+        // Only the relation resolves: a `String` keeps its text, and an
+        // ambiguous stem in metadata the schema never reads is no problem.
         let x = s.get("Topic", "X").await.unwrap().expect("X loads");
         assert_eq!(x["rel"], json!(["Y"]));
+        assert_eq!(x["title"], json!("[[y]]"));
         assert_eq!(x["aliases"], json!(["[[foo]]"]));
         let (_, problems) = s.notes().unwrap();
         assert!(problems.is_empty(), "{problems:?}");
@@ -964,7 +1041,7 @@ mod tests {
         let s = store(
             dir.path(),
             "type = \"Topic\"\nkey = \"frontmatter:id\"",
-            &[("Topic", "id", &["rel"])],
+            &[("Topic", "id", &[("rel", "Topic")])],
         );
         let (_, problems) = s.notes().unwrap();
         assert_eq!(problems.len(), 1, "{problems:?}");
@@ -972,7 +1049,7 @@ mod tests {
         assert!(
             problems[0]
                 .message
-                .contains("[[foo]] names more than one note"),
+                .contains("[[foo]] names more than one `Topic` note"),
             "{}",
             problems[0].message
         );
@@ -1105,7 +1182,7 @@ type Query { topic(id: ID!): Topic }
         NoteTypes {
             key_fields: BTreeMap::from([("A".to_string(), "id".to_string())]),
             link_targets: BTreeMap::new(),
-            fields: BTreeMap::new(),
+            relations: BTreeMap::new(),
         }
     }
 

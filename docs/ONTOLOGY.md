@@ -199,13 +199,13 @@ body_field = "body"      # optional: receives the markdown body
 links_field = "related"  # optional: receives the keys of the notes the body links to
 ```
 
-In a field the schema declares, a frontmatter string that is exactly one
-`[[wikilink]]` names another note and becomes that note's key; links
-resolve by file stem, ignoring case, and other frontmatter is left as it
-is. A
-frontmatter relation that names no note keeps its text as the key (an
-entity elsewhere, or a dangling reference `check` reports), and one naming
-an ambiguous stem (two notes share it) is an error, never a guess.
+In a relation (a field typed as an entity), a frontmatter string that is
+exactly one `[[wikilink]]` names the note of the relation's type with that
+file stem, ignoring case, and becomes its key; other frontmatter, a
+`String` included, is left as it is. A link naming no note of that type
+keeps its text as the key (an entity elsewhere, or a dangling reference
+`check` reports), never another type's note, and one naming two notes of
+that type is an error, never a guess.
 `links_field` lists only notes of the type its field lists: a body link to
 a note that does not exist (yet), to a note of another type, or to an
 ambiguous stem adds nothing, since body text links freely. The body is
