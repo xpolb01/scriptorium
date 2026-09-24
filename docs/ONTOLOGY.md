@@ -274,13 +274,14 @@ fails instead of downgrading. A local server is reached without TLS unless
 the connection string says `sslmode=require`. (`verify-full` is how
 `require` behaves here; write `require`.)
 
-A connection attempt gets the connection string's `connect_timeout` (10 s
-if it sets none) for each address it may try, a host name's every
-resolved address included, TLS and the startup exchange included; a query
-gets 30 s. The request then fails (for a client, with a reference), the
-connection is closed, and the next request reconnects: a server that
-stalls, or a proxy that keeps a dead connection open, cannot hold
-`serve`'s startup or its requests.
+Connecting tries the hosts the connection string lists, and each address
+a host name resolves to, in turn, as libpq does: each gets the connection
+string's `connect_timeout` (10 s if it sets none), its name lookup, TLS,
+and the startup exchange included, and one that fails or stalls gives way
+to the next. A query gets 30 s: the request then fails (for a client, with
+a reference), the connection is closed, and the next request reconnects.
+A server that stalls, or a proxy that keeps a dead connection open,
+cannot hold `serve`'s startup or its requests.
 
 ### DynamoDB items
 
