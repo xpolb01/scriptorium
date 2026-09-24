@@ -22,7 +22,10 @@
 //! The connection string comes from the environment variable named by
 //! `url_env`; it is never logged or put in an error. The store connects on
 //! first use (`serve` calls [`EntityStore::ready`] at startup), shares one
-//! connection between all queries, and reconnects once it has closed.
+//! connection between all queries, and reconnects once it has closed or a
+//! query on it went unanswered for 30 s. A connection attempt gives up after
+//! its `connect_timeout` (10 s unless the connection string sets one), TLS
+//! and the startup exchange included.
 //!
 //! **TLS.** Any server other than a local one (`localhost`, a loopback
 //! address, a Unix socket) is reached over TLS (rustls), with its
@@ -62,6 +65,16 @@ const TABLE_CHECK: &str = "SELECT c.oid IS NOT NULL, a.attnum IS NOT NULL, c.rel
      LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attname = $2 \
      AND a.attnum > 0 AND NOT a.attisdropped";
 
+/// How long one connection attempt may take, the socket, TLS, and the
+/// startup exchange together, when the connection string sets no
+/// `connect_timeout`.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one query may take. A server that stops answering (stalled, or
+/// cut off behind a proxy that keeps the socket open) must not hold a
+/// request, or `serve`'s startup, forever.
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct PostgresStore {
     sub: String,
     url_env: String,
@@ -72,8 +85,10 @@ pub struct PostgresStore {
     /// with derived fields only), so they need no table.
     unstored: BTreeSet<String>,
     /// The connection every query shares: opened on first use, replaced
-    /// once closed.
+    /// once closed or once a query on it got no answer.
     client: tokio::sync::Mutex<Option<Arc<Client>>>,
+    /// [`QUERY_TIMEOUT`]; shorter in tests.
+    query_timeout: std::time::Duration,
 }
 
 /// One entity type's table, and its queries.
@@ -243,6 +258,7 @@ impl PostgresStore {
             tables,
             unstored,
             client: tokio::sync::Mutex::new(None),
+            query_timeout: QUERY_TIMEOUT,
         })
     }
 
@@ -297,6 +313,26 @@ impl PostgresStore {
 
     async fn connect_to(&self, url: &str) -> Result<Client> {
         let config = connection_config(&self.url_env, url).map_err(|m| self.error(m))?;
+        // tokio-postgres bounds only the socket connect by `connect_timeout`;
+        // TLS and the startup exchange get it too, per destination tried.
+        let per_destination = config
+            .get_connect_timeout()
+            .copied()
+            .unwrap_or(CONNECT_TIMEOUT);
+        let destinations = config.get_hosts().len().max(config.get_hostaddrs().len());
+        let limit =
+            per_destination.saturating_mul(u32::try_from(destinations.max(1)).unwrap_or(u32::MAX));
+        match tokio::time::timeout(limit, self.open(&config)).await {
+            Ok(opened) => opened,
+            Err(_) => Err(self.error(format!(
+                "connecting with `{}`: no answer within {}s; set `connect_timeout` in the connection string to wait longer",
+                self.url_env,
+                limit.as_secs()
+            ))),
+        }
+    }
+
+    async fn open(&self, config: &Config) -> Result<Client> {
         let failed = |e: tokio_postgres::Error| {
             self.error(format!(
                 "connecting with `{}`: {}",
@@ -319,6 +355,31 @@ impl PostgresStore {
             drive(store, connection);
             Ok(client)
         }
+    }
+
+    /// Wait for `query` over `client` for at most `query_timeout`. With no
+    /// answer by then, the request fails and the connection is dropped, so
+    /// the next query reconnects instead of queueing behind this one.
+    async fn within<T>(
+        &self,
+        client: &Client,
+        what: &str,
+        query: impl std::future::Future<Output = std::result::Result<T, tokio_postgres::Error>>,
+    ) -> Result<std::result::Result<T, tokio_postgres::Error>> {
+        if let Ok(answered) = tokio::time::timeout(self.query_timeout, query).await {
+            return Ok(answered);
+        }
+        let mut slot = self.client.lock().await;
+        if slot
+            .as_ref()
+            .is_some_and(|current| std::ptr::eq(Arc::as_ptr(current), client))
+        {
+            *slot = None;
+        }
+        Err(self.error(format!(
+            "{what}: no answer within {}s",
+            self.query_timeout.as_secs()
+        )))
     }
 
     fn query_error(&self, table: &Table, e: &tokio_postgres::Error) -> Error {
@@ -359,9 +420,13 @@ impl EntityStore for PostgresStore {
             return Ok(None);
         }
         let client = self.client().await?;
-        let rows = client
-            .query_typed(&table.get, &[(&key, Type::TEXT)])
-            .await
+        let rows = self
+            .within(
+                &client,
+                &format!("reading {}", table.relation),
+                client.query_typed(&table.get, &[(&key, Type::TEXT)]),
+            )
+            .await?
             .map_err(|e| self.query_error(table, &e))?;
         match rows.as_slice() {
             [] => Ok(None),
@@ -386,19 +451,26 @@ impl EntityStore for PostgresStore {
             return Ok(Vec::new());
         }
         let client = self.client().await?;
+        let what = format!("reading {}", table.relation);
         let rows = match &query.references {
             None => {
-                client
-                    .query_typed(&table.list, &[(&limit, Type::INT8)])
-                    .await
+                self.within(
+                    &client,
+                    &what,
+                    client.query_typed(&table.list, &[(&limit, Type::INT8)]),
+                )
+                .await?
             }
             Some((field, key)) => {
-                client
-                    .query_typed(
+                self.within(
+                    &client,
+                    &what,
+                    client.query_typed(
                         &table.references,
                         &[(key, Type::TEXT), (field, Type::TEXT), (&limit, Type::INT8)],
-                    )
-                    .await
+                    ),
+                )
+                .await?
             }
         }
         .map_err(|e| self.query_error(table, &e))?;
@@ -438,15 +510,20 @@ impl PostgresStore {
         let mut not_tables = Vec::new();
         let mut unreadable = Vec::new();
         for (type_name, table) in &self.tables {
-            let row = client
-                .query_typed_one(
-                    TABLE_CHECK,
-                    &[
-                        (&table.relation, Type::TEXT),
-                        (&table.key_field, Type::TEXT),
-                    ],
+            let what = format!("checking {}", table.relation);
+            let row = self
+                .within(
+                    client,
+                    &what,
+                    client.query_typed_one(
+                        TABLE_CHECK,
+                        &[
+                            (&table.relation, Type::TEXT),
+                            (&table.key_field, Type::TEXT),
+                        ],
+                    ),
                 )
-                .await
+                .await?
                 .map_err(|e| {
                     self.error(format!("checking {}: {}", table.relation, error_chain(&e)))
                 })?;
@@ -468,9 +545,13 @@ impl PostgresStore {
                 not_tables.push(format!("{} (`{type_name}`)", table.relation));
             } else if !(not_null && unique) {
                 loose_keys.push(column);
-            } else if let Err(e) = client
-                .query_typed(&table.list, &[(&Some(0_i64), Type::INT8)])
-                .await
+            } else if let Err(e) = self
+                .within(
+                    client,
+                    &what,
+                    client.query_typed(&table.list, &[(&Some(0_i64), Type::INT8)]),
+                )
+                .await?
             {
                 // The catalogs are readable by any role; the rows may not be.
                 unreadable.push(format!(
@@ -611,6 +692,11 @@ fn connection_config(url_env: &str, url: &str) -> std::result::Result<Config, St
             Some(addr) => addr.is_loopback(),
             None => hosts.get(i).is_some_and(is_local),
         });
+    // Bounds each socket connect; `connect_to` holds TLS and the startup
+    // exchange to it as well.
+    if config.get_connect_timeout().is_none() {
+        config.connect_timeout(CONNECT_TIMEOUT);
+    }
     if !local {
         match config.get_ssl_mode() {
             SslMode::Disable => {
@@ -879,6 +965,54 @@ mod tests {
         let err = store.connect_to(&url).await.err().unwrap().to_string();
         eprintln!("refused as expected: {err}");
         assert!(err.to_lowercase().contains("certificate"), "{err}");
+    }
+
+    #[test]
+    fn connections_wait_a_bounded_time() {
+        let config = connection_config("DB_URL", "postgres://u@localhost/db").unwrap();
+        assert_eq!(config.get_connect_timeout(), Some(&CONNECT_TIMEOUT));
+        let config =
+            connection_config("DB_URL", "postgres://u@localhost/db?connect_timeout=3").unwrap();
+        assert_eq!(
+            config.get_connect_timeout(),
+            Some(&std::time::Duration::from_secs(3))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_is_given_up_on() {
+        // It accepts the socket, then says nothing: without a bound, the TLS
+        // and startup exchanges would wait forever.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let store =
+            PostgresStore::new("research", &config("public", &[]), BTreeMap::new()).unwrap();
+        for mode in ["disable", "require"] {
+            let started = std::time::Instant::now();
+            let url = format!(
+                "postgres://alice:hunter2@127.0.0.1:{port}/db?connect_timeout=1&sslmode={mode}"
+            );
+            let attempt = store.connect_to(&url);
+            let err = tokio::time::timeout(std::time::Duration::from_secs(10), attempt)
+                .await
+                .expect("the attempt ends on its own")
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(err.contains("no answer within 1s"), "{mode}: {err}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{mode}"
+            );
+            assert!(!err.contains("hunter2"), "{err}");
+        }
+        silent.abort();
     }
 
     #[test]
@@ -1562,6 +1696,50 @@ type Query { wide(id: ID!): Wide wides(first: Int): [Wide!]! }
             "{err}"
         );
         assert!(!err.contains(r#""paper""#), "{err}");
+        db.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_read_without_an_answer_fails_and_the_next_reconnects() {
+        let Some(db) = TestDb::open("ontology_test_stall").await else {
+            return;
+        };
+        db.exec("CREATE TABLE paper (id text PRIMARY KEY); INSERT INTO paper VALUES ('a');")
+            .await;
+        let mut store = db.store(&[], &[("Paper", "id", &[])]);
+        store.query_timeout = std::time::Duration::from_secs(1);
+        assert!(store.get("Paper", "a").await.unwrap().is_some());
+        let first = store.client().await.unwrap();
+
+        // Another session holds the table, so reads wait for its lock: the
+        // server is up, but this read gets no answer.
+        let url = std::env::var(TEST_URL_ENV).unwrap();
+        let (locker, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        locker
+            .batch_execute(&format!(
+                "BEGIN; LOCK TABLE {}.paper IN ACCESS EXCLUSIVE MODE",
+                quote_ident(&db.schema)
+            ))
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), store.get("Paper", "a"))
+            .await
+            .expect("the read ends on its own")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no answer within 1s"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        locker.batch_execute("ROLLBACK").await.unwrap();
+
+        // The stalled connection was dropped: the next read opens another.
+        assert!(store.get("Paper", "a").await.unwrap().is_some());
+        assert!(!Arc::ptr_eq(&first, &store.client().await.unwrap()));
         db.finish().await;
     }
 
