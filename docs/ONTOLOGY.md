@@ -403,6 +403,34 @@ sub-ontology, and the supergraph `serve --supergraph` publishes.
 notes, and, with their features and test databases, Postgres rows and
 DynamoDB items, and requires identical answers from each.
 
+`tests/e2e.rs` runs the whole system the way a person runs it: the
+binary's commands, git commits, `serve` for this repository and for
+another one, the databases, and a gateway, all reached over HTTP. Each
+test shows that one claim of this document holds:
+
+| Claim | Test | Needs |
+|---|---|---|
+| The quickstart below answers as documented (its query is read from this file) | `the_documented_quickstart_answers_as_documented` | a gateway |
+| A commit is a version: each commit serves its own records, and uncommitted edits are never served | `every_commit_is_a_version_that_can_be_served` | a gateway |
+| A commit that does not compose never reaches the gateway | `a_commit_that_does_not_compose_never_reaches_the_gateway` | a gateway |
+| A remote's schema change reaches clients only through `pull` | `a_remote_schema_change_reaches_clients_only_through_pull` | a gateway |
+| One gateway joins git, markdown, Postgres, DynamoDB, and another repository; moving data between stores changes no answer; a credential stays out of every commit | `one_ontology_across_every_store_and_another_repository` | a gateway, both features and test databases |
+| A failing store fails only its own fields, tells clients nothing about itself, and recovers without a restart | `a_failing_store_fails_only_its_own_fields_and_recovers` | a gateway, both features and test databases |
+| `serve` publishes nothing while a store is unreachable | `serve_publishes_nothing_while_a_store_is_unreachable` | `--features postgres` |
+| Apollo's composition of the running subgraphs gives the same answers and the same client-facing schema | `apollo_composition_agrees_with_this_one` | a gateway, Rover |
+
+The comparison runs Apollo's composition through Rover, Apollo's CLI (a
+`rover` binary from github.com/apollographql/rover/releases). Its
+composition plugin is under the Elastic License 2.0, so the test skips
+unless whoever runs it accepts that license with
+`APOLLO_ELV2_LICENSE=accept`; the test never accepts it itself:
+
+```sh
+APOLLO_ELV2_LICENSE=accept SCRIPTORIUM_ONTOLOGY_TEST_ROVER=$PWD/target/tools/rover \
+SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY=$PWD/target/tools/router \
+  cargo test --manifest-path crates/scriptorium-ontology/Cargo.toml --features postgres,dynamodb --test e2e
+```
+
 ## Commands
 
 | Command | What it does |
