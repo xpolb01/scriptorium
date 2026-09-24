@@ -271,7 +271,10 @@ mod rows {
     impl Rows {
         pub async fn load(data: &Dataset) -> Option<Self> {
             let Ok(url) = std::env::var(URL_ENV) else {
-                eprintln!("note: {URL_ENV} is not set; skipping the Postgres leg");
+                crate::gateway_support::skip(
+                    "the Postgres leg of every_store_answers_alike",
+                    &format!("set {URL_ENV}"),
+                );
                 return None;
             };
             let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
@@ -403,7 +406,10 @@ mod items {
                 .ok()
                 .filter(|e| !e.trim().is_empty())
             else {
-                eprintln!("note: {ENDPOINT_ENV} is not set; skipping the DynamoDB leg");
+                crate::gateway_support::skip(
+                    "the DynamoDB leg of every_store_answers_alike",
+                    &format!("set {ENDPOINT_ENV}"),
+                );
                 return None;
             };
             // DynamoDB Local takes any credentials; with the AWS config files

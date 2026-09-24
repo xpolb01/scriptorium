@@ -18,6 +18,23 @@ use serde_json::{json, Value};
 
 const GATEWAY_ENV: &str = "SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY";
 const KIND_ENV: &str = "SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY_KIND";
+const STRICT_ENV: &str = "SCRIPTORIUM_ONTOLOGY_TEST_STRICT";
+
+/// Whether `SCRIPTORIUM_ONTOLOGY_TEST_STRICT` is set, as CI sets it: then
+/// nothing may skip.
+pub fn strict() -> bool {
+    std::env::var_os(STRICT_ENV).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Notes that `test` does not run here, and why; in a strict run, fails it
+/// instead, so a suite cannot pass by skipping what it was meant to run.
+pub fn skip(test: &str, why: &str) {
+    assert!(
+        !strict(),
+        "{test} cannot run: {why} ({STRICT_ENV} is set, so nothing may skip)"
+    );
+    eprintln!("skipping {test}: {why}");
+}
 
 /// Which gateway `SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY` names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,8 +81,9 @@ impl Kind {
 /// The gateway binary, or `None` after a note saying why `test` skips.
 pub fn gateway(test: &str) -> Option<(PathBuf, Kind)> {
     let Some(path) = std::env::var_os(GATEWAY_ENV).filter(|p| !p.is_empty()) else {
-        eprintln!(
-            "skipping {test}: set {GATEWAY_ENV} to a Hive Router, Hive Gateway, or Apollo Router binary"
+        skip(
+            test,
+            &format!("set {GATEWAY_ENV} to a Hive Router, Hive Gateway, or Apollo Router binary"),
         );
         return None;
     };

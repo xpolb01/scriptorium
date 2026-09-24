@@ -20,7 +20,9 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use gateway_support::{client, gateway, scriptorium_ontology, Gateway, Kind, Running, GIT};
+use gateway_support::{
+    client, gateway, scriptorium_ontology, skip, strict, Gateway, Kind, Running, GIT,
+};
 use serde_json::{json, Value};
 
 /// How long one command may run, and `serve` may take to start.
@@ -260,6 +262,16 @@ async fn battery(gateway: &Gateway) -> Vec<Value> {
         answers.push(gateway.data(query).await);
     }
     answers
+}
+
+/// A strict run builds every store in: without `--features
+/// postgres,dynamodb`, the store tests would be left out without a word.
+#[test]
+fn a_strict_run_builds_every_store() {
+    assert!(
+        !strict() || cfg!(all(feature = "postgres", feature = "dynamodb")),
+        "a strict run needs --features postgres,dynamodb"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -890,7 +902,10 @@ mod stores {
                     .ok()
                     .filter(|e| !e.trim().is_empty()),
             ) else {
-                eprintln!("skipping {test}: set {POSTGRES_ENV} and {DYNAMODB_ENV}");
+                crate::gateway_support::skip(
+                    test,
+                    &format!("set {POSTGRES_ENV} and {DYNAMODB_ENV}"),
+                );
                 return None;
             };
             let partner_repo = partner();
@@ -1190,12 +1205,16 @@ async fn apollo_composition_agrees_with_this_one() {
         return;
     };
     let Some(rover) = std::env::var_os(ROVER_ENV).filter(|r| !r.is_empty()) else {
-        eprintln!("skipping apollo_composition_agrees: set {ROVER_ENV} to a rover binary");
+        skip(
+            "apollo_composition_agrees",
+            &format!("set {ROVER_ENV} to a rover binary"),
+        );
         return;
     };
     if std::env::var("APOLLO_ELV2_LICENSE").as_deref() != Ok("accept") {
-        eprintln!(
-            "skipping apollo_composition_agrees: Apollo's composition plugin is under the Elastic License 2.0; set APOLLO_ELV2_LICENSE=accept to accept it"
+        skip(
+            "apollo_composition_agrees",
+            "Apollo's composition plugin is under the Elastic License 2.0; set APOLLO_ELV2_LICENSE=accept to accept it",
         );
         return;
     }
