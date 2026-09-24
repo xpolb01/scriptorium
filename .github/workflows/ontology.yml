@@ -149,6 +149,11 @@ jobs:
               fetch graphql-hive/gateway hive-gateway@2.14.2 hive-gateway-Linux-X64.gz \
                 3ce1b24b9fa81b4b66ebe19f89f5a05f71cf48ff97eeacadf62bd825f7028986
               gunzip --stdout hive-gateway-Linux-X64.gz > hive-gateway && chmod +x hive-gateway
+              # The binary unpacks its bundled node_modules into /tmp on its
+              # first run, and several first runs at once race over them:
+              # unpack them once, before the tests start gateways in parallel.
+              ./hive-gateway --version
+              ls -d /tmp/graphql-hive__gateway_*_node_modules/graphql
               echo "SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY=$PWD/hive-gateway" >> "$GITHUB_ENV"
               ;;
             apollo-router)
