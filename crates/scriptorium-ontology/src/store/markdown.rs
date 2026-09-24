@@ -698,13 +698,14 @@ fn resolve_wikilink_values(
 
 /// `[[wikilink]]` targets in a markdown body, in order. The body is read as
 /// `CommonMark`, as the vault reads its pages: links in code (spans, which
-/// may run across lines, and fenced or indented blocks) and in raw HTML do
-/// not count, nor do `![[embeds]]`.
+/// may run across lines, and fenced or indented blocks), in raw HTML, and in
+/// Markdown links, images, and reference definitions (a URL may hold
+/// `[[…]]`) do not count, nor do `![[embeds]]`.
 fn wikilink_targets(body: &str) -> Vec<String> {
     let mut targets = Vec::new();
     let mut at = 0;
     let end = std::iter::once(body.len()..body.len());
-    for skipped in code_and_html(body).into_iter().chain(end) {
+    for skipped in not_prose(body).into_iter().chain(end) {
         let text = &body[at..skipped.start.max(at)];
         for capture in wikilink_regex().captures_iter(text) {
             let start = capture.get(0).map_or(0, |m| m.start());
@@ -718,15 +719,22 @@ fn wikilink_targets(body: &str) -> Vec<String> {
     targets
 }
 
-/// The byte ranges of `body` that are code or raw HTML, in order and
-/// merged. `pulldown-cmark` splits `[[a]]` into brackets and a reference
-/// link, so its text events cannot be searched for links themselves; only
-/// the source between these ranges is.
-fn code_and_html(body: &str) -> Vec<std::ops::Range<usize>> {
+/// The byte ranges of `body` that are code, raw HTML, Markdown links and
+/// images, or reference definitions, in order and merged. `pulldown-cmark`
+/// splits `[[a]]` into brackets and a reference link, so its text events
+/// cannot be searched for links themselves; only the source between these
+/// ranges is.
+fn not_prose(body: &str) -> Vec<std::ops::Range<usize>> {
     use pulldown_cmark::{Event, Parser, Tag, TagEnd};
-    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let parser = Parser::new(body).into_offset_iter();
+    // Definitions produce no events; the parser keeps their spans.
+    let mut ranges: Vec<std::ops::Range<usize>> = parser
+        .reference_definitions()
+        .iter()
+        .map(|(_, definition)| definition.span.clone())
+        .collect();
     let mut block = None;
-    for (event, range) in Parser::new(body).into_offset_iter() {
+    for (event, range) in parser {
         match event {
             Event::Start(Tag::CodeBlock(_)) => block = Some(range.start),
             Event::End(TagEnd::CodeBlock) => {
@@ -734,7 +742,11 @@ fn code_and_html(body: &str) -> Vec<std::ops::Range<usize>> {
                     ranges.push(start..range.end);
                 }
             }
-            Event::Code(_) | Event::Html(_) | Event::InlineHtml(_) => ranges.push(range),
+            // A link's start event spans the whole link, text and URL.
+            Event::Start(Tag::Link { .. } | Tag::Image { .. })
+            | Event::Code(_)
+            | Event::Html(_)
+            | Event::InlineHtml(_) => ranges.push(range),
             _ => {}
         }
     }
@@ -1246,6 +1258,14 @@ type Query { topic(id: ID!): Topic }
         // Indented code blocks and raw HTML are not prose either.
         assert_eq!(
             wikilink_targets("text\n\n    [[indented]]\n\n<div>\n[[html]]\n</div>\n\n[[prose]]"),
+            ["prose"]
+        );
+        // Nor are Markdown links, images, and reference definitions, whose
+        // URLs may hold brackets.
+        assert_eq!(
+            wikilink_targets(
+                "[text](https://example.com/[[inline]]) <https://example.com/[[auto]]>\n\n[source]: <https://example.com/[[defined]]>\n\n![alt](x/[[image]].png) [[prose]]"
+            ),
             ["prose"]
         );
     }

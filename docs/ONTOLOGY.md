@@ -210,9 +210,10 @@ that type is an error, never a guess.
 a note that does not exist (yet), to a note of another type, or to an
 ambiguous stem adds nothing, since body text links freely. The body is
 read as CommonMark, as the vault reads its pages: links in code (spans,
-even ones that run across lines, and fenced or indented blocks) or in raw
-HTML do not count, nor do `![[embeds]]`. With `links_field`, backlinks are
-an ordinary `@inverse(of: "related")`.
+even ones that run across lines, and fenced or indented blocks), in raw
+HTML, and in Markdown links, images, and reference definitions (whose URLs
+may hold brackets) do not count, nor do `![[embeds]]`. With `links_field`,
+backlinks are an ordinary `@inverse(of: "related")`.
 
 Frontmatter opened with `---` must be closed by another `---` line; an
 unclosed block is an error rather than body text. A symlink among the
