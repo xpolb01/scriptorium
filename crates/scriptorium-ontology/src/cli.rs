@@ -524,9 +524,7 @@ fn head_registry(root: &Path, dir: &str) -> Result<Registry> {
         worktree: false,
         dir: dir.to_string(),
     };
-    let has_head = git2::Repository::open(root)
-        .ok()
-        .is_some_and(|repo| repo.head().is_ok());
+    let has_head = git2::Repository::open(root).is_ok_and(|repo| repo.head().is_ok());
     if !has_head {
         return Ok(Registry {
             ontology_dir: source.dir(),
