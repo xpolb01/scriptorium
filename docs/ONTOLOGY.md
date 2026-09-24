@@ -373,6 +373,28 @@ run when `SCRIPTORIUM_ONTOLOGY_TEST_POSTGRES_URL` (a disposable database)
 or `SCRIPTORIUM_ONTOLOGY_TEST_DYNAMODB_ENDPOINT` (DynamoDB Local) is set,
 and skip otherwise.
 
+The gateway suites (`tests/gateway.rs`, `tests/gateway_stores.rs`) run a
+real federation gateway on the composed supergraph, so its own query
+planner decides the fetches, and skip unless
+`SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY` names one. Their planners are written
+apart, so run the suites with both:
+
+```sh
+cargo install --locked hive-router --root target/tools          # Hive Router (Rust)
+SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY=$PWD/target/tools/bin/hive_router \
+  cargo test --manifest-path crates/scriptorium-ontology/Cargo.toml --test gateway --test gateway_stores
+npm install --prefix target/tools @graphql-hive/gateway          # Hive Gateway (JavaScript)
+SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY=$PWD/target/tools/node_modules/.bin/hive-gateway \
+  cargo test --manifest-path crates/scriptorium-ontology/Cargo.toml --test gateway --test gateway_stores
+```
+
+`tests/gateway.rs` plans across every sub-ontology of the example and
+through fixtures for `Int` keys, `@override`, `@inaccessible`, a remote
+sub-ontology, and the supergraph `serve --supergraph` publishes.
+`tests/gateway_stores.rs` serves one dataset from git records, markdown
+notes, and, with their features and test databases, Postgres rows and
+DynamoDB items, and requires identical answers from each.
+
 ## Commands
 
 | Command | What it does |
@@ -572,8 +594,11 @@ the schema `compose` composed. Subgraphs do not answer introspection
 - **Subgraph runtime: [`async-graphql`](https://crates.io/crates/async-graphql)**
   dynamic schemas (MIT/Apache-2.0), which implement `_service` and
   `_entities`.
-- **Gateway:** not bundled. The supergraph is the standard `join__` format;
-  Hive Gateway (MIT) is the tested gateway.
+- **Gateway:** not bundled. The supergraph is the standard `join__` format,
+  tested with Hive Router (Rust, MIT) and Hive Gateway (JavaScript, MIT).
+  graphql-composition leaves the root query type without `@join__type`,
+  which planners that follow the join spec need, so `compose` adds one for
+  each subgraph with root fields.
 
 ## Roadmap
 

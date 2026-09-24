@@ -1,6 +1,9 @@
-//! End to end over HTTP: scaffold the example ontology into a git repo,
-//! commit it, serve its subgraphs, and walk the same fetches a federation
-//! gateway's query plan would make across the three sub-ontologies.
+//! End to end over HTTP, without a gateway: scaffold an ontology into a git
+//! repo, commit it, serve its subgraphs, and walk the fetches a federation
+//! gateway's query plan would make; and check the supergraph carries what
+//! gateways need to plan them. `gateway.rs` runs real gateways.
+
+mod gateway_support;
 
 use std::sync::Arc;
 
@@ -79,7 +82,7 @@ async fn subgraphs_join_entities_across_sub_ontologies() {
     let server = tokio::spawn(serve_listener(listener, subgraphs, async {
         let _ = stopped.await;
     }));
-    let client = reqwest::Client::new();
+    let client = gateway_support::client();
 
     // 1. Root field in `research`.
     let paper = post(
@@ -226,4 +229,148 @@ fn graphql_literal(value: &Value) -> String {
         ),
         other => other.to_string(),
     }
+}
+
+/// The `{ ... }` head of `type <name>` in `sdl`: its directives.
+fn head<'a>(sdl: &'a str, name: &str) -> &'a str {
+    let start = sdl
+        .find(&format!("\ntype {name}\n"))
+        .or_else(|| sdl.find(&format!("\nenum {name}\n")))
+        .unwrap_or_else(|| panic!("no {name} in\n{sdl}"));
+    let rest = &sdl[start..];
+    &rest[..rest.find('{').unwrap()]
+}
+
+#[test]
+fn the_supergraph_joins_every_type_to_its_subgraphs() {
+    let dir = tempfile::tempdir().unwrap();
+    scaffold_example(dir.path(), "ontology").unwrap();
+    commit_all(dir.path(), "scaffold");
+    let snapshot = GitSnapshot::open(dir.path(), "HEAD").unwrap();
+    let (registry, _) = Registry::load(&snapshot, "ontology").unwrap();
+    let supergraph = compose(&registry, "http://h:1").supergraph.unwrap();
+    // Root fields are reachable only through a `@join__type` on Query.
+    let query = head(&supergraph, "Query");
+    for graph in ["CORE", "NOTES", "RESEARCH", "SOFTWARE"] {
+        assert!(
+            query.contains(&format!("@join__type(graph: {graph})")),
+            "{query}"
+        );
+    }
+    // An entity is joined, by its key, to every subgraph that defines it.
+    for (entity, graphs) in [
+        ("Person", &["CORE", "RESEARCH"][..]),
+        ("Paper", &["NOTES", "RESEARCH", "SOFTWARE"][..]),
+        ("Topic", &["NOTES"][..]),
+        ("Repository", &["SOFTWARE"][..]),
+    ] {
+        let head = head(&supergraph, entity);
+        for graph in graphs {
+            assert!(
+                head.contains(&format!("@join__type(graph: {graph}, key: \"id\")")),
+                "{entity}: {head}"
+            );
+        }
+    }
+    assert!(head(&supergraph, "PaperKind").contains("@join__type(graph: RESEARCH)"));
+}
+
+#[test]
+fn override_and_inaccessible_reach_the_supergraph() {
+    use gateway_support::{repository, GIT, LINK};
+    let library = format!(
+        "{LINK}\ntype Book @key(fields: \"id\") {{ id: ID! title: String! blurb: String }}\ntype Query {{ book(id: ID!): Book }}\n"
+    );
+    let reviews = "extend schema @link(url: \"https://specs.apollo.dev/federation/v2.3\", import: [\"@key\", \"@override\", \"@inaccessible\"])\nextend type Book @key(fields: \"id\") { id: ID! blurb: String @override(from: \"library\") draft: String @inaccessible }\n";
+    let repo = repository(&[
+        ("ontology/library/subgraph.toml", GIT),
+        ("ontology/library/schema.graphql", &library),
+        ("ontology/reviews/subgraph.toml", GIT),
+        ("ontology/reviews/schema.graphql", reviews),
+    ]);
+    let snapshot = GitSnapshot::open(repo.path(), "HEAD").unwrap();
+    let (registry, _) = Registry::load(&snapshot, "ontology").unwrap();
+    let composition = compose(&registry, "http://h:1");
+    assert!(composition.is_ok(), "{:?}", composition.errors);
+    let supergraph = composition.supergraph.unwrap();
+    assert!(
+        supergraph.contains("blurb: String @join__field(graph: REVIEWS, override: \"library\")"),
+        "{supergraph}"
+    );
+    assert!(supergraph.contains("@inaccessible"), "{supergraph}");
+    let api = composition.api_schema.unwrap();
+    assert!(!api.contains("draft"), "{api}");
+    assert!(api.contains("blurb"), "{api}");
+}
+
+#[tokio::test]
+async fn int_keyed_representations_resolve() {
+    use gateway_support::{repository, Served, GIT, LINK};
+    let catalog = format!(
+        "{LINK}\ntype Item @key(fields: \"sku\") {{ sku: Int! name: String! }}\ntype Query {{ item(sku: Int!): Item }}\n"
+    );
+    let stock =
+        format!("{LINK}\nextend type Item @key(fields: \"sku\") {{ sku: Int! quantity: Int }}\n");
+    let repo = repository(&[
+        ("ontology/catalog/subgraph.toml", GIT),
+        ("ontology/catalog/schema.graphql", &catalog),
+        ("ontology/catalog/data/Item/7.yaml", "name: Anvil\n"),
+        ("ontology/catalog/data/Item/42.yaml", "name: Crucible\n"),
+        ("ontology/stock/subgraph.toml", GIT),
+        ("ontology/stock/schema.graphql", &stock),
+        ("ontology/stock/data/Item/42.yaml", "quantity: 3\n"),
+    ]);
+    let served = Served::start(repo.path()).await;
+    let client = gateway_support::client();
+    // Keys come back as the numbers the owner answered with.
+    let data = post(
+        &client,
+        &format!("{}/stock/graphql", served.base),
+        r#"{ _entities(representations: [{__typename: "Item", sku: 42}, {__typename: "Item", sku: 7}]) { ... on Item { sku quantity } } }"#,
+    )
+    .await;
+    assert_eq!(
+        data["_entities"],
+        json!([{ "sku": 42, "quantity": 3 }, { "sku": 7, "quantity": null }])
+    );
+    let data = post(
+        &client,
+        &format!("{}/catalog/graphql", served.base),
+        r#"{ _entities(representations: [{__typename: "Item", sku: 7}]) { ... on Item { name } } }"#,
+    )
+    .await;
+    assert_eq!(data["_entities"], json!([{ "name": "Anvil" }]));
+}
+
+#[tokio::test]
+async fn mixed_entity_batches_answer_in_order() {
+    use gateway_support::Served;
+    let dir = tempfile::tempdir().unwrap();
+    scaffold_example(dir.path(), "ontology").unwrap();
+    commit_all(dir.path(), "scaffold");
+    let served = Served::start(dir.path()).await;
+    // research owns Paper and extends Person: one batch, both kinds, the
+    // order a planner sent them in.
+    let data = post(
+        &gateway_support::client(),
+        &format!("{}/research/graphql", served.base),
+        r#"{ _entities(representations: [
+            {__typename: "Person", id: "devlin"},
+            {__typename: "Paper", id: "attention-is-all-you-need"},
+            {__typename: "Person", id: "vaswani"}
+        ]) {
+            __typename
+            ... on Person { papers { id } }
+            ... on Paper { year }
+        } }"#,
+    )
+    .await;
+    assert_eq!(
+        data["_entities"],
+        json!([
+            { "__typename": "Person", "papers": [{ "id": "bert" }] },
+            { "__typename": "Paper", "year": 2017 },
+            { "__typename": "Person", "papers": [{ "id": "attention-is-all-you-need" }] },
+        ])
+    );
 }
