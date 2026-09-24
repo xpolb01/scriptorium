@@ -869,9 +869,7 @@ mod tests {
         // A TLS server whose certificate the system does not trust, e.g.
         // postgres with `ssl=on` and a self-signed certificate.
         let Ok(url) = std::env::var("SCRIPTORIUM_ONTOLOGY_TEST_POSTGRES_UNTRUSTED_TLS_URL") else {
-            eprintln!(
-                "note: SCRIPTORIUM_ONTOLOGY_TEST_POSTGRES_UNTRUSTED_TLS_URL is not set; skipping"
-            );
+            skip("set SCRIPTORIUM_ONTOLOGY_TEST_POSTGRES_UNTRUSTED_TLS_URL");
             return;
         };
         let store =
@@ -983,6 +981,19 @@ mod tests {
 
     const TEST_URL_ENV: &str = "SCRIPTORIUM_ONTOLOGY_TEST_POSTGRES_URL";
 
+    /// Notes that a Postgres integration test does not run here, and why;
+    /// under `SCRIPTORIUM_ONTOLOGY_TEST_STRICT`, as CI sets it, fails it
+    /// instead.
+    fn skip(why: &str) {
+        let strict = std::env::var_os("SCRIPTORIUM_ONTOLOGY_TEST_STRICT")
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        assert!(
+            !strict,
+            "a Postgres integration test cannot run: {why} (SCRIPTORIUM_ONTOLOGY_TEST_STRICT is set, so nothing may skip)"
+        );
+        eprintln!("note: skipping a Postgres integration test: {why}");
+    }
+
     struct TestDb {
         client: Client,
         schema: String,
@@ -1004,7 +1015,7 @@ mod tests {
         /// the setup connection's search path.
         async fn open(base: &str) -> Option<Self> {
             let Ok(url) = std::env::var(TEST_URL_ENV) else {
-                eprintln!("note: {TEST_URL_ENV} is not set; skipping a Postgres integration test");
+                skip(&format!("set {TEST_URL_ENV}"));
                 return None;
             };
             let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)

@@ -10,7 +10,7 @@ type Repository @key(fields: "id") {
   implements: [Paper!]!
 }
 
-"software adds implementations to research's Paper (`extend`: research owns Paper records)."
+# software adds implementations to research's Paper (`extend`: research owns Paper records).
 extend type Paper @key(fields: "id") {
   id: ID!
   implementations: [Repository!]! @inverse(of: "implements")

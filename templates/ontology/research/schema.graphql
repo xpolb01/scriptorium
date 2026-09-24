@@ -23,7 +23,7 @@ type Paper @key(fields: "id") {
   citedBy: [Paper!]! @inverse(of: "cites")
 }
 
-"research adds authorship to core's Person (`extend`: core owns Person records)."
+# research adds authorship to core's Person (`extend`: core owns Person records).
 extend type Person @key(fields: "id") {
   id: ID!
   papers: [Paper!]! @inverse(of: "authors")

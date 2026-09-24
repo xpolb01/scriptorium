@@ -7,8 +7,9 @@
 //!   --features dynamodb --test dynamodb
 //! ```
 //!
-//! Without the variable every test prints a note and passes. Each test
-//! creates its own table and deletes it when it passes.
+//! Without the variable every test prints a note and passes, or fails
+//! under `SCRIPTORIUM_ONTOLOGY_TEST_STRICT`. Each test creates its own
+//! table and deletes it when it passes.
 //!
 //! These tests are a binary of their own because they put dummy AWS
 //! credentials in the process environment, which is only safe while no
@@ -38,6 +39,18 @@ const ENDPOINT_ENV: &str = "SCRIPTORIUM_ONTOLOGY_TEST_DYNAMODB_ENDPOINT";
 const REGION: &str = "us-east-1";
 static DUMMY_CREDENTIALS: Once = Once::new();
 
+/// Notes that `test` does not run here, and why; under
+/// `SCRIPTORIUM_ONTOLOGY_TEST_STRICT`, as CI sets it, fails it instead.
+fn skip(test: &str, why: &str) {
+    let strict = std::env::var_os("SCRIPTORIUM_ONTOLOGY_TEST_STRICT")
+        .is_some_and(|v| !v.is_empty() && v != "0");
+    assert!(
+        !strict,
+        "{test} cannot run: {why} (SCRIPTORIUM_ONTOLOGY_TEST_STRICT is set, so nothing may skip)"
+    );
+    eprintln!("skipping {test}: {why}");
+}
+
 /// The endpoint under test, or `None` after a note saying why the test
 /// skips.
 fn endpoint(test: &str) -> Option<String> {
@@ -45,8 +58,9 @@ fn endpoint(test: &str) -> Option<String> {
         .ok()
         .filter(|url| !url.trim().is_empty())
     else {
-        eprintln!(
-            "skipping {test}: set {ENDPOINT_ENV} to a DynamoDB Local URL (e.g. http://127.0.0.1:8000) to run it"
+        skip(
+            test,
+            &format!("set {ENDPOINT_ENV} to a DynamoDB Local URL (e.g. http://127.0.0.1:8000)"),
         );
         return None;
     };
