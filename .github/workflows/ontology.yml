@@ -1,0 +1,192 @@
+# The federated ontology (crates/scriptorium-ontology): its gate, a build on
+# its declared rust-version, and every test suite behind each gateway it is
+# tested with, against real Postgres and DynamoDB Local. The system jobs run
+# strictly (SCRIPTORIUM_ONTOLOGY_TEST_STRICT): a test that cannot run fails
+# instead of skipping, so a run that lost a database or a gateway is red.
+name: ontology
+
+on:
+  pull_request:
+    paths:
+      - crates/scriptorium-ontology/**
+      - templates/ontology/**
+      - docs/ONTOLOGY.md
+      - rust-toolchain.toml
+      - .github/workflows/ontology.yml
+  push:
+    branches: [main]
+    paths:
+      - crates/scriptorium-ontology/**
+      - templates/ontology/**
+      - docs/ONTOLOGY.md
+      - rust-toolchain.toml
+      - .github/workflows/ontology.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ontology-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: crates/scriptorium-ontology
+
+jobs:
+  gate:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The toolchain rust-toolchain.toml names, with its components.
+      - name: Rust
+        run: |
+          rustup toolchain install
+          cargo --version && cargo clippy --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: crates/scriptorium-ontology
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets --features postgres,dynamodb -- -D warnings
+      # Without features or services: the suites that need them skip.
+      - run: cargo test --locked
+
+  msrv:
+    name: build on rust-version (1.94.1)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Over rust-toolchain.toml, which names stable.
+      RUSTUP_TOOLCHAIN: "1.94.1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust 1.94.1
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal
+          cargo --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: crates/scriptorium-ontology
+      - run: cargo check --locked --all-targets --features postgres,dynamodb
+
+  system:
+    name: system behind ${{ matrix.gateway }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        gateway: [hive-router, hive-gateway, apollo-router]
+    services:
+      postgres:
+        image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+        env:
+          POSTGRES_PASSWORD: ittest
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+      dynamodb:
+        image: amazon/dynamodb-local:3.3.1@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab
+        ports:
+          - 127.0.0.1:8000:8000
+    env:
+      SCRIPTORIUM_ONTOLOGY_TEST_STRICT: "1"
+      SCRIPTORIUM_ONTOLOGY_TEST_POSTGRES_URL: postgres://postgres:ittest@127.0.0.1:5432/postgres
+      SCRIPTORIUM_ONTOLOGY_TEST_POSTGRES_UNTRUSTED_TLS_URL: postgres://postgres:ittest@localhost:5433/postgres?sslmode=require
+      SCRIPTORIUM_ONTOLOGY_TEST_DYNAMODB_ENDPOINT: http://127.0.0.1:8000
+      # The Rover comparison runs Apollo's composition plugin, which is under
+      # the Elastic License 2.0; the repository's owner accepts it for CI.
+      APOLLO_ELV2_LICENSE: accept
+      APOLLO_TELEMETRY_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust
+        run: |
+          rustup toolchain install
+          cargo --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: crates/scriptorium-ontology
+          shared-key: system
+      # Release binaries, each checked against the sha256 GitHub recorded for
+      # it (and, for Apollo's, the one Apollo publishes).
+      - name: ${{ matrix.gateway }} and Rover
+        working-directory: ${{ runner.temp }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATEWAY: ${{ matrix.gateway }}
+        run: |
+          set -euo pipefail
+          mkdir tools && cd tools
+          fetch() { # repo tag asset sha256
+            gh release download "$2" --repo "$1" --pattern "$3"
+            echo "$4  $3" | sha256sum --check --strict
+          }
+          case "$GATEWAY" in
+            hive-router)
+              fetch graphql-hive/router hive-router/v0.2.19 hive_router_linux_amd64 \
+                286f4df3bae3b536a8336af8338bb960a639756757440f7ea18a120c9a0d4ae4
+              mv hive_router_linux_amd64 hive_router && chmod +x hive_router
+              echo "SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY=$PWD/hive_router" >> "$GITHUB_ENV"
+              ;;
+            hive-gateway)
+              fetch graphql-hive/gateway hive-gateway@2.14.2 hive-gateway-Linux-X64.gz \
+                3ce1b24b9fa81b4b66ebe19f89f5a05f71cf48ff97eeacadf62bd825f7028986
+              gunzip --stdout hive-gateway-Linux-X64.gz > hive-gateway && chmod +x hive-gateway
+              echo "SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY=$PWD/hive-gateway" >> "$GITHUB_ENV"
+              ;;
+            apollo-router)
+              fetch apollographql/router v2.17.0 router-v2.17.0-x86_64-unknown-linux-gnu.tar.gz \
+                74b67256938e9fe1e263ce395dd67c0b884adcc1b1054433a0aa87674975c97a
+              mkdir apollo-router && tar -xzf router-v2.17.0-x86_64-unknown-linux-gnu.tar.gz -C apollo-router
+              echo "SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY=$PWD/apollo-router/dist/router" >> "$GITHUB_ENV"
+              ;;
+          esac
+          fetch apollographql/rover v0.41.0 rover-v0.41.0-x86_64-unknown-linux-gnu.tar.gz \
+            03d54d731711394afef43fff240eb41020cf20c2b10f472c10c51f3cd4609949
+          mkdir rover && tar -xzf rover-v0.41.0-x86_64-unknown-linux-gnu.tar.gz -C rover
+          echo "SCRIPTORIUM_ONTOLOGY_TEST_ROVER=$PWD/rover/dist/rover" >> "$GITHUB_ENV"
+          echo "APOLLO_HOME=$PWD/apollo-home" >> "$GITHUB_ENV"
+      # For the test that a server certificate nothing trusts is refused.
+      - name: Postgres behind a self-signed certificate
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          mkdir certs
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" \
+            -keyout certs/server.key -out certs/server.crt 2>/dev/null
+          chmod 644 certs/server.key
+          docker run -d --name untrusted-tls -e POSTGRES_PASSWORD=ittest \
+            -p 127.0.0.1:5433:5432 -v "$PWD/certs:/certs-src:ro" --entrypoint sh \
+            postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 \
+            -c 'cp /certs-src/server.crt /certs-src/server.key /tmp/ && chown postgres:postgres /tmp/server.crt /tmp/server.key && chmod 600 /tmp/server.key && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/server.crt -c ssl_key_file=/tmp/server.key'
+          for _ in $(seq 60); do
+            docker exec untrusted-tls pg_isready -q -U postgres -h 127.0.0.1 && break
+            sleep 1
+          done
+          test "$(docker exec untrusted-tls psql -U postgres -tAc 'show ssl')" = on
+      - name: DynamoDB Local answers
+        run: |
+          for _ in $(seq 60); do
+            curl -s -o /dev/null http://127.0.0.1:8000 && exit 0
+            sleep 1
+          done
+          exit 1
+      - name: Every suite, strictly, behind ${{ matrix.gateway }}
+        run: cargo test --locked --no-fail-fast --features postgres,dynamodb

@@ -431,6 +431,19 @@ SCRIPTORIUM_ONTOLOGY_TEST_GATEWAY=$PWD/target/tools/router \
   cargo test --manifest-path crates/scriptorium-ontology/Cargo.toml --features postgres,dynamodb --test e2e
 ```
 
+A test that cannot run here (no gateway, no test database, no Rover)
+notes why and passes. With `SCRIPTORIUM_ONTOLOGY_TEST_STRICT=1` it fails
+instead, so a run shows it exercised everything. CI
+(`.github/workflows/ontology.yml`) runs on every pull request that touches
+the ontology:
+
+- the gate: format, lints with and without the database features, and tests;
+- a build on the declared `rust-version`;
+- every suite, strictly, behind each of the three gateways, against
+  Postgres 18 (plus one behind a self-signed certificate) and DynamoDB
+  Local, with Rover. The gateways and Rover are pinned release binaries,
+  checked against their sha256.
+
 ## Commands
 
 | Command | What it does |
