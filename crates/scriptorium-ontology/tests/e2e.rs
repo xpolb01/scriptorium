@@ -277,7 +277,7 @@ fn a_strict_run_builds_every_store() {
 // ---------------------------------------------------------------------------
 // The documented path.
 
-/// docs/ONTOLOGY.md, "Running a federated query": init, serve publishing a
+/// docs/ONTOLOGY.md, "Run a federated query": init, serve publishing a
 /// supergraph, a gateway on it, and the query the docs send, verbatim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_documented_quickstart_answers_as_documented() {
@@ -286,7 +286,7 @@ async fn the_documented_quickstart_answers_as_documented() {
     };
     let docs = include_str!("../../../docs/ONTOLOGY.md");
     let section = docs
-        .split("### Running a federated query")
+        .split("### Run a federated query")
         .nth(1)
         .expect("the quickstart section");
     let body = section
