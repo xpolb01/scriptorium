@@ -334,14 +334,22 @@ impl PostgresStore {
     /// (tokio-postgres bounds only the socket connect, and moves on only when
     /// that fails, so each attempt is one address of its own.)
     async fn connect_with(&self, config: &Config) -> Result<Session> {
-        let failed = |why: String| self.error(format!("connecting with `{}`: {why}", self.url_env));
+        let all = destinations(config)
+            .map_err(|why| self.error(format!("connecting with `{}`: {why}", self.url_env)))?;
+        self.try_each(config, all).await
+    }
+
+    /// [`Self::connect_with`] over `destinations`, with `config`'s options.
+    async fn try_each(&self, config: &Config, destinations: Vec<Destination>) -> Result<Session> {
         let limit = config
             .get_connect_timeout()
             .copied()
             .unwrap_or(CONNECT_TIMEOUT);
         let random = config.get_load_balance_hosts() == LoadBalanceHosts::Random;
-        let mut last = String::new();
-        for destination in destinations(config).map_err(failed)? {
+        let mut last = String::from("no destination to try");
+        for destination in destinations {
+            // A host's name lookup counts toward its first address's time.
+            let started = tokio::time::Instant::now();
             let addresses = match addresses(&destination, limit, random).await {
                 Ok(addresses) => addresses,
                 Err(why) => {
@@ -349,10 +357,15 @@ impl PostgresStore {
                     continue;
                 }
             };
-            for address in addresses {
+            for (n, address) in addresses.into_iter().enumerate() {
+                let deadline = if n == 0 {
+                    started + limit
+                } else {
+                    tokio::time::Instant::now() + limit
+                };
                 let one =
                     one_destination(config, destination.host.as_ref(), address, destination.port);
-                match tokio::time::timeout(limit, self.open(&one)).await {
+                match tokio::time::timeout_at(deadline, self.open(&one)).await {
                     Ok(Ok(session)) => return Ok(session),
                     Ok(Err(why)) => last = why,
                     Err(_) => {
@@ -364,7 +377,7 @@ impl PostgresStore {
                 }
             }
         }
-        Err(failed(last))
+        Err(self.error(format!("connecting with `{}`: {last}", self.url_env)))
     }
 
     /// Connect to the one place `config` lists.
@@ -2040,29 +2053,22 @@ type Query { wide(id: ID!): Wide wides(first: Int): [Wide!]! }
         db.exec("CREATE TABLE paper (id text PRIMARY KEY); INSERT INTO paper VALUES ('a');")
             .await;
         let store = db.store(&[], &[("Paper", "id", &[])]);
-        let real: Config = std::env::var(TEST_URL_ENV).unwrap().parse().unwrap();
+        let mut real =
+            connection_config(TEST_URL_ENV, &std::env::var(TEST_URL_ENV).unwrap()).unwrap();
+        real.connect_timeout(std::time::Duration::from_secs(1));
         let (silent, task) = silent_server().await;
-        // The silent host first, then the test database.
-        let mut both = Config::new();
-        both.host("127.0.0.1").port(silent);
-        for host in real.get_hosts() {
-            if let Host::Tcp(name) = host {
-                both.host(name);
-            }
-        }
-        both.port(real.get_ports().first().copied().unwrap_or(5432))
-            .user(real.get_user().unwrap_or("postgres"))
-            .connect_timeout(std::time::Duration::from_secs(1));
-        if let Some(password) = real.get_password() {
-            both.password(password);
-        }
-        if let Some(dbname) = real.get_dbname() {
-            both.dbname(dbname);
-        }
+        // The silent host first, then the test database wherever it is (a
+        // host, a `hostaddr`, or a socket path), with its own options.
+        let mut both = vec![Destination {
+            host: Some(Host::Tcp("127.0.0.1".into())),
+            hostaddr: None,
+            port: silent,
+        }];
+        both.extend(destinations(&real).unwrap());
         let started = std::time::Instant::now();
         let session = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            store.connect_with(&both),
+            store.try_each(&real, both),
         )
         .await
         .expect("the attempt ends on its own")
