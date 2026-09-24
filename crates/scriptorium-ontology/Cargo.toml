@@ -1,0 +1,91 @@
+[package]
+name = "scriptorium-ontology"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94.1"
+license = "GPL-3.0-only"
+repository = "https://github.com/xpolb01/scriptorium"
+authors = ["Bogdan Polovko"]
+description = "Git-backed federated ontology for Scriptorium: sub-ontologies as GraphQL federation subgraphs"
+
+# A workspace of its own. `graphql-composition` enables serde_json's
+# `preserve_order` feature, and Cargo unifies features across a workspace:
+# sharing one with scriptorium-core would change its JSON key order (and with
+# it page content hashes). Build and test with
+# `--manifest-path crates/scriptorium-ontology/Cargo.toml`.
+[workspace]
+
+[[bin]]
+name = "scriptorium-ontology"
+path = "src/main.rs"
+
+# Mirrors the root workspace's lint policy.
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[features]
+default = []
+# Storage adapters that need a database client.
+postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-platform-verifier"]
+dynamodb = ["dep:aws-config", "dep:aws-sdk-dynamodb"]
+
+[dependencies]
+async-graphql = { version = "7.2.1", default-features = false, features = ["dynamic-schema"] }
+async-trait = "0.1.92"
+# `dynamodb` storage (Apache-2.0). aws-config keeps its defaults so the whole
+# standard credential chain works (SSO, `credential_process`). The client's
+# default `rustls` feature is the legacy hyper 0.14 / rustls 0.21 stack;
+# `default-https-client` alone is the current one (hyper 1, rustls on
+# aws-lc-rs, which the root workspace's reqwest already uses).
+aws-config = { version = "1.12.0", optional = true }
+aws-sdk-dynamodb = { version = "1.127.0", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
+axum = "0.8.9"
+clap = { version = "4.6.7", features = ["derive"] }
+cynic-parser = "0.11.2"
+git2 = { version = "0.21.0", default-features = false }
+# Held at 0.2 like scriptorium-core, so notes read the same way as vault pages
+# (0.3 parses unquoted `True`/`False` as booleans).
+gray_matter = { version = "0.2.9", default-features = false, features = ["yaml"] }
+# MPL-2.0 (GPL-compatible). Do not swap in `apollo-federation` (Elastic-2.0).
+graphql-composition = "0.12.2"
+miette = { version = "7.6.0", features = ["fancy"] }
+# MIT. Note bodies are read as CommonMark to find their links, as the vault
+# reads its pages (same version as the root workspace).
+pulldown-cmark = { version = "0.13.4", default-features = false }
+regex = "1.13.1"
+# `compose --out` asks the local subgraphs what they serve; `add-remote` and
+# `pull` fetch pinned remote schemas (rustls over aws-lc-rs, like the root
+# workspace's reqwest).
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# Held at 0.0.12 like the root workspace (0.0.13 renders YAML differently).
+serde_yml = "0.0.12"
+# Apache-2.0. Line diffs of refreshed remote schemas (`pull --dry-run`).
+similar = "3.2.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+# MIT/Apache-2.0. `postgres` storage; `with-serde_json-1` decodes `jsonb` rows.
+tokio-postgres = { version = "0.7.18", optional = true, features = ["with-serde_json-1"] }
+# `postgres` TLS: rustls on aws-lc-rs (the root workspace's TLS stack), verifying the
+# server against the system trust store. MIT, and MIT/Apache-2.0.
+tokio-postgres-rustls = { version = "0.14.0", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-platform-verifier = { version = "0.7.0", optional = true }
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+pretty_assertions = "1.4.1"
+tempfile = "3.27.0"

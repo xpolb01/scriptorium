@@ -149,13 +149,14 @@ vault serialize on `flock(2)`. No interleaved writes, no corrupted log.
 
 ## Architecture
 
-~28k lines of Rust across three crates:
+Rust across three crates, plus the experimental ontology in its own workspace:
 
 | Crate | Purpose |
 |-------|---------|
 | [`scriptorium-core`](crates/scriptorium-core/) | Library: vault model, wikilinks, link graph, `VaultTx` (atomic writes), schema loader, mechanical lint, `LlmProvider` trait + 5 implementations (Claude, OpenAI, Gemini, Ollama, Mock), hybrid search (vector + FTS5 + RRF), embeddings store, ingest, query, maintenance, learnings, skills, hooks, keychain, social import, URL fetch |
 | [`scriptorium-cli`](crates/scriptorium-cli/) | The `scriptorium` binary. 20+ `clap` subcommands including `setup`, `doctor`, `bench`, `learn`, `skill`, `social`, `vault` (multi-vault management) |
 | [`scriptorium-mcp`](crates/scriptorium-mcp/) | MCP server (JSON-RPC 2.0 over stdio) exposing 16 tools. Hand-rolled — no `rmcp` dependency |
+| [`scriptorium-ontology`](crates/scriptorium-ontology/) | *Experimental, separate workspace and binary* (`scriptorium-ontology init\|list\|compose\|check\|serve`). Git-backed federated ontology: sub-ontologies as GraphQL Federation v2 subgraphs, composed from any git revision and served over HTTP. See [`docs/ONTOLOGY.md`](docs/ONTOLOGY.md) |
 
 The shape is hexagonal / ports-and-adapters: the CLI and MCP server are
 two clients that share the same core library. The LLM provider is a

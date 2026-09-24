@@ -5,6 +5,10 @@ members = [
     "crates/scriptorium-cli",
     "crates/scriptorium-mcp",
 ]
+# The experimental ontology is its own workspace: graphql-composition enables
+# serde_json's `preserve_order`, and features are unified across a workspace,
+# which would change scriptorium-core's JSON key order (and page hashes).
+exclude = ["crates/scriptorium-ontology"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,4 @@
+# Optional settings for `scriptorium-ontology serve`.
+[serve]
+# addr = "127.0.0.1:4200"
+# base_url = "https://ontology.example.internal"  # when the gateway reaches us through a proxy

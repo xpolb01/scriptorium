@@ -1,0 +1,21 @@
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
+
+directive @inverse(of: String!) on FIELD_DEFINITION
+
+"A source code repository."
+type Repository @key(fields: "id") {
+  id: ID!
+  url: String!
+  implements: [Paper!]!
+}
+
+"software adds implementations to research's Paper (`extend`: research owns Paper records)."
+extend type Paper @key(fields: "id") {
+  id: ID!
+  implementations: [Repository!]! @inverse(of: "implements")
+}
+
+type Query {
+  repository(id: ID!): Repository
+}

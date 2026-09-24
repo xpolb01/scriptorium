@@ -1,0 +1,5 @@
+description = "People: the entities other sub-ontologies relate to."
+owners = []
+
+[storage]
+kind = "git"
