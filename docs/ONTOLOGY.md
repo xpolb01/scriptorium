@@ -274,6 +274,15 @@ fails instead of downgrading. A local server is reached without TLS unless
 the connection string says `sslmode=require`. (`verify-full` is how
 `require` behaves here; write `require`.)
 
+Connecting tries the hosts the connection string lists, and each address
+a host name resolves to, in turn, as libpq does: each gets the connection
+string's `connect_timeout` (10 s if it sets none), its name lookup, TLS,
+and the startup exchange included, and one that fails or stalls gives way
+to the next. A query gets 30 s: the request then fails (for a client, with
+a reference), the connection is closed, and the next request reconnects.
+A server that stalls, or a proxy that keeps a dead connection open,
+cannot hold `serve`'s startup or its requests.
+
 ### DynamoDB items
 
 `storage.kind = "dynamodb"` (build with `--features dynamodb`) keeps a
@@ -301,7 +310,9 @@ schema at startup and makes one `GetItem` and one `Scan`, so credentials
 that can describe the table but not read it fail there. Lookups use
 `GetItem`; lists and `@inverse` relations scan the table, reading items by
 `type` or by `pk` prefix, so an item whose two disagree is an error rather
-than a silent gap.
+than a silent gap. Connecting gives up after 10 s, and each request to
+DynamoDB, retries included, after 30 s, so an endpoint that stops answering
+cannot hold `serve`'s startup or its requests.
 
 ### Remote sub-ontologies
 
