@@ -69,8 +69,62 @@ fn apply_unless_current(conn: &Connection, version: u32, sql: &str) -> rusqlite:
     if found >= version {
         return Ok(found);
     }
-    conn.execute_batch(sql)?;
+    if version == HOOK_EVENTS_VIEW_VERSION {
+        apply_hook_events_view(conn, sql)?;
+    } else {
+        conn.execute_batch(sql)?;
+    }
     Ok(version)
+}
+
+/// Migration 002 replaces the legacy `hook_events` table with a view over
+/// `logs`.
+const HOOK_EVENTS_VIEW_VERSION: u32 = 2;
+
+/// Columns of the legacy `hook_events` table, which the view keeps.
+const HOOK_EVENT_COLUMNS: &str = "ts, session_id, parent_session_id, hook_type, source, cwd, \
+     score, threshold, signals, metrics, agent_type, privacy_veto, decision, \
+     peak_turn_score, session_aggregate_score, final_score, turn_count, \
+     subagent_count, raw_json, raw_json_hash";
+
+/// Apply migration 002 without losing legacy rows. Its SQL drops the
+/// legacy table, so rename the table first, then copy its rows in through
+/// the view's insert trigger: they get the column keys and the
+/// `legacy-shim:` dedup key that live writes use. Drop the old table only
+/// when every row arrived. Otherwise keep it as `hook_events_legacy`: the
+/// trigger skips rows it cannot store, such as a row whose timestamp does
+/// not parse. Runs inside the caller's write transaction.
+fn apply_hook_events_view(conn: &Connection, sql: &str) -> rusqlite::Result<()> {
+    let legacy: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hook_events')",
+        [],
+        |r| r.get(0),
+    )?;
+    if legacy {
+        conn.execute_batch("ALTER TABLE hook_events RENAME TO hook_events_legacy")?;
+    }
+    conn.execute_batch(sql)?;
+    if legacy {
+        conn.execute_batch(&format!(
+            "INSERT INTO hook_events ({HOOK_EVENT_COLUMNS}) \
+             SELECT {HOOK_EVENT_COLUMNS} FROM hook_events_legacy ORDER BY id"
+        ))?;
+        let missing: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM hook_events_legacy AS l WHERE NOT EXISTS \
+             (SELECT 1 FROM logs WHERE dedup_hash = 'legacy-shim:' || l.raw_json_hash)",
+            [],
+            |r| r.get(0),
+        )?;
+        if missing == 0 {
+            conn.execute_batch("DROP TABLE hook_events_legacy")?;
+        } else {
+            tracing::warn!(
+                missing,
+                "kept hook_events_legacy: some legacy hook events could not be copied"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Read the highest applied version from `schema_version`. Returns `0`
