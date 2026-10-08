@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // ── Retry config ─────────────────────────────────────────────────────────
 
@@ -53,8 +53,6 @@ use std::time::{Duration, Instant};
 const MAX_WRITE_ATTEMPTS: u32 = 3;
 /// Base backoff in ms; jitter samples uniformly from `[BASE, 2*BASE)`.
 const BASE_BACKOFF_MS: u64 = 25;
-/// How long [`enable_wal`] retries the WAL switch. Matches `busy_timeout`.
-const WAL_SWITCH_BUDGET: Duration = Duration::from_secs(5);
 
 // ── Global stats ─────────────────────────────────────────────────────────
 
@@ -1081,32 +1079,10 @@ impl TelemetryStore {
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn configure_conn(conn: &Connection) -> rusqlite::Result<()> {
-    // Set the busy timeout first, so the statements below wait for a
-    // lock instead of failing at once with "database is locked".
-    conn.pragma_update(None, "busy_timeout", 5000i64)?;
-    enable_wal(conn)?;
+    crate::sqlite::open_wal(conn)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
-}
-
-/// Switch the database to WAL mode. Converting a new database needs an
-/// exclusive lock, and while another connection converts it SQLite
-/// returns `SQLITE_BUSY` at once, without calling the busy handler. So
-/// retry here, within the same budget as `busy_timeout`.
-fn enable_wal(conn: &Connection) -> rusqlite::Result<()> {
-    let deadline = Instant::now() + WAL_SWITCH_BUDGET;
-    loop {
-        // `journal_mode = WAL` is a PRAGMA that returns a row; use query_row.
-        match conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0)) {
-            Ok(_) => return Ok(()),
-            Err(e) if is_retryable(&e) && Instant::now() < deadline => {
-                let jitter_ms = rand::rng().random_range(BASE_BACKOFF_MS..BASE_BACKOFF_MS * 2);
-                thread::sleep(Duration::from_millis(jitter_ms));
-            }
-            Err(e) => return Err(e),
-        }
-    }
 }
 
 /// Well-known attributes hash for the single `telemetry-marker` resource.

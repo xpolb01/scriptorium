@@ -49,6 +49,13 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::vault::PageId;
 
+/// Row counts of the FTS5 table and the embeddings table.
+fn fts_and_embedding_counts(conn: &Connection) -> rusqlite::Result<(i64, i64)> {
+    let fts_count = conn.query_row("SELECT COUNT(*) FROM fts_chunks", [], |r| r.get(0))?;
+    let emb_count = conn.query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))?;
+    Ok((fts_count, emb_count))
+}
+
 /// Errors specific to the embeddings store, wrapped into [`Error::Other`].
 // `map_err` consumes the error by value, so taking `&rusqlite::Error` here
 // would force every call site into `|e| wrap_sql(&e)`.
@@ -110,9 +117,9 @@ impl EmbeddingsStore {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        crate::sqlite::open_wal(&conn).map_err(wrap_sql)?;
         conn.execute_batch(
             r"
-            PRAGMA journal_mode = WAL;
             PRAGMA synchronous  = NORMAL;
             CREATE TABLE IF NOT EXISTS embeddings (
                 page_id      TEXT    NOT NULL,
@@ -145,19 +152,23 @@ impl EmbeddingsStore {
         // Backfill: if the FTS5 table is empty but the embeddings table has
         // rows, populate FTS5 from the existing data. This handles the
         // migration path for databases created before FTS5 was added.
-        let fts_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM fts_chunks", [], |r| r.get(0))
-            .map_err(wrap_sql)?;
-        let emb_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))
-            .map_err(wrap_sql)?;
+        // Check again under the write lock: another connection may have
+        // backfilled since the first check, and the same rows would then
+        // fail the FTS5 rowid constraint.
+        let (fts_count, emb_count) = fts_and_embedding_counts(&conn).map_err(wrap_sql)?;
         if fts_count == 0 && emb_count > 0 {
-            conn.execute_batch(
-                r"
-                INSERT INTO fts_chunks(rowid, page_id, chunk_text, heading, provider, model)
-                SELECT rowid, page_id, chunk_text, heading, provider, model FROM embeddings;
-                ",
-            )
+            crate::sqlite::with_write_txn(&conn, || {
+                let (fts_count, emb_count) = fts_and_embedding_counts(&conn)?;
+                if fts_count == 0 && emb_count > 0 {
+                    conn.execute_batch(
+                        r"
+                        INSERT INTO fts_chunks(rowid, page_id, chunk_text, heading, provider, model)
+                        SELECT rowid, page_id, chunk_text, heading, provider, model FROM embeddings;
+                        ",
+                    )?;
+                }
+                Ok(())
+            })
             .map_err(wrap_sql)?;
         }
 
@@ -195,8 +206,11 @@ impl EmbeddingsStore {
         let dim = i64::try_from(row.vector.len())
             .map_err(|_| Error::Other(anyhow::anyhow!("dim overflow")))?;
         let page_id_str = row.page_id.to_string();
-        self.conn
-            .execute(
+        // Write the row and its FTS5 entry in one transaction, so no other
+        // connection sees one without the other. `init`'s FTS5 backfill
+        // relies on that.
+        let rowid = crate::sqlite::with_write_txn(&self.conn, || {
+            self.conn.execute(
                 r"
                 INSERT INTO embeddings
                     (page_id, content_hash, chunk_idx, chunk_text, heading,
@@ -220,14 +234,11 @@ impl EmbeddingsStore {
                     dim,
                     bytes,
                 ],
-            )
-            .map_err(wrap_sql)?;
+            )?;
 
-        // Sync the FTS5 index. Get the rowid of the just-upserted row and
-        // insert-or-replace in the FTS5 table.
-        let rowid: i64 = self
-            .conn
-            .query_row(
+            // Sync the FTS5 index. Get the rowid of the just-upserted row and
+            // insert-or-replace in the FTS5 table.
+            let rowid: i64 = self.conn.query_row(
                 r"SELECT rowid FROM embeddings
                   WHERE page_id = ?1 AND content_hash = ?2 AND chunk_idx = ?3
                     AND provider = ?4 AND model = ?5",
@@ -239,14 +250,11 @@ impl EmbeddingsStore {
                     row.model
                 ],
                 |r| r.get(0),
-            )
-            .map_err(wrap_sql)?;
-        // Delete then re-insert (FTS5 contentless tables don't support UPDATE).
-        self.conn
-            .execute("DELETE FROM fts_chunks WHERE rowid = ?1", params![rowid])
-            .map_err(wrap_sql)?;
-        self.conn
-            .execute(
+            )?;
+            // Delete then re-insert (FTS5 contentless tables don't support UPDATE).
+            self.conn
+                .execute("DELETE FROM fts_chunks WHERE rowid = ?1", params![rowid])?;
+            self.conn.execute(
                 r"INSERT INTO fts_chunks(rowid, page_id, chunk_text, heading, provider, model)
                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
@@ -257,8 +265,10 @@ impl EmbeddingsStore {
                     row.provider,
                     row.model
                 ],
-            )
-            .map_err(wrap_sql)?;
+            )?;
+            Ok(rowid)
+        })
+        .map_err(wrap_sql)?;
 
         // Sync the in-process vector index.
         #[allow(clippy::cast_sign_loss)]
@@ -663,6 +673,43 @@ mod tests {
             provider: "mock".into(),
             model: "mock-1".into(),
             vector,
+        }
+    }
+
+    /// Regression: the store set no busy timeout, so with several
+    /// connections on one file a write failed at once with "database is
+    /// locked" instead of waiting. Switching a new file to WAL failed the
+    /// same way.
+    #[test]
+    fn concurrent_opens_and_upserts_all_succeed() {
+        const WRITERS: usize = 16;
+        for round in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("e.sqlite");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|i| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let store = EmbeddingsStore::open(&path)?;
+                        store.upsert(&row(
+                            PageId::new(),
+                            "hash",
+                            i,
+                            "chunk",
+                            unit(vec![1.0, 0.0]),
+                        ))
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let result = handle.join().unwrap();
+                assert!(result.is_ok(), "round {round}: {result:?}");
+            }
+            let store = EmbeddingsStore::open(&path).unwrap();
+            assert_eq!(store.len().unwrap(), WRITERS, "round {round}");
         }
     }
 

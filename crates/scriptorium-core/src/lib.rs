@@ -46,6 +46,7 @@ pub mod search;
 pub mod setup;
 pub mod skills;
 pub mod social;
+mod sqlite;
 pub mod suggest;
 pub mod telemetry;
 pub mod url_fetch;
