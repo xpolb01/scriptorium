@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ── Retry config ─────────────────────────────────────────────────────────
 
@@ -53,6 +53,8 @@ use std::time::Duration;
 const MAX_WRITE_ATTEMPTS: u32 = 3;
 /// Base backoff in ms; jitter samples uniformly from `[BASE, 2*BASE)`.
 const BASE_BACKOFF_MS: u64 = 25;
+/// How long [`enable_wal`] retries the WAL switch. Matches `busy_timeout`.
+const WAL_SWITCH_BUDGET: Duration = Duration::from_secs(5);
 
 // ── Global stats ─────────────────────────────────────────────────────────
 
@@ -1079,12 +1081,32 @@ impl TelemetryStore {
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn configure_conn(conn: &Connection) -> rusqlite::Result<()> {
-    // `journal_mode = WAL` is a PRAGMA that returns a row; use query_row.
-    let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // Set the busy timeout first, so the statements below wait for a
+    // lock instead of failing at once with "database is locked".
     conn.pragma_update(None, "busy_timeout", 5000i64)?;
+    enable_wal(conn)?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
+}
+
+/// Switch the database to WAL mode. Converting a new database needs an
+/// exclusive lock, and while another connection converts it SQLite
+/// returns `SQLITE_BUSY` at once, without calling the busy handler. So
+/// retry here, within the same budget as `busy_timeout`.
+fn enable_wal(conn: &Connection) -> rusqlite::Result<()> {
+    let deadline = Instant::now() + WAL_SWITCH_BUDGET;
+    loop {
+        // `journal_mode = WAL` is a PRAGMA that returns a row; use query_row.
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0)) {
+            Ok(_) => return Ok(()),
+            Err(e) if is_retryable(&e) && Instant::now() < deadline => {
+                let jitter_ms = rand::rng().random_range(BASE_BACKOFF_MS..BASE_BACKOFF_MS * 2);
+                thread::sleep(Duration::from_millis(jitter_ms));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Well-known attributes hash for the single `telemetry-marker` resource.
@@ -1290,6 +1312,37 @@ mod tests {
             v,
             i64::from(crate::telemetry::schema::CURRENT_SCHEMA_VERSION)
         );
+    }
+
+    /// Regression: hooks run `scriptorium log emit` in parallel, so
+    /// several processes can open a fresh database at once. Two of them
+    /// could both apply migration 002, and the second `DROP TABLE IF
+    /// EXISTS hook_events` then failed on the view the first had
+    /// created. Others failed with "database is locked" because the WAL
+    /// switch ran before `busy_timeout` was set. Each failed open
+    /// dropped a record.
+    #[test]
+    fn concurrent_first_opens_all_succeed() {
+        const OPENERS: usize = 16;
+        for round in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("t.sqlite");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(OPENERS));
+            let handles: Vec<_> = (0..OPENERS)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        TelemetryStore::open(&path).map(|_| ())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let result = handle.join().unwrap();
+                assert!(result.is_ok(), "round {round}: open failed: {result:?}");
+            }
+        }
     }
 
     #[test]
