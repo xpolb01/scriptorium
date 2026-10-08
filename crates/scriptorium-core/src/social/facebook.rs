@@ -302,7 +302,7 @@ fn find_json_root(dirs: &[PathBuf]) -> Result<PathBuf> {
 }
 
 fn has_json_files(dir: &Path) -> bool {
-    fs::read_dir(dir).ok().is_some_and(|entries| {
+    fs::read_dir(dir).is_ok_and(|entries| {
         entries.filter_map(std::result::Result::ok).any(|e| {
             e.path().extension().is_some_and(|ext| ext == "json")
                 || e.file_type().is_ok_and(|ft| ft.is_dir())
@@ -1683,4 +1683,30 @@ fn list_json_files(dir: &Path) -> Vec<PathBuf> {
         .collect();
     files.sort();
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn has_json_files_detects_json_files_and_subdirectories() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!has_json_files(dir.path()), "empty directory");
+
+        fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        assert!(!has_json_files(dir.path()), "no JSON file, no subdirectory");
+
+        fs::write(dir.path().join("posts.json"), "[]").unwrap();
+        assert!(has_json_files(dir.path()), "JSON file");
+
+        let nested = tempfile::tempdir().unwrap();
+        fs::create_dir(nested.path().join("messages")).unwrap();
+        assert!(has_json_files(nested.path()), "subdirectory");
+
+        assert!(
+            !has_json_files(&dir.path().join("missing")),
+            "missing directory"
+        );
+    }
 }
