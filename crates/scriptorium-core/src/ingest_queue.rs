@@ -247,6 +247,9 @@ pub async fn drain(
     }
     report.considered = sorted.len();
 
+    // Built on the first duplicate that is a staged session note, and
+    // dropped after each ingest, which can store a new copy.
+    let mut stored: Option<std::collections::HashSet<String>> = None;
     for marker_path in sorted {
         let bytes = match fs::read(&marker_path) {
             Ok(b) => b,
@@ -321,6 +324,20 @@ pub async fn drain(
             Ok(true) => {
                 report.skipped_dup += 1;
                 let _ = fs::remove_file(&marker_path);
+                // The content was ingested before, so a staged session note
+                // is redundant, as on the success path below. Delete it only
+                // when a stored copy exists: the hash store also holds
+                // hashes of notes that were never stored. The near-duplicate
+                // gate once skipped every session note as a copy of itself,
+                // and the drain recorded the hash anyway.
+                if !cfg.dry_run
+                    && is_staged_session_note(vault, &marker.source)
+                    && stored
+                        .get_or_insert_with(|| stored_canonical_hashes(vault))
+                        .contains(&hash)
+                {
+                    let _ = fs::remove_file(&marker.source);
+                }
                 continue;
             }
             Ok(false) => {}
@@ -360,13 +377,10 @@ pub async fn drain(
                 let _ = fs::remove_file(&marker_path);
                 // Session source files are redundant after ingest — the
                 // interned copy in sources/articles/ is canonical in git.
-                // Canonicalize to handle symlinks (e.g. /tmp → /private/tmp).
-                let sessions_dir = vault.root().join("sources/sessions");
-                if let Ok(canonical) = sessions_dir.as_std_path().canonicalize() {
-                    if marker.source.starts_with(&canonical) {
-                        let _ = fs::remove_file(&marker.source);
-                    }
+                if is_staged_session_note(vault, &marker.source) {
+                    let _ = fs::remove_file(&marker.source);
                 }
+                stored = None;
                 report.ingested += 1;
                 if ingest_report.redundant {
                     report.redundant_skips += 1;
@@ -639,6 +653,52 @@ fn canonical_hash(text: &str) -> String {
 
 fn hash_store_path(vault: &Vault) -> PathBuf {
     vault.meta_dir().join(HASH_STORE_FILE).into_std_path_buf()
+}
+
+/// True when `source` is a session note staged in `sources/sessions/`.
+/// Canonicalize to handle symlinks (e.g. /tmp → /private/tmp).
+fn is_staged_session_note(vault: &Vault, source: &Path) -> bool {
+    vault
+        .root()
+        .join("sources/sessions")
+        .as_std_path()
+        .canonicalize()
+        .is_ok_and(|sessions| source.starts_with(sessions))
+}
+
+/// Canonical hashes of the files stored under `sources/`, staged session
+/// notes excepted. Files over 2 MiB or not UTF-8 are skipped, so a match
+/// always proves that a stored copy exists. Symlinks are not followed, and
+/// the staging directory is compared by its real path, so a staged note
+/// can never count as a stored copy of itself.
+fn stored_canonical_hashes(vault: &Vault) -> std::collections::HashSet<String> {
+    const MAX_BYTES: u64 = 2 * 1024 * 1024;
+    let sources = vault.root().join("sources").into_std_path_buf();
+    let staging = sources.join("sessions").canonicalize().ok();
+    let mut hashes = std::collections::HashSet::new();
+    let mut stack = vec![sources];
+    while let Some(dir) = stack.pop() {
+        if staging.is_some() && dir.canonicalize().ok() == staging {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(std::result::Result::ok) {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() && entry.metadata().is_ok_and(|m| m.len() <= MAX_BYTES) {
+                if let Ok(text) = fs::read_to_string(&path) {
+                    hashes.insert(canonical_hash(&text));
+                }
+            }
+        }
+    }
+    hashes
 }
 
 fn hash_store_contains(vault: &Vault, h: &str) -> Result<bool> {
@@ -1105,6 +1165,193 @@ mod tests {
         let report = drain(&vault, &ingest_plan_mock(), cfg).await.unwrap();
         assert_eq!(report.ingested, 1);
         assert!(src.exists(), "non-session source should NOT be deleted");
+    }
+
+    /// A duplicate of an ingested note is redundant once a stored copy
+    /// exists, so the drain deletes the staged note, as it does after an
+    /// ingest. Before this, duplicates piled up in `sources/sessions/`.
+    #[tokio::test]
+    async fn drain_deletes_duplicate_session_note_with_stored_copy() {
+        let (dir, vault) = make_ingest_vault();
+        let sessions = dir.path().join("sources").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let cfg = || DrainConfig {
+            debounce: Duration::from_secs(0),
+            ..Default::default()
+        };
+
+        let first = write_source(
+            &sessions,
+            "2026-10-07-session-aaaa1111.md",
+            "Session ID: A\ndup cleanup body\n",
+        );
+        enqueue(&vault, &first, None).unwrap();
+        let report = drain(&vault, &ingest_plan_mock(), cfg()).await.unwrap();
+        assert_eq!(report.ingested, 1);
+
+        let again = write_source(
+            &sessions,
+            "2026-10-08-session-aaaa1111.md",
+            "Session ID: B\ndup cleanup body\n",
+        );
+        enqueue(&vault, &again, None).unwrap();
+        let report = drain(&vault, &ingest_plan_mock(), cfg()).await.unwrap();
+        assert_eq!(report.skipped_dup, 1);
+        assert!(
+            !again.exists(),
+            "a duplicate with a stored copy should be deleted"
+        );
+    }
+
+    /// The hash store can name content that was never stored. A staged
+    /// note with that content is then the only copy, so the drain keeps it.
+    #[tokio::test]
+    async fn drain_keeps_duplicate_session_note_without_stored_copy() {
+        let (dir, vault) = make_ingest_vault();
+        let sessions = dir.path().join("sources").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let body = "Session ID: C\nnever stored body\n";
+        hash_store_append(&vault, &canonical_hash(body)).unwrap();
+        let note = write_source(&sessions, "2026-10-08-session-cccc3333.md", body);
+        enqueue(&vault, &note, None).unwrap();
+
+        let cfg = DrainConfig {
+            debounce: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let report = drain(&vault, &dummy_provider(), cfg).await.unwrap();
+        assert_eq!(report.skipped_dup, 1);
+        assert!(note.exists(), "the only copy of the content must be kept");
+    }
+
+    /// `sources/sessions` may be a symlink to another directory under
+    /// `sources/`. The scan must not reach the staged note through that
+    /// directory's real name and count it as its own stored copy.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_keeps_duplicate_when_staging_dir_is_a_symlink() {
+        let (dir, vault) = make_ingest_vault();
+        let staging = dir.path().join("sources").join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        std::os::unix::fs::symlink(&staging, dir.path().join("sources").join("sessions")).unwrap();
+        let body = "Session ID: S\nsymlinked staging body\n";
+        hash_store_append(&vault, &canonical_hash(body)).unwrap();
+        let note = write_source(
+            &dir.path().join("sources").join("sessions"),
+            "note.md",
+            body,
+        );
+        enqueue(&vault, &note, None).unwrap();
+
+        let cfg = DrainConfig {
+            debounce: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let report = drain(&vault, &dummy_provider(), cfg).await.unwrap();
+        assert_eq!(report.skipped_dup, 1);
+        assert!(note.exists(), "the only copy of the content must be kept");
+    }
+
+    #[tokio::test]
+    async fn drain_dry_run_keeps_duplicate_session_note() {
+        let (dir, vault) = make_ingest_vault();
+        let sessions = dir.path().join("sources").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let first = write_source(&sessions, "first.md", "Session ID: D\ndry run body\n");
+        enqueue(&vault, &first, None).unwrap();
+        let cfg = |dry_run| DrainConfig {
+            debounce: Duration::from_secs(0),
+            dry_run,
+            ..Default::default()
+        };
+        assert_eq!(
+            drain(&vault, &ingest_plan_mock(), cfg(false))
+                .await
+                .unwrap()
+                .ingested,
+            1
+        );
+
+        let again = write_source(&sessions, "again.md", "Session ID: E\ndry run body\n");
+        enqueue(&vault, &again, None).unwrap();
+        let report = drain(&vault, &ingest_plan_mock(), cfg(true)).await.unwrap();
+        assert_eq!(report.skipped_dup, 1);
+        assert!(again.exists(), "a dry run must not delete sources");
+    }
+
+    /// Within one run: a duplicate builds the stored-hash set, a new note
+    /// is then ingested, and a duplicate of that new note comes last. The
+    /// set must include the new copy, or the last note would keep its file
+    /// but lose its marker, and no later run could clean it up.
+    #[tokio::test]
+    async fn drain_deletes_duplicate_of_note_ingested_in_same_run() {
+        let (dir, vault) = make_ingest_vault();
+        let sessions = dir.path().join("sources").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let x1 = write_source(&sessions, "x1.md", "Session ID: X1\nbody x\n");
+        enqueue(&vault, &x1, None).unwrap();
+        let cfg = || DrainConfig {
+            debounce: Duration::from_secs(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            drain(&vault, &distinct_plan_mock(), cfg())
+                .await
+                .unwrap()
+                .ingested,
+            1
+        );
+
+        let x2 = write_source(&sessions, "x2.md", "Session ID: X2\nbody x\n");
+        let y1 = write_source(&sessions, "y1.md", "Session ID: Y1\nbody y\n");
+        let y2 = write_source(&sessions, "y2.md", "Session ID: Y2\nbody y\n");
+        for (name, src) in [
+            ("100-a.json", &x2),
+            ("200-b.json", &y1),
+            ("300-c.json", &y2),
+        ] {
+            let marker = QueueMarker {
+                version: 1,
+                source: src.canonicalize().unwrap(),
+                session_id: None,
+                enqueued_at: Utc::now() - chrono::Duration::seconds(10),
+            };
+            write_marker_file(&vault, name, &marker);
+        }
+        let report = drain(&vault, &distinct_plan_mock(), cfg()).await.unwrap();
+        assert_eq!((report.skipped_dup, report.ingested), (2, 1));
+        assert!(!x2.exists() && !y1.exists() && !y2.exists());
+    }
+
+    /// A plan mock that creates a different page on every call, so several
+    /// ingests can run against one vault.
+    fn distinct_plan_mock() -> crate::llm::MockProvider {
+        use crate::llm::prompts::{IngestAction, IngestPageAction, IngestPlan};
+        use crate::llm::{CompletionResponse, Usage};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        crate::llm::MockProvider::with_handler(move |_req| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            let plan = IngestPlan {
+                summary: format!("distinct ingest {n}"),
+                pages: vec![IngestPageAction {
+                    action: IngestAction::Create,
+                    path: format!("wiki/concepts/distinct-{n}.md"),
+                    title: format!("Distinct {n}"),
+                    tags: vec![],
+                    body: "Body without wikilinks.\n".into(),
+                    source_quote: None,
+                    supersedes: vec![],
+                }],
+                log_entry: format!("distinct {n}"),
+                redundant: false,
+            };
+            Ok(CompletionResponse {
+                text: serde_json::to_string(&plan).unwrap(),
+                usage: Usage::default(),
+                model: "mock-1".into(),
+            })
+        })
     }
 
     #[tokio::test]
