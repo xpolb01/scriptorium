@@ -1321,6 +1321,52 @@ mod tests {
         }
     }
 
+    /// Regression: migration 002 drops a legacy `hook_events` table, so
+    /// every open path (`hooks migrate-backfill` included) lost its rows.
+    /// They are now copied into the view first.
+    #[test]
+    fn legacy_hook_events_rows_survive_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE hook_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+                session_id TEXT NOT NULL, parent_session_id TEXT,
+                hook_type TEXT NOT NULL DEFAULT 'stop', source TEXT, cwd TEXT,
+                score INTEGER, threshold INTEGER DEFAULT 6, signals TEXT, metrics TEXT,
+                agent_type TEXT, privacy_veto TEXT, decision TEXT,
+                peak_turn_score INTEGER, session_aggregate_score INTEGER,
+                final_score INTEGER, turn_count INTEGER, subagent_count INTEGER,
+                raw_json TEXT, raw_json_hash TEXT NOT NULL
+            );
+            INSERT INTO hook_events (ts, session_id, hook_type, score, raw_json, raw_json_hash)
+            VALUES ('2026-04-15T10:00:00Z', 'legacy-1', 'stop', 7, '{}', 'hash-legacy-1');",
+        )
+        .unwrap();
+        drop(conn);
+
+        TelemetryStore::open(&path).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let kind: String = conn
+            .query_row(
+                "SELECT type FROM sqlite_master WHERE name = 'hook_events'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "view", "migration 002 should have run");
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM hook_events WHERE session_id = 'legacy-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "the legacy row was dropped instead of copied");
+    }
+
     #[test]
     fn insert_log_basic() {
         let (_dir, store) = test_db();
