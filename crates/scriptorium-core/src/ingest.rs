@@ -104,8 +104,8 @@ pub struct IngestOptions {
     pub dry_run: bool,
     /// Lifecycle hooks to fire at key points. `None` = no hooks.
     pub hooks: Option<crate::hooks::HooksConfig>,
-    /// Ingest even when the source is a near-duplicate of one already in
-    /// `sources/` (the deterministic pre-LLM gate is skipped).
+    /// Ingest even when the source is a near-duplicate of one already
+    /// interned in `sources/` (the deterministic pre-LLM gate is skipped).
     pub force: bool,
 }
 
@@ -901,44 +901,59 @@ fn apply_provenance_extras(
     }
 }
 
-/// Scan `sources/` for a near-duplicate of `text`. Returns the first
-/// existing source above [`NEAR_DUP_THRESHOLD`] with its similarity.
-/// Only readable UTF-8 sources under the size cap are compared.
+/// Every category [`category_for_ext`] files an interned source under.
+const SOURCE_CATEGORIES: [&str; 4] = ["articles", "pdfs", "web", "data"];
+
+/// Scan the interned sources for a near-duplicate of `text`. Returns the
+/// first one above [`NEAR_DUP_THRESHOLD`] with its similarity. Only
+/// readable UTF-8 sources under the size cap are compared.
+///
+/// Only files [`intern_source`] wrote count (`sources/<category>/<hash>-…`
+/// and their `.extracted.md` siblings). Other files under `sources/` are
+/// staged, not ingested: session notes in `sources/sessions/`, chat
+/// imports, files dropped in by hand. The source being ingested is often
+/// one of them, so comparing against them skipped it as a duplicate of
+/// itself.
 fn find_near_duplicate_source(vault: &Vault, text: &str) -> Option<(Utf8PathBuf, f32)> {
-    let sources_root = vault.root().join("sources");
-    let mut stack = vec![sources_root.clone()];
-    while let Some(dir) = stack.pop() {
+    for category in SOURCE_CATEGORIES {
+        let dir = vault.root().join("sources").join(category);
         let Ok(entries) = std::fs::read_dir(dir.as_std_path()) else {
             continue;
         };
         for entry in entries.filter_map(std::result::Result::ok) {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Ok(utf8) = Utf8PathBuf::from_path_buf(path) {
-                    stack.push(utf8);
-                }
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            if !is_interned_name(name) {
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
-            if meta.len() > NEAR_DUP_MAX_BYTES {
+            if !meta.is_file() || meta.len() > NEAR_DUP_MAX_BYTES {
                 continue;
             }
-            let Ok(existing_text) = std::fs::read_to_string(&path) else {
+            let Ok(existing_text) = std::fs::read_to_string(entry.path()) else {
                 continue;
             };
             let sim = crate::extract::shingle_jaccard(text, &existing_text);
             if sim >= NEAR_DUP_THRESHOLD {
-                let rel = path
-                    .strip_prefix(vault.root().as_std_path())
-                    .unwrap_or(&path)
-                    .to_path_buf();
-                if let Ok(utf8) = Utf8PathBuf::from_path_buf(rel) {
-                    return Some((utf8, sim));
-                }
+                let rel = Utf8PathBuf::from(format!("sources/{category}/{name}"));
+                return Some((rel, sim));
             }
         }
     }
     None
+}
+
+/// True for the file names [`intern_source`] writes: a 12-character
+/// lowercase hex hash prefix, then `-`.
+fn is_interned_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() > 13
+        && bytes[12] == b'-'
+        && bytes[..12]
+            .iter()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Returns the vault-relative interned path plus whether this call newly
@@ -1256,6 +1271,28 @@ mod tests {
         assert_eq!(category_for_ext("pdf"), "pdfs");
         assert_eq!(category_for_ext("html"), "web");
         assert_eq!(category_for_ext("zip"), "data");
+    }
+
+    #[test]
+    fn source_categories_cover_category_for_ext() {
+        for ext in ["md", "markdown", "txt", "text", "pdf", "html", "htm", "zip"] {
+            assert!(
+                SOURCE_CATEGORIES.contains(&category_for_ext(ext)),
+                "{ext} files under a category the near-duplicate gate skips"
+            );
+        }
+    }
+
+    #[test]
+    fn is_interned_name_accepts_only_intern_source_names() {
+        assert!(is_interned_name("5bccda2df7f3-report.md"));
+        assert!(is_interned_name("5bccda2df7f3-.md"));
+        assert!(is_interned_name("5bccda2df7f3-scan.pdf.extracted.md"));
+        assert!(!is_interned_name("2026-10-08-session-abcd1234.md"));
+        assert!(!is_interned_name("dropped.md"));
+        assert!(!is_interned_name("5BCCDA2DF7F3-upper.md"));
+        assert!(!is_interned_name("5bccda2df7f-short.md"));
+        assert!(!is_interned_name("5bccda2df7f3-"));
     }
 
     use crate::llm::prompts::{IngestAction, IngestPageAction, IngestPlan};
