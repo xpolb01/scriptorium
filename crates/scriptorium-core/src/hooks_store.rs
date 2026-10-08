@@ -380,13 +380,20 @@ impl HooksStore {
         // database this only reads the schema version, so read paths never
         // wait for the write lock.
         crate::telemetry::schema::apply_migrations(&conn).map_err(wrap_sql)?;
-        // The view also shows hook telemetry that was written through
-        // `TelemetryStore::insert_log`. Those rows have no legacy columns
-        // (NULL `session_id`) and are not hook events. Every read below
-        // goes through this per-connection view of the shim's rows.
+        // Every read below goes through this per-connection view. The hook
+        // scripts write their events with `scriptorium log emit`: those
+        // rows carry `session_id` and the other legacy keys, but no
+        // `raw_json_hash`, so the view shows that column as ''. Rows with
+        // no `session_id` (nudges, health checks) are not hook events and
+        // cannot map into a `HookEvent`.
         conn.execute_batch(
             "CREATE TEMP VIEW IF NOT EXISTS hook_event_rows AS \
-             SELECT * FROM main.hook_events WHERE raw_json_hash IS NOT NULL",
+             SELECT id, ts, session_id, parent_session_id, hook_type, source, cwd, \
+                    score, threshold, signals, metrics, agent_type, privacy_veto, \
+                    decision, peak_turn_score, session_aggregate_score, final_score, \
+                    turn_count, subagent_count, raw_json, \
+                    COALESCE(raw_json_hash, '') AS raw_json_hash \
+             FROM main.hook_events WHERE session_id IS NOT NULL",
         )
         .map_err(wrap_sql)?;
         Ok(Self { conn, db_path })
@@ -1759,6 +1766,38 @@ mod tests {
         let events = store.query_events(50, None).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].session_id, "s-1");
+    }
+
+    /// Regression: the hook scripts write events with `log emit`, so live
+    /// rows have a `session_id` but no `raw_json_hash`. Reading only rows
+    /// with a hash hid every live event and zeroed the dashboard summary.
+    #[test]
+    #[allow(deprecated)]
+    fn reads_include_hook_events_from_log_emit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hooks.sqlite");
+        let store = HooksStore::open(&db).unwrap();
+        let now_ns = Utc::now().timestamp_nanos_opt().unwrap();
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO logs (time_unix_nano, observed_time_unix_nano, severity_number, \
+                 severity_text, body, resource_id, attributes, source, dedup_hash) \
+                 VALUES (?1, ?1, 9, 'INFO', 'hook.turn_scored', (SELECT id FROM resources LIMIT 1), \
+                 '{\"session_id\":\"live-1\",\"decision\":\"ingest\",\"score\":8,\"threshold\":6}', \
+                 'hook', 'emit-row-1')",
+                params![now_ns],
+            )
+            .unwrap();
+
+        let events = store.query_events(50, None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id, "live-1");
+        assert_eq!(events[0].decision.as_deref(), Some("ingest"));
+        assert_eq!(events[0].raw_json_hash, "");
+        assert_eq!(store.query_session("live-1").unwrap().len(), 1);
+        let summary = store.query_summary(Duration::from_hours(24)).unwrap();
+        assert_eq!(summary.ingests_today, 1);
     }
 
     /// Import takes the write lock before its first read. A deferred
