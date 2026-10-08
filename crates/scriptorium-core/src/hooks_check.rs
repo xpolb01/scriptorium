@@ -1742,6 +1742,22 @@ mod tests {
 
     // ── Dynamic hook validation tests ────────────────────────────────
 
+    /// Write an executable hook script and run it once. macOS scans a new
+    /// executable on its first run, and under parallel test load that scan
+    /// can exceed `check_dynamic`'s 2-second budget. These tests time the
+    /// hook, not the scan.
+    fn write_warm_hook(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).unwrap();
+        let _ = std::process::Command::new(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
     #[test]
     fn dynamic_hook_pass_on_exit_zero() {
         let dir = tempfile::tempdir().unwrap();
@@ -1749,10 +1765,7 @@ mod tests {
         fs::create_dir_all(&hooks_dir).unwrap();
 
         let script = hooks_dir.join("scriptorium-ok.sh");
-        fs::write(&script, "#!/bin/bash\ncat > /dev/null\nexit 0\n").unwrap();
-        let mut perms = fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).unwrap();
+        write_warm_hook(&script, "#!/bin/bash\ncat > /dev/null\nexit 0\n");
 
         let settings = write_settings(
             dir.path(),
@@ -1782,10 +1795,7 @@ mod tests {
         fs::create_dir_all(&hooks_dir).unwrap();
 
         let script = hooks_dir.join("scriptorium-bad.sh");
-        fs::write(&script, "#!/bin/bash\ncat > /dev/null\nexit 1\n").unwrap();
-        let mut perms = fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).unwrap();
+        write_warm_hook(&script, "#!/bin/bash\ncat > /dev/null\nexit 1\n");
 
         let settings = write_settings(
             dir.path(),
@@ -1872,14 +1882,10 @@ mod tests {
         fs::create_dir_all(&hooks_dir).unwrap();
 
         let script = hooks_dir.join("scriptorium-envcheck.sh");
-        fs::write(
+        write_warm_hook(
             &script,
             "#!/bin/bash\ncat > /dev/null\n[ \"$SCRIPTORIUM_DRY_RUN\" = \"1\" ] && exit 0 || exit 1\n",
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).unwrap();
+        );
 
         let settings = write_settings(
             dir.path(),
