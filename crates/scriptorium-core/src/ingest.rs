@@ -382,6 +382,22 @@ pub async fn ingest_with_retrieval(
         });
     }
 
+    // An empty body (an LLM reply can leave it blank) would create an empty
+    // page, or wipe an existing one. Drop a create that would make a new
+    // empty page, before it counts as a link target. A create that the stem
+    // guard below turns into an update, and an update, keep the page's
+    // current body (see step 6).
+    plan.pages.retain(|action| {
+        let path = action.path.replace('\\', "/");
+        let keep = !action.body.trim().is_empty()
+            || existing_paths.contains(&path)
+            || stem_to_path.contains_key(&normalize_stem(Utf8Path::new(&path)));
+        if !keep {
+            tracing::warn!(path = %action.path, "ingest plan creates a page with an empty body; skipped");
+        }
+        keep
+    });
+
     // Valid link targets = every existing wiki page stem plus the stems
     // this plan itself creates (links between same-plan pages are fine).
     let mut valid_stems: std::collections::HashSet<String> = prior_scan
@@ -471,7 +487,14 @@ pub async fn ingest_with_retrieval(
             if !next.frontmatter.sources.contains(&source_ref) {
                 next.frontmatter.sources.push(source_ref.clone());
             }
-            next.body.clone_from(&action.body);
+            if action.body.trim().is_empty() {
+                tracing::warn!(
+                    path = %action.path,
+                    "ingest plan updates a page with an empty body; kept the current body"
+                );
+            } else {
+                next.body.clone_from(&action.body);
+            }
             updated += 1;
             next
         } else {

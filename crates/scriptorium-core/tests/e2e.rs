@@ -1388,3 +1388,83 @@ async fn near_duplicate_gate_still_skips_copies_of_interned_sources() {
     assert_eq!(second.source, first.source);
     assert_eq!(calls.load(Ordering::SeqCst), 1, "no LLM call for the copy");
 }
+
+fn page_action(action: IngestAction, path: &str, body: &str) -> IngestPageAction {
+    IngestPageAction {
+        action,
+        path: path.into(),
+        title: "Page".into(),
+        tags: vec![],
+        body: body.into(),
+        source_quote: None,
+        supersedes: vec![],
+    }
+}
+
+fn plan_with(pages: Vec<IngestPageAction>) -> MockProvider {
+    let plan = IngestPlan {
+        summary: "plan".into(),
+        pages,
+        log_entry: "plan".into(),
+        redundant: false,
+    };
+    MockProvider::constant(serde_json::to_string(&plan).unwrap())
+}
+
+/// Regression: an update whose body came back empty from the LLM replaced
+/// the page body with nothing (the live vault lost one page this way).
+/// The page keeps its body; the new source is still recorded.
+#[tokio::test]
+async fn ingest_update_with_empty_body_keeps_the_page_body() {
+    let (dir, vault) = empty_test_vault();
+    let seed = dir.path().join("sources/articles/seed.md");
+    std::fs::write(&seed, "seed").unwrap();
+    let path = "wiki/concepts/target.md";
+    let seeded = plan_with(vec![page_action(
+        IngestAction::Create,
+        path,
+        "Original body.\n",
+    )]);
+    ingest::ingest(&vault, &seeded, &seed).await.unwrap();
+
+    let source = dir.path().join("sources/articles/blank-update.md");
+    std::fs::write(&source, "blank update").unwrap();
+    let blank = plan_with(vec![page_action(IngestAction::Update, path, " \n")]);
+    let report = ingest::ingest(&vault, &blank, &source).await.unwrap();
+    assert_eq!(report.updated, 1);
+
+    let scan = vault.scan().unwrap();
+    let page = scan.pages.iter().find(|p| p.path == path).unwrap();
+    assert!(
+        page.body.contains("Original body."),
+        "body: {:?}",
+        page.body
+    );
+    assert_eq!(
+        page.frontmatter.sources.len(),
+        2,
+        "the new source is recorded"
+    );
+}
+
+/// A create with an empty body is skipped instead of writing an empty
+/// page; the rest of the plan still applies.
+#[tokio::test]
+async fn ingest_skips_a_create_with_an_empty_body() {
+    let (dir, vault) = empty_test_vault();
+    let source = dir.path().join("sources/articles/mixed.md");
+    std::fs::write(&source, "mixed").unwrap();
+    let mock = plan_with(vec![
+        page_action(IngestAction::Create, "wiki/concepts/empty.md", ""),
+        page_action(
+            IngestAction::Create,
+            "wiki/concepts/full.md",
+            "Full body.\n",
+        ),
+    ]);
+
+    let report = ingest::ingest(&vault, &mock, &source).await.unwrap();
+    assert_eq!(report.created, 1);
+    assert!(!dir.path().join("wiki/concepts/empty.md").exists());
+    assert!(dir.path().join("wiki/concepts/full.md").exists());
+}
