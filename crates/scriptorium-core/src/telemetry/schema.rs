@@ -37,6 +37,12 @@ const MIGRATIONS: &[(u32, &str)] = &[(1, MIGRATION_001), (2, MIGRATION_002)];
 /// failing statement rolls back the whole migration leaving the previous
 /// version intact.
 ///
+/// Safe for concurrent openers: each transaction takes the write lock
+/// (`BEGIN IMMEDIATE`) before it re-reads the version, so one connection
+/// applies a migration and the others see it applied and skip it.
+/// Migration 002 cannot run twice: once its view exists, its
+/// `DROP TABLE IF EXISTS hook_events` fails.
+///
 /// # Errors
 ///
 /// Returns [`rusqlite::Error`] if any DDL statement fails (for example a
@@ -46,13 +52,34 @@ pub fn apply_migrations(conn: &Connection) -> rusqlite::Result<u32> {
     let mut current = current_version(conn)?;
 
     for &(version, sql) in MIGRATIONS {
-        if version > current {
-            conn.execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))?;
-            current = version;
+        if version <= current {
+            continue;
+        }
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let applied = apply_unless_current(conn, version, sql)
+            .and_then(|now| conn.execute_batch("COMMIT;").map(|()| now));
+        match applied {
+            Ok(now) => current = now,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
         }
     }
 
     Ok(current)
+}
+
+/// Inside the caller's write transaction: apply `sql` unless another
+/// connection already took the database to `version`. Returns the
+/// version the database is now at.
+fn apply_unless_current(conn: &Connection, version: u32, sql: &str) -> rusqlite::Result<u32> {
+    let found = current_version(conn)?;
+    if found >= version {
+        return Ok(found);
+    }
+    conn.execute_batch(sql)?;
+    Ok(version)
 }
 
 /// Read the highest applied version from `schema_version`. Returns `0`
