@@ -55,16 +55,7 @@ pub fn apply_migrations(conn: &Connection) -> rusqlite::Result<u32> {
         if version <= current {
             continue;
         }
-        conn.execute_batch("BEGIN IMMEDIATE;")?;
-        let applied = apply_unless_current(conn, version, sql)
-            .and_then(|now| conn.execute_batch("COMMIT;").map(|()| now));
-        match applied {
-            Ok(now) => current = now,
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK;");
-                return Err(e);
-            }
-        }
+        current = crate::sqlite::with_write_txn(conn, || apply_unless_current(conn, version, sql))?;
     }
 
     Ok(current)

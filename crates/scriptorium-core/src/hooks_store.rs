@@ -352,8 +352,7 @@ impl HooksStore {
     }
 
     fn init(conn: Connection, db_path: Option<PathBuf>) -> Result<Self> {
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")
-            .map_err(wrap_sql)?;
+        crate::sqlite::open_wal(&conn).map_err(wrap_sql)?;
 
         let existing_kind: Option<String> = conn
             .query_row(
@@ -1061,6 +1060,32 @@ mod tests {
         }
     }
 
+    /// Regression: `init` switched to WAL before it set the busy timeout,
+    /// so a connection that met another one converting a new file failed
+    /// at once with "database is locked".
+    #[test]
+    fn concurrent_first_opens_all_succeed() {
+        const OPENERS: usize = 16;
+        for round in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("h.sqlite");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(OPENERS));
+            let handles: Vec<_> = (0..OPENERS)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        HooksStore::open(&path).map(|_| ())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let result = handle.join().unwrap();
+                assert!(result.is_ok(), "round {round}: open failed: {result:?}");
+            }
+        }
+    }
     #[test]
     fn create_insert_and_query_back() {
         let store = HooksStore::in_memory().unwrap();
