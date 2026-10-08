@@ -1238,3 +1238,153 @@ async fn enqueue_drain_dedup_e2e() {
     assert_eq!(ingest_commits, 3);
     assert_eq!(counter.load(Ordering::SeqCst), 3);
 }
+
+/// A long, unique body: well above the near-duplicate gate's 40-word
+/// floor, so the gate runs on it.
+fn gate_sized_body(tag: &str) -> String {
+    let words: Vec<String> = (0..300).map(|i| format!("{tag}{i}")).collect();
+    words.join(" ") + "\n"
+}
+
+/// A mock that returns a distinct one-page plan per call, plus its call
+/// counter, so a test can tell an LLM ingest from a pre-LLM skip.
+fn counting_plan_mock() -> (MockProvider, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use scriptorium_core::llm::{CompletionResponse, Usage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let calls = counter.clone();
+    let mock = MockProvider::with_handler(move |_req| {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        let plan = IngestPlan {
+            summary: format!("gate ingest {n}"),
+            pages: vec![IngestPageAction {
+                action: IngestAction::Create,
+                path: format!("wiki/concepts/gate-{n}.md"),
+                title: format!("Gate {n}"),
+                tags: vec![],
+                body: format!("Gate body {n}.\n"),
+                source_quote: None,
+                supersedes: vec![],
+            }],
+            log_entry: format!("gate {n}"),
+            redundant: false,
+        };
+        Ok(CompletionResponse {
+            text: serde_json::to_string(&plan).unwrap(),
+            usage: Usage::default(),
+            model: "mock-1".into(),
+        })
+    });
+    (mock, counter)
+}
+
+/// Regression: the session hook stages notes in `sources/sessions/`. The
+/// near-duplicate gate scanned all of `sources/`, matched each note
+/// against itself (similarity 1.00) and reported it as a redundant
+/// ingest before any LLM call, so the drain ingested nothing.
+#[tokio::test]
+async fn drain_ingests_session_note_staged_under_sources() {
+    use scriptorium_core::ingest_queue;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let (dir, vault) = empty_test_vault();
+    let sessions = dir.path().join("sources/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let note = sessions.join("2026-10-08-session-abcd1234.md");
+    std::fs::write(&note, gate_sized_body("note")).unwrap();
+    ingest_queue::enqueue(&vault, &note, Some("abcd1234")).unwrap();
+
+    let (mock, calls) = counting_plan_mock();
+    let cfg = ingest_queue::DrainConfig {
+        debounce: Duration::from_secs(0),
+        ..Default::default()
+    };
+    let report = ingest_queue::drain(&vault, &mock, cfg).await.unwrap();
+
+    assert!(
+        report.failures.is_empty(),
+        "failures: {:?}",
+        report.failures
+    );
+    assert_eq!(report.ingested, 1);
+    assert_eq!(report.redundant_skips, 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the LLM must see the note");
+    assert!(dir.path().join("wiki/concepts/gate-0.md").exists());
+    let repo = git2::Repository::open(dir.path()).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert!(head.message().unwrap().contains("gate ingest 0"));
+}
+
+/// A file dropped into a category folder by hand (or picked up by
+/// `watch`) is not interned yet, so it must not match itself.
+#[tokio::test]
+async fn near_duplicate_gate_ignores_the_source_itself() {
+    use std::sync::atomic::Ordering;
+
+    let (dir, vault) = empty_test_vault();
+    let source = dir.path().join("sources/articles/dropped.md");
+    std::fs::write(&source, gate_sized_body("dropped")).unwrap();
+
+    let (mock, calls) = counting_plan_mock();
+    let report = ingest::ingest(&vault, &mock, &source).await.unwrap();
+
+    assert!(!report.redundant, "summary: {}", report.summary);
+    assert_eq!(report.created, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// Staged files that were never ingested are not existing sources. A
+/// near-copy among them (the same session's note from an earlier day)
+/// must not make the gate skip the source.
+#[tokio::test]
+async fn near_duplicate_gate_ignores_staged_copies() {
+    use std::sync::atomic::Ordering;
+
+    let (dir, vault) = empty_test_vault();
+    let sessions = dir.path().join("sources/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let body = gate_sized_body("staged");
+    std::fs::write(sessions.join("2026-10-07-session-abcd1234.md"), &body).unwrap();
+    let today = sessions.join("2026-10-08-session-abcd1234.md");
+    std::fs::write(&today, format!("{body}one more line\n")).unwrap();
+
+    let (mock, calls) = counting_plan_mock();
+    let report = ingest::ingest(&vault, &mock, &today).await.unwrap();
+
+    assert!(!report.redundant, "summary: {}", report.summary);
+    assert_eq!(report.created, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// The gate still does its job: a lightly edited copy of an interned
+/// source is skipped before any LLM call, and the skip names the
+/// interned copy.
+#[tokio::test]
+async fn near_duplicate_gate_still_skips_copies_of_interned_sources() {
+    use std::sync::atomic::Ordering;
+
+    let (dir, vault) = empty_test_vault();
+    let outside = TempDir::new().unwrap();
+    let original = outside.path().join("report.md");
+    let body = gate_sized_body("doc");
+    std::fs::write(&original, &body).unwrap();
+
+    let (mock, calls) = counting_plan_mock();
+    let first = ingest::ingest(&vault, &mock, &original).await.unwrap();
+    assert!(!first.redundant);
+    assert!(first.source.as_str().starts_with("sources/articles/"));
+
+    let sessions = dir.path().join("sources/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let copy = sessions.join("2026-10-08-session-feedbeef.md");
+    std::fs::write(&copy, format!("{body}one more line\n")).unwrap();
+    let second = ingest::ingest(&vault, &mock, &copy).await.unwrap();
+
+    assert!(second.redundant);
+    assert_eq!(second.commit_id, "skipped-near-duplicate");
+    assert_eq!(second.source, first.source);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no LLM call for the copy");
+}
