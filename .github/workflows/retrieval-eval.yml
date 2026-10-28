@@ -1,0 +1,55 @@
+# The retrieval eval (crates/scriptorium-core/tests/retrieval_eval.rs). It
+# runs the code behind `scriptorium bench` on a synthetic multi-hop vault
+# with frozen EmbeddingGemma 2 vectors, and fails when any case's rank
+# differs from the committed baseline. It needs no model and no network.
+name: retrieval-eval
+
+on:
+  pull_request:
+    paths:
+      - crates/scriptorium-core/src/**
+      - crates/scriptorium-core/Cargo.toml
+      - crates/scriptorium-core/tests/retrieval_eval.rs
+      - crates/scriptorium-core/tests/fixtures/retrieval-eval/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/retrieval-eval.yml
+  push:
+    branches: [main]
+    paths:
+      - crates/scriptorium-core/src/**
+      - crates/scriptorium-core/Cargo.toml
+      - crates/scriptorium-core/tests/retrieval_eval.rs
+      - crates/scriptorium-core/tests/fixtures/retrieval-eval/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/retrieval-eval.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: retrieval-eval-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  eval:
+    name: retrieval eval
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The toolchain rust-toolchain.toml names.
+      - name: Rust
+        run: |
+          rustup toolchain install
+          cargo --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test --locked -p scriptorium-core --test retrieval_eval -- --nocapture

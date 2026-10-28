@@ -1,0 +1,4 @@
+# Live runs write derived caches here; never commit them.
+.scriptorium/*
+!.scriptorium/benchmarks.json
+!.scriptorium/config.toml

@@ -1,0 +1,373 @@
+{
+  "benchmarks": [
+    {
+      "query": "What does Project Heron monitor?",
+      "expected": [
+        "project-heron"
+      ],
+      "k": 5,
+      "description": "s01 single en"
+    },
+    {
+      "query": "What is Project Saltmarsh surveying?",
+      "expected": [
+        "project-saltmarsh"
+      ],
+      "k": 5,
+      "description": "s02 single en"
+    },
+    {
+      "query": "What is the goal of Project Ember?",
+      "expected": [
+        "project-ember"
+      ],
+      "k": 5,
+      "description": "s03 single en"
+    },
+    {
+      "query": "Which logbooks is Project Quill digitizing?",
+      "expected": [
+        "project-quill"
+      ],
+      "k": 5,
+      "description": "s04 single en"
+    },
+    {
+      "query": "How often is the Drift Buoy DB-9 calibrated?",
+      "expected": [
+        "drift-buoy-db9"
+      ],
+      "k": 5,
+      "description": "s05 single en"
+    },
+    {
+      "query": "What warranty does Castellan Marine give?",
+      "expected": [
+        "castellan-marine"
+      ],
+      "k": 5,
+      "description": "s06 single en"
+    },
+    {
+      "query": "Which languages does Maren Solberg speak?",
+      "expected": [
+        "maren-solberg"
+      ],
+      "k": 5,
+      "description": "s07 single en"
+    },
+    {
+      "query": "Which village is Brask Station near?",
+      "expected": [
+        "brask-station"
+      ],
+      "k": 5,
+      "description": "s08 single en"
+    },
+    {
+      "query": "What facilities does the Harrowgate Annex have?",
+      "expected": [
+        "harrowgate-annex"
+      ],
+      "k": 5,
+      "description": "s09 single en"
+    },
+    {
+      "query": "What happened to the Kelmouth wet lab in March 2025?",
+      "expected": [
+        "kelmouth-flood-2025"
+      ],
+      "k": 5,
+      "description": "s10 single en"
+    },
+    {
+      "query": "Which firmware did Velloria Optics recall?",
+      "expected": [
+        "firmware-recall-2026"
+      ],
+      "k": 5,
+      "description": "s11 single en"
+    },
+    {
+      "query": "When did Pieter van Dam join the institute?",
+      "expected": [
+        "pieter-vandam"
+      ],
+      "k": 5,
+      "description": "s12 single en"
+    },
+    {
+      "query": "Which station is the lead of Project Heron based at?",
+      "expected": [
+        "maren-solberg"
+      ],
+      "k": 5,
+      "description": "h01 hop1 en"
+    },
+    {
+      "query": "Which languages does the lead of Project Ember speak?",
+      "expected": [
+        "hana-sato"
+      ],
+      "k": 5,
+      "description": "h02 hop1 en"
+    },
+    {
+      "query": "When did the lead of Project Wren join the institute?",
+      "expected": [
+        "teodor-halim"
+      ],
+      "k": 5,
+      "description": "h03 hop1 en"
+    },
+    {
+      "query": "Who makes the instrument that Project Ember uses?",
+      "expected": [
+        "thermal-mast-tm2"
+      ],
+      "k": 5,
+      "description": "h04 hop1 en"
+    },
+    {
+      "query": "How often is the instrument that Project Quill uses calibrated?",
+      "expected": [
+        "scanner-rig-sr1"
+      ],
+      "k": 5,
+      "description": "h05 hop1 en"
+    },
+    {
+      "query": "What facilities does the site that Project Wren runs from have?",
+      "expected": [
+        "harrowgate-annex"
+      ],
+      "k": 5,
+      "description": "h06 hop1 en"
+    },
+    {
+      "query": "Which town is the site that Project Heron runs from near?",
+      "expected": [
+        "kelmouth-site"
+      ],
+      "k": 5,
+      "description": "h07 hop1 en"
+    },
+    {
+      "query": "How long is the warranty on the Thermal Mast TM-2?",
+      "expected": [
+        "velloria-optics"
+      ],
+      "k": 5,
+      "description": "h08 hop1 en"
+    },
+    {
+      "query": "Where is the maker of the Scanner Rig SR-1 based?",
+      "expected": [
+        "pemberton-scanning"
+      ],
+      "k": 5,
+      "description": "h09 hop1 en"
+    },
+    {
+      "query": "How often is the instrument that Junia Ferraz maintains calibrated?",
+      "expected": [
+        "mirror-array-mx4"
+      ],
+      "k": 5,
+      "description": "h10 hop1 en"
+    },
+    {
+      "query": "Which village is Pieter van Dam's station near?",
+      "expected": [
+        "brask-station"
+      ],
+      "k": 5,
+      "description": "h11 hop1 en"
+    },
+    {
+      "query": "What support does the maker of the Drift Buoy DB-9 offer?",
+      "expected": [
+        "castellan-marine"
+      ],
+      "k": 5,
+      "description": "h12 hop1 en"
+    },
+    {
+      "query": "Which village is the station of Project Heron's lead near?",
+      "expected": [
+        "brask-station"
+      ],
+      "k": 5,
+      "description": "t01 hop2 en"
+    },
+    {
+      "query": "How often is the instrument maintained by the lead of Project Wren calibrated?",
+      "expected": [
+        "scanner-rig-sr1"
+      ],
+      "k": 5,
+      "description": "t02 hop2 en"
+    },
+    {
+      "query": "Which company makes the instrument maintained by the lead of Project Lantern?",
+      "expected": [
+        "thermal-mast-tm2"
+      ],
+      "k": 5,
+      "description": "t03 hop2 en"
+    },
+    {
+      "query": "What warranty applies to the instrument that Project Ember uses?",
+      "expected": [
+        "velloria-optics"
+      ],
+      "k": 5,
+      "description": "t04 hop2 en"
+    },
+    {
+      "query": "What facilities are at the base of Project Saltmarsh's lead?",
+      "expected": [
+        "brask-station"
+      ],
+      "k": 5,
+      "description": "t05 hop2 en"
+    },
+    {
+      "query": "Which special rooms does the workplace of Project Wren's lead have?",
+      "expected": [
+        "tolvan-lab"
+      ],
+      "k": 5,
+      "description": "t06 hop2 en"
+    },
+    {
+      "query": "What repair support does the maker of Project Quill's scanner offer?",
+      "expected": [
+        "pemberton-scanning"
+      ],
+      "k": 5,
+      "description": "t07 hop2 en"
+    },
+    {
+      "query": "How long are the warranties on the instruments that Project Saltmarsh uses?",
+      "expected": [
+        "velloria-optics",
+        "castellan-marine"
+      ],
+      "k": 5,
+      "description": "t08 hop2 en"
+    },
+    {
+      "query": "How often is the instrument maintained by the lead of Project Heron calibrated?",
+      "expected": [
+        "drift-buoy-db9"
+      ],
+      "k": 5,
+      "description": "t09 hop2 en"
+    },
+    {
+      "query": "What equipment does the base of Project Ember's lead have?",
+      "expected": [
+        "harrowgate-annex"
+      ],
+      "k": 5,
+      "description": "t10 hop2 en"
+    },
+    {
+      "query": "Що відстежує Project Heron?",
+      "expected": [
+        "project-heron"
+      ],
+      "k": 5,
+      "description": "u01 single uk"
+    },
+    {
+      "query": "Яку гарантію дає Castellan Marine?",
+      "expected": [
+        "castellan-marine"
+      ],
+      "k": 5,
+      "description": "u02 single uk"
+    },
+    {
+      "query": "Якими мовами розмовляє керівник Project Ember?",
+      "expected": [
+        "hana-sato"
+      ],
+      "k": 5,
+      "description": "u03 hop1 uk"
+    },
+    {
+      "query": "Як часто калібрують прилад, який використовує Project Quill?",
+      "expected": [
+        "scanner-rig-sr1"
+      ],
+      "k": 5,
+      "description": "u04 hop1 uk"
+    },
+    {
+      "query": "Біля якого села розташована станція керівника Project Heron?",
+      "expected": [
+        "brask-station"
+      ],
+      "k": 5,
+      "description": "u05 hop2 uk"
+    },
+    {
+      "query": "Яка гарантія на прилад, який використовує Project Ember?",
+      "expected": [
+        "velloria-optics"
+      ],
+      "k": 5,
+      "description": "u06 hop2 uk"
+    },
+    {
+      "query": "Ostervik",
+      "expected": [
+        "brask-station"
+      ],
+      "k": 5,
+      "description": "k01 keyword en"
+    },
+    {
+      "query": "reference tank",
+      "expected": [
+        "drift-buoy-db9"
+      ],
+      "k": 5,
+      "description": "k02 keyword en"
+    },
+    {
+      "query": "glass book cradle",
+      "expected": [
+        "scanner-rig-sr1"
+      ],
+      "k": 5,
+      "description": "k03 keyword en"
+    },
+    {
+      "query": "Igbo French",
+      "expected": [
+        "amara-nwosu"
+      ],
+      "k": 5,
+      "description": "k04 keyword en"
+    },
+    {
+      "query": "Turin",
+      "expected": [
+        "velloria-optics"
+      ],
+      "k": 5,
+      "description": "k05 keyword en"
+    },
+    {
+      "query": "storm surge",
+      "expected": [
+        "kelmouth-flood-2025"
+      ],
+      "k": 5,
+      "description": "k06 keyword en"
+    }
+  ]
+}
