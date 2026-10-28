@@ -297,7 +297,7 @@ mod tests {
         let foo_id = foo.frontmatter.id;
         let graph = LinkGraph::build(&[foo]);
         let backs: Vec<_> = graph.backlinks(foo_id).collect();
-        assert!(backs.is_empty());
+        assert_eq!(backs, [] as [PageId; 0]);
         let forward = graph.forward(foo_id).unwrap();
         assert_eq!(forward[0].resolved, Resolution::SelfHeading);
     }

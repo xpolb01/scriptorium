@@ -187,7 +187,7 @@ pub async fn fetch_sdl(url: &str, headers_env: &BTreeMap<String, String>) -> Res
         url: display_url(url),
         message,
     };
-    validate_url(url).map_err(&fail)?;
+    validate_url(url).map_err(fail)?;
     let parsed = reqwest::Url::parse(url).map_err(|e| fail(e.to_string()))?;
     if !headers_env.is_empty() && parsed.scheme() == "http" && !is_loopback(&parsed) {
         return Err(fail(

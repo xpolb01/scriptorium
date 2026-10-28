@@ -724,7 +724,7 @@ mod tests {
                     ("research".to_string(), true),
                 ]
             );
-            assert!(snap.list("nope").unwrap().is_empty());
+            assert_eq!(snap.list("nope").unwrap(), [] as [DirEntry; 0]);
             assert!(snap.read("ontology/missing.graphql").unwrap().is_none());
             assert!(
                 snap.read("ontology/core").unwrap().is_none(),

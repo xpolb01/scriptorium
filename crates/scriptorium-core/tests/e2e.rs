@@ -1217,7 +1217,10 @@ async fn enqueue_drain_dedup_e2e() {
         "failures: {:?}",
         report.failures
     );
-    assert!(ingest_queue::list_queued(&vault).unwrap().is_empty());
+    assert_eq!(
+        ingest_queue::list_queued(&vault).unwrap(),
+        [] as [ingest_queue::QueueMarker; 0]
+    );
 
     let lines: Vec<String> = std::fs::read_to_string(&hash_path)
         .unwrap()

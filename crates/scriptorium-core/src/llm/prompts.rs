@@ -712,7 +712,7 @@ mod tests {
             "log_entry": "   "
         }"#;
         let plan: IngestPlan = serde_json::from_str(input).unwrap();
-        assert!(!plan.log_entry.trim().is_empty());
+        assert_ne!(plan.log_entry.trim(), "");
         assert!(plan.log_entry.contains("auto-synthesized"));
     }
 
@@ -859,7 +859,7 @@ mod tests {
     fn render_valid_links_empty_stems_returns_empty() {
         let ctx = PromptContext::with_stems("schema", &[], &[]);
         let rendered = ctx.render_valid_links();
-        assert!(rendered.is_empty());
+        assert_eq!(rendered, "");
     }
 
     #[test]

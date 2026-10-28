@@ -193,9 +193,9 @@ mod tests {
     #[test]
     fn empty_body_produces_no_chunks() {
         let chunks = chunk_page("", 1000);
-        assert!(chunks.is_empty());
+        assert_eq!(chunks, [] as [Chunk; 0]);
         let chunks = chunk_page("   \n\n  \n", 1000);
-        assert!(chunks.is_empty());
+        assert_eq!(chunks, [] as [Chunk; 0]);
     }
 
     #[test]

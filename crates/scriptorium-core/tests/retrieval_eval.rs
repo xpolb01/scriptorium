@@ -74,14 +74,13 @@ impl FrozenEmbedder {
             texts.len() * DIM * 4,
             "vectors.f32 must hold one {DIM}-d f32 vector per text"
         );
+        let (byte_rows, _) = bytes.as_chunks::<{ DIM * 4 }>();
         let rows = texts
             .iter()
-            .zip(bytes.chunks_exact(DIM * 4))
+            .zip(byte_rows)
             .map(|(text, row)| {
-                let vector = row
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
+                let (floats, _) = row.as_chunks::<4>();
+                let vector = floats.iter().map(|b| f32::from_le_bytes(*b)).collect();
                 (text.as_str().expect("texts are strings").to_owned(), vector)
             })
             .collect();

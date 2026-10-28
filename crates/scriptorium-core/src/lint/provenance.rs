@@ -122,8 +122,8 @@ fn check_lifecycle(page: &Page, stems: &HashSet<&str>, issues: &mut Vec<LintIssu
     };
     let from = page.frontmatter.extra.get("valid_from");
     let to = page.frontmatter.extra.get("valid_to");
-    let from_date = from.and_then(&parse_date);
-    let to_date = to.and_then(&parse_date);
+    let from_date = from.and_then(parse_date);
+    let to_date = to.and_then(parse_date);
     if from.is_some() && from_date.is_none() {
         issues.push(warn(
             page,

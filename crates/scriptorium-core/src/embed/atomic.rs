@@ -147,8 +147,8 @@ mod tests {
 
     #[test]
     fn empty_and_no_block_inputs_are_safe() {
-        assert!(segment_atomic("").is_empty());
+        assert_eq!(segment_atomic(""), [] as [Segment<'_>; 0]);
         let spans = atomic_spans("no blocks here at all");
-        assert!(spans.is_empty());
+        assert_eq!(spans, [] as [Range<usize>; 0]);
     }
 }

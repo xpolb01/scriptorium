@@ -505,6 +505,6 @@ mod tests {
         let snap = GitSnapshot::open(dir.path(), "HEAD").unwrap();
         let (reg, issues) = Registry::load(&snap, "ontology").unwrap();
         assert!(reg.sub_ontologies.is_empty());
-        assert!(issues.is_empty());
+        assert_eq!(issues, [] as [RegistryIssue; 0]);
     }
 }

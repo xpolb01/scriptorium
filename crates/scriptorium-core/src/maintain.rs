@@ -287,7 +287,7 @@ mod tests {
             .unwrap();
 
         assert!(report.lint.is_clean());
-        assert!(report.stale_embedding_pages.is_empty());
+        assert_eq!(report.stale_embedding_pages, [] as [String; 0]);
         assert_eq!(report.embedding_coverage, (0, 0));
     }
 

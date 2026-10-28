@@ -285,7 +285,7 @@ mod tests {
     fn linear_index_empty_search() {
         let idx = LinearIndex::new();
         let results = idx.search(&[1.0, 0.0], 5).unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [(u64, f32); 0]);
     }
 
     #[test]
@@ -293,6 +293,6 @@ mod tests {
         let idx = LinearIndex::new();
         idx.insert(1, &[1.0, 0.0]).unwrap();
         let results = idx.search(&[1.0, 0.0], 0).unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [(u64, f32); 0]);
     }
 }

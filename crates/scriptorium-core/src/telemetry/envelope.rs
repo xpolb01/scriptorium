@@ -843,7 +843,7 @@ mod tests {
         assert!(s.parent_span_id.is_none());
         assert!(s.end_time_unix_nano.is_none());
         assert!(s.attributes.is_empty());
-        assert!(s.events.is_empty());
+        assert_eq!(s.events, [] as [SpanEvent; 0]);
         assert_eq!(s.resource_id, 0);
         assert!(!s.trace_id.is_zero());
         assert!(!s.span_id.is_zero());

@@ -253,7 +253,7 @@ mod tests {
 
         let resource = Resource::from_attributes(attrs.clone());
         assert_eq!(resource.attributes, attrs);
-        assert!(!resource.attributes_hash.is_empty());
+        assert_ne!(resource.attributes_hash, "");
     }
 
     #[test]

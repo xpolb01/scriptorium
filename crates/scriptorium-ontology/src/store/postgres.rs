@@ -1350,11 +1350,10 @@ mod tests {
         .unwrap();
         // No connection string is set: these answer without any I/O.
         assert_eq!(store.get("Person", "vaswani").await.unwrap(), None);
-        assert!(store
-            .list("Person", &ListQuery::default())
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            store.list("Person", &ListQuery::default()).await.unwrap(),
+            [] as [Arc<Record>; 0]
+        );
         let err = PostgresStore::for_types(
             "research",
             &config("public", &[("Person", "people")]),
@@ -1570,7 +1569,10 @@ mod tests {
         );
         let two = store.list("Paper", &limited(2)).await.unwrap();
         assert_eq!(keys_of(&two, "id"), [json!("attention"), json!("bert")]);
-        assert!(store.list("Paper", &limited(0)).await.unwrap().is_empty());
+        assert_eq!(
+            store.list("Paper", &limited(0)).await.unwrap(),
+            [] as [Arc<Record>; 0]
+        );
 
         // Integer keys: looked up and ordered as text.
         // Keys are read as text: exact, whatever the column's type.

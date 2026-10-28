@@ -202,7 +202,7 @@ mod tests {
     #[test]
     fn ignores_empty_links() {
         let links = parse_text("[[]] should be ignored");
-        assert!(links.is_empty());
+        assert_eq!(links, [] as [Wikilink; 0]);
     }
 
     #[test]
