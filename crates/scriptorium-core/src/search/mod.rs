@@ -202,6 +202,88 @@ mod tests {
         }
     }
 
+    fn linked_page(stem: &str, body: &str) -> Page {
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 4, 6, 12, 0, 0).unwrap();
+        Page {
+            path: camino::Utf8PathBuf::from(format!("wiki/{stem}.md")),
+            frontmatter: crate::vault::page::Frontmatter {
+                id: PageId::new(),
+                title: stem.into(),
+                created: now,
+                updated: now,
+                sources: vec![],
+                tags: vec![],
+                aliases: vec![],
+                schema_version: 1,
+                extra: std::collections::BTreeMap::new(),
+            },
+            body: body.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn hybrid_keeps_top_vector_hit_first_with_graph_on() {
+        // a is the best vector hit and the least-linked page. top_k = 2
+        // leaves b..d outside the seed set; top_k = 5 makes every page a seed.
+        let pages = [
+            linked_page("a", "Links [[hub]].\n"),
+            linked_page("hub", "Links [[b]], [[c]] and [[d]].\n"),
+            linked_page("b", "Links [[c]] and [[d]].\n"),
+            linked_page("c", "Leaf.\n"),
+            linked_page("d", "Leaf.\n"),
+        ];
+        let ids: Vec<PageId> = pages.iter().map(|p| p.frontmatter.id).collect();
+
+        let mock = MockProvider::constant("");
+        let query = "which page answers this";
+        let q = mock.embed(&[query.to_string()]).await.unwrap().remove(0);
+        let off = mock
+            .embed(&["unrelated direction".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let rows = ids
+            .iter()
+            .zip(["apple", "brick", "cloud", "delta", "ember"])
+            .zip([0.9f32, 0.8, 0.7, 0.6, 0.5]);
+        for ((id, word), w) in rows {
+            let v = q
+                .iter()
+                .zip(&off)
+                .map(|(x, y)| w * x + (1.0 - w) * y)
+                .collect();
+            store
+                .upsert(&embed_row(*id, &format!("{word} {word}"), unit(v)))
+                .unwrap();
+        }
+        let vector_order: Vec<PageId> = store
+            .search(&q, "mock", "mock-1", 5)
+            .unwrap()
+            .iter()
+            .map(|h| h.page_id)
+            .collect();
+        assert_eq!(
+            vector_order, ids,
+            "precondition: vector order a, hub, b, c, d"
+        );
+
+        for top_k in [2, 5] {
+            let opts = HybridSearchOpts {
+                expansion: false,
+                ..HybridSearchOpts::with_top_k(top_k)
+            };
+            let results = hybrid_search(&store, &mock, &mock, "mock-1", query, &pages, &opts)
+                .await
+                .unwrap();
+            assert_eq!(
+                results[0].page_id, ids[0],
+                "best vector hit must stay first (top_k = {top_k})"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn hybrid_combines_vector_and_keyword() {
         let store = EmbeddingsStore::in_memory().unwrap();

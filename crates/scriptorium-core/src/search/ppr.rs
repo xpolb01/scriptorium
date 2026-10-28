@@ -155,10 +155,19 @@ pub fn personalized_pagerank<S: std::hash::BuildHasher>(
 ///
 /// Seeds the walk with the pages behind the top `seed_count` fused chunks
 /// (weight = best fused score per page), runs PPR, and emits the ranking of
-/// **non-seed** pages as a ranked `SearchHit` list, capped at `limit`. Seed
-/// pages are omitted because they already carry the retrieval evidence this
-/// list is fused against — re-emitting them would double-count it, while
-/// their neighbors are the new information a graph hop contributes.
+/// every reached page, seeds included, as a ranked `SearchHit` list capped
+/// at `limit`. Seeds must stay in the list: RRF adds one `1/(k + rank)` term
+/// per list a result appears in, so a list without the seeds gives each of
+/// their neighbors a term the seeds never get. With `k = 60` that term
+/// outweighs the seeds' lead in the retrieval lists, and the best hits sink
+/// below their own neighbors.
+///
+/// PPR decides where the seeds sit among their neighbors, but its scores do
+/// not keep the seeds in retrieval order: a well-linked seed outranks a
+/// peripheral one. The seed slots are therefore refilled in retrieval order,
+/// and the top seed moves to the first slot. The top retrieval hit then gets
+/// the largest graph term, so no page can pass it in the final fusion, also
+/// when `limit` truncates the list.
 ///
 /// Pages that already have a chunk in `fused` reuse their best-ranked chunk
 /// (so RRF merges the graph contribution into the same logical result);
@@ -179,14 +188,40 @@ pub fn graph_expansion_list(
     // chunks. `fused` is sorted best-first, so the first chunk seen for a
     // page is its best.
     let mut seeds: HashMap<PageId, f32> = HashMap::new();
+    let mut seed_rank: HashMap<PageId, usize> = HashMap::new();
     for hit in fused.iter().take(seed_count) {
+        let next = seed_rank.len();
+        seed_rank.entry(hit.page_id).or_insert(next);
         seeds
             .entry(hit.page_id)
             .and_modify(|s| *s = s.max(hit.score))
             .or_insert(hit.score);
     }
 
-    let ranking = personalized_pagerank(graph, &seeds, config);
+    let mut ranking = personalized_pagerank(graph, &seeds, config);
+
+    // Fill the slots PPR gave to seeds in retrieval order, then move the top
+    // seed to the first slot.
+    let mut seeds_in_order: Vec<(PageId, f32)> = ranking
+        .iter()
+        .copied()
+        .filter(|(id, _)| seed_rank.contains_key(id))
+        .collect();
+    seeds_in_order.sort_by_key(|(id, _)| seed_rank[id]);
+    let mut next_seed = seeds_in_order.into_iter();
+    for entry in &mut ranking {
+        if seed_rank.contains_key(&entry.0) {
+            if let Some(seed) = next_seed.next() {
+                *entry = seed;
+            }
+        }
+    }
+    if let Some(first) = ranking
+        .iter()
+        .position(|(id, _)| seed_rank.contains_key(id))
+    {
+        ranking[..=first].rotate_right(1);
+    }
 
     // Best (first-seen) chunk per page, for identity-preserving reuse.
     let mut best_chunk: HashMap<PageId, &SearchHit> = HashMap::new();
@@ -196,7 +231,6 @@ pub fn graph_expansion_list(
 
     ranking
         .into_iter()
-        .filter(|(id, _)| !seeds.contains_key(id))
         .take(limit)
         .map(|(id, score)| match best_chunk.get(&id) {
             Some(hit) => {
@@ -389,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn expansion_list_surfaces_neighbors_but_not_seeds() {
+    fn expansion_list_keeps_seeds_ahead_of_neighbors() {
         let a = page("a", "A", "Links [[b]].\n");
         let b = page("b", "B", "One hop out.\n");
         let a_id = a.frontmatter.id;
@@ -398,11 +432,177 @@ mod tests {
 
         let fused = vec![hit(a_id, "chunk from a", 0.5)];
         let list = graph_expansion_list(&graph, &fused, 5, 10, &PprConfig::default());
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].page_id, b_id);
+        assert_eq!(list.len(), 2);
+        // The seed leads and reuses its retrieved chunk.
+        assert_eq!(list[0].page_id, a_id);
+        assert_eq!(list[0].chunk_text, "chunk from a");
+        assert_eq!(list[1].page_id, b_id);
         // b has no chunk in the fused list → synthetic hit carries the title.
-        assert_eq!(list[0].chunk_text, "B");
-        assert_eq!(list[0].page_path.as_deref(), Some("wiki/b.md"));
+        assert_eq!(list[1].chunk_text, "B");
+        assert_eq!(list[1].page_path.as_deref(), Some("wiki/b.md"));
+    }
+
+    #[test]
+    fn expansion_list_keeps_seeds_in_retrieval_order() {
+        // a is the best retrieval hit but the least-linked seed.
+        let a = page("a", "A", "Links [[hub]].\n");
+        let hub = page("hub", "Hub", "Links [[b]], [[c]] and [[d]].\n");
+        let b = page("b", "B", "Links [[c]] and [[d]].\n");
+        let c = page("c", "C", "Leaf.\n");
+        let d = page("d", "D", "Leaf.\n");
+        let ids = vec![
+            a.frontmatter.id,
+            hub.frontmatter.id,
+            b.frontmatter.id,
+            c.frontmatter.id,
+            d.frontmatter.id,
+        ];
+        let graph = LinkGraph::build(&[a, hub, b, c, d]);
+
+        let retrieval: Vec<SearchHit> = ids
+            .iter()
+            .zip([0.9, 0.8, 0.7, 0.6, 0.5])
+            .zip(["ca", "ch", "cb", "cc", "cd"])
+            .map(|((id, score), text)| hit(*id, text, score))
+            .collect();
+        let prelim = crate::search::fusion::rrf_fuse(std::slice::from_ref(&retrieval));
+
+        // Precondition: raw PPR ranks a better-linked seed above a.
+        let weights: HashMap<PageId, f32> = prelim.iter().map(|h| (h.page_id, h.score)).collect();
+        let raw = personalized_pagerank(&graph, &weights, &PprConfig::default());
+        assert_ne!(raw[0].0, ids[0]);
+
+        let list = graph_expansion_list(&graph, &prelim, 5, 20, &PprConfig::default());
+        let order: Vec<PageId> = list.iter().map(|h| h.page_id).collect();
+        assert_eq!(order, ids, "the graph list must not reorder seeds");
+        let fused = crate::search::fusion::rrf_fuse(&[retrieval, list]);
+        assert_eq!(fused[0].page_id, ids[0]);
+
+        // A limit below the seed count keeps the best seed, not the best-linked one.
+        let short = graph_expansion_list(&graph, &prelim, 5, 1, &PprConfig::default());
+        assert_eq!(short.len(), 1);
+        assert_eq!(short[0].page_id, ids[0]);
+    }
+
+    #[test]
+    fn neighbors_keep_their_ppr_place_behind_the_top_seed() {
+        // n bridges three seeds, so PPR ranks it above them; only the top
+        // seed moves ahead of it.
+        let a = page("a", "A", "Links [[n]].\n");
+        let b = page("b", "B", "Links [[n]].\n");
+        let c = page("c", "C", "Links [[n]].\n");
+        let n = page("n", "N", "Bridge page.\n");
+        let (a_id, b_id, c_id, n_id) = (
+            a.frontmatter.id,
+            b.frontmatter.id,
+            c.frontmatter.id,
+            n.frontmatter.id,
+        );
+        let graph = LinkGraph::build(&[a, b, c, n]);
+
+        let fused = vec![
+            hit(a_id, "chunk a", 0.9),
+            hit(b_id, "chunk b", 0.8),
+            hit(c_id, "chunk c", 0.7),
+        ];
+        let list = graph_expansion_list(&graph, &fused, 3, 10, &PprConfig::default());
+        let order: Vec<PageId> = list.iter().map(|h| h.page_id).collect();
+        assert_eq!(order, vec![a_id, n_id, b_id, c_id]);
+    }
+
+    #[test]
+    fn bridge_neighbor_cannot_pass_the_top_hit() {
+        // n links all five seeds and ranks just below them in retrieval, so
+        // PPR puts n first.
+        let mut pages: Vec<Page> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| page(s, s, "Links [[n]].\n"))
+            .collect();
+        let seed_ids: Vec<PageId> = pages.iter().map(|p| p.frontmatter.id).collect();
+        let n = page("n", "N", "Bridge page.\n");
+        let n_id = n.frontmatter.id;
+        pages.push(n);
+        let graph = LinkGraph::build(&pages);
+
+        // Vector: a..e, n, fillers. Keyword: seven fillers, then n, e..a.
+        let filler = |text: String| hit(PageId::new(), &text, 0.1);
+        let mut vector: Vec<SearchHit> = seed_ids.iter().map(|id| hit(*id, "seed", 0.9)).collect();
+        vector.push(hit(n_id, "bridge", 0.8));
+        vector.extend((0..6).map(|i| filler(format!("vector filler {i}"))));
+        let mut keyword: Vec<SearchHit> = (0..7)
+            .map(|i| filler(format!("keyword filler {i}")))
+            .collect();
+        keyword.push(hit(n_id, "bridge", 0.5));
+        keyword.extend(seed_ids.iter().rev().map(|id| hit(*id, "seed", 0.4)));
+
+        let prelim = crate::search::fusion::rrf_fuse(&[vector.clone(), keyword.clone()]);
+        assert_eq!(prelim[0].page_id, seed_ids[0], "precondition: a leads");
+        assert_eq!(prelim[5].page_id, n_id, "precondition: n is sixth");
+        let weights: HashMap<PageId, f32> = prelim
+            .iter()
+            .take(5)
+            .map(|h| (h.page_id, h.score))
+            .collect();
+        let raw = personalized_pagerank(&graph, &weights, &PprConfig::default());
+        assert_eq!(raw[0].0, n_id, "precondition: raw PPR ranks n first");
+
+        let list = graph_expansion_list(&graph, &prelim, 5, 20, &PprConfig::default());
+        let fused = crate::search::fusion::rrf_fuse(&[vector, keyword, list]);
+        assert_eq!(fused[0].page_id, seed_ids[0], "n must not pass the top hit");
+
+        // With room for one page, the slot goes to the top hit, not to n.
+        let short = graph_expansion_list(&graph, &prelim, 5, 1, &PprConfig::default());
+        let order: Vec<PageId> = short.iter().map(|h| h.page_id).collect();
+        assert_eq!(order, vec![seed_ids[0]]);
+    }
+
+    #[test]
+    fn tied_top_hits_keep_the_preliminary_leader_first() {
+        // a and b tie in retrieval and b is better linked. Whichever page RRF
+        // ranks first before the graph list must stay first after it.
+        let a = page("a", "A", "Leaf.\n");
+        let b = page("b", "B", "Links [[x]] and [[y]].\n");
+        let x = page("x", "X", "Links [[y]].\n");
+        let y = page("y", "Y", "Leaf.\n");
+        let (a_id, b_id) = (a.frontmatter.id, b.frontmatter.id);
+        let graph = LinkGraph::build(&[a, b, x, y]);
+
+        let vector = vec![hit(a_id, "chunk a", 0.9), hit(b_id, "chunk b", 0.8)];
+        let keyword = vec![hit(b_id, "chunk b", 0.9), hit(a_id, "chunk a", 0.8)];
+        let prelim = crate::search::fusion::rrf_fuse(&[vector.clone(), keyword.clone()]);
+        assert!(
+            (prelim[0].score - prelim[1].score).abs() < f32::EPSILON,
+            "precondition: a and b tie"
+        );
+
+        let list = graph_expansion_list(&graph, &prelim, 2, 20, &PprConfig::default());
+        let fused = crate::search::fusion::rrf_fuse(&[vector, keyword, list]);
+        assert_eq!(fused[0].page_id, prelim[0].page_id);
+    }
+
+    #[test]
+    fn top_retrieval_hit_stays_first_after_graph_fusion() {
+        // Regression: the graph list used to omit seeds, so a seed's linked
+        // neighbor collected an extra RRF term and outranked the seed even
+        // when the seed was the top retrieval hit.
+        let a = page("a", "A", "Links [[hub]].\n");
+        let hub = page("hub", "Hub", "Links [[a]] and [[b]].\n");
+        let b = page("b", "B", "Links [[hub]].\n");
+        let a_id = a.frontmatter.id;
+        let hub_id = hub.frontmatter.id;
+        let b_id = b.frontmatter.id;
+        let graph = LinkGraph::build(&[a, hub, b]);
+
+        // a is the best retrieval hit; the hub trails far behind.
+        let mut retrieval = vec![hit(a_id, "chunk from a", 0.9)];
+        retrieval.extend((0..8).map(|i| hit(PageId::new(), &format!("filler {i}"), 0.5)));
+        retrieval.push(hit(hub_id, "chunk from hub", 0.1));
+        retrieval.push(hit(b_id, "chunk from b", 0.05));
+
+        let prelim = crate::search::fusion::rrf_fuse(std::slice::from_ref(&retrieval));
+        let graph_list = graph_expansion_list(&graph, &prelim, 5, 20, &PprConfig::default());
+        let fused = crate::search::fusion::rrf_fuse(&[retrieval, graph_list]);
+        assert_eq!(fused[0].page_id, a_id, "top retrieval hit must stay first");
     }
 
     #[test]
@@ -419,10 +619,13 @@ mod tests {
             hit(b_id, "existing chunk from b", 0.01),
         ];
         let list = graph_expansion_list(&graph, &fused, 1, 10, &PprConfig::default());
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].page_id, b_id);
+        assert_eq!(list.len(), 2);
+        let b_hit = list
+            .iter()
+            .find(|h| h.page_id == b_id)
+            .expect("b is reached");
         // Reuses the real chunk so RRF merges it with the retrieval lists.
-        assert_eq!(list[0].chunk_text, "existing chunk from b");
+        assert_eq!(b_hit.chunk_text, "existing chunk from b");
     }
 
     #[test]
@@ -436,6 +639,7 @@ mod tests {
         let fused = vec![hit(a_id, "chunk from a", 0.5)];
         let list = graph_expansion_list(&graph, &fused, 5, 1, &PprConfig::default());
         assert_eq!(list.len(), 1, "limit must cap the expansion list");
+        assert_eq!(list[0].page_id, a_id, "the seed takes the first slot");
 
         assert!(graph_expansion_list(&graph, &[], 5, 10, &PprConfig::default()).is_empty());
         assert!(graph_expansion_list(&graph, &fused, 5, 0, &PprConfig::default()).is_empty());
