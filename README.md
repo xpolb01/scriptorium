@@ -215,7 +215,7 @@ operations; post-hooks are fire-and-forget. Configured in
 | `ingest-enqueue <SOURCE>` | Queue a source for a later drain, without calling the LLM |
 | `ingest-drain` | Dedup the queue, then ingest the remaining sources one at a time |
 | `ingest-queue --list\|--stats\|--clear` | Inspect or clear the ingest queue |
-| `drain install\|uninstall\|status` | Manage the launchd job that drains the queue every 60s |
+| `drain install\|uninstall\|status` | Manage the launchd job that drains the queue every 60s (`--vault PATH`, not `-C`) |
 | `query <QUESTION>` | Ask a question with hybrid retrieval and citations |
 | `reindex [--rebuild]` | Rebuild the embeddings store (idempotent; `--rebuild` drops cached rows first) |
 | `lint [--fix]` | Run mechanical integrity checks, optionally auto-fix |
@@ -237,9 +237,11 @@ operations; post-hooks are fire-and-forget. Configured in
 | `hooks <SUBCOMMAND>` | Claude Code hook telemetry: record events in SQLite, check and list hook registrations |
 | `log emit\|tail`, `trace <SUBCOMMAND>` | Write and read the OTel-shaped log and span store |
 
-Every command accepts `-C PATH` to target a vault other than `.`.
-Commands that call a model accept `--provider` to override the configured
-one.
+Commands that work on a vault use `-C PATH` when it is given, else the
+current directory when it is a vault, else the registered default vault
+(`vault default`). `drain install` and `drain status` ignore `-C`: pass
+`--vault PATH` (default `~/scriptorium-vault`). Commands that call a model
+accept `--provider` to override the configured one.
 
 ## Source formats
 

@@ -618,8 +618,9 @@ sequenceDiagram
    `md`/`markdown`/`txt`/`text` → `articles`, `pdf` → `pdfs`,
    `html`/`htm` → `web`, anything else → `data`. The file is written only
    if nothing exists at that path yet. If this run wrote it and the ingest
-   then fails before its commit, the file is deleted again. A dry run only
-   works out the path.
+   fails later, before its commit, the file is deleted again; a write that
+   itself fails part-way is not cleaned up. A dry run only works out the
+   path.
 4. **Load the schema.** `Schema::load` reads `CLAUDE.md` from the vault
    root, falling back to `AGENTS.md`, then to an empty schema. It is
    rendered within a quarter of the provider's context window
@@ -1131,7 +1132,11 @@ below stops the whole run instead, before the final checkpoint save.
 
 - **Eligible files** are `md`, `markdown`, `txt`, `text`, `feature`,
   `html`, `htm`, `pdf`, `docx`, `pptx`, `xlsx` and `epub` files up to
-  5 MB, found by a recursive walk that skips hidden files.
+  5 MB, found by a recursive walk with the `ignore` crate's default
+  filters. Hidden files, paths matched by `.ignore` files and, inside a
+  git repository, git-ignored paths are left out, and a directory the
+  walk can't read is skipped without an error. Neither shows in the
+  report, so check the discovered count against what you expect.
 - **Skipped files.** A file whose content hash prefix already names a file
   under `sources/` counts as already interned. A file listed in this
   directory's checkpoint is skipped too.
@@ -1633,8 +1638,9 @@ ingest DRY RUN: would create 5 page(s), update 0 — nothing written.
 |---|---|---|
 | `llm ingest returned invalid IngestPlan json: ...` | The LLM returned non-JSON or JSON that doesn't match the `IngestPlan` shape. Rare with Claude/OpenAI strict-mode, more common with Ollama or Gemini JSON mode. | Open the newest file in `<vault>/.ingest-failures/`: it holds the raw reply, the parse error and the prompt. Usually means your schema (in `CLAUDE.md`) is confusing the model; tighten the rules. |
 | `vault tx validation failed: broken_link: ...` | A page links to a page that doesn't exist. Validation covers the whole vault with the staged writes overlaid, so the link can be in a page you edited by hand, not in this write. During an ingest it can also come from the plan: ingest unlinks targets that match no page in any case, but keeps a link that differs from the page's file name only in case (`[[Target]]` for `target.md`), and links resolve case-sensitively. | Run `scriptorium lint`. It checks the vault on disk, so a link it reports is in an existing page: create the target or remove the brackets, commit, and retry. If lint is clean, the link came from the plan; re-run the ingest. |
-| `ingest: 0 created, 0 updated, commit skipped-near-duplicate`, summary `skipped: near-duplicate of sources/...` | The source is a near-copy (similarity 0.92 or more) of a file interned under `sources/`. If `git status sources/` shows that file as untracked, it is a leftover: from an ingest stopped before its commit, or from a dry run on a build before [#34](https://github.com/xpolb01/scriptorium/pull/34), which copied the source and left it there. | If it really is a copy, nothing to do. Otherwise re-run with `--force`. Delete untracked leftovers so they stop matching. |
+| `ingest: 0 created, 0 updated, commit skipped-near-duplicate`, summary `skipped: near-duplicate of sources/...` | The source is a near-copy (similarity 0.92 or more) of a file interned under `sources/`. If `git status sources/` shows that file as untracked, it is a leftover: from an ingest stopped before its commit, from a copy whose write failed part-way, or from a dry run on a build before [#34](https://github.com/xpolb01/scriptorium/pull/34), which copied the source and left it there. | If it really is a copy, nothing to do. Otherwise re-run with `--force`. Delete untracked leftovers so they stop matching. |
 | `bulk-ingest` ingests nothing; the report counts every file under `Skipped (checkpoint)` | A checkpoint from an earlier run of the same directory lists them, for example one from `bulk-ingest --dry-run`. | Re-run with `--fresh`. |
+| `bulk-ingest` counts a file you never ingested under `Skipped (already interned)` | A file under `sources/` already starts with that file's hash prefix, often an untracked leftover (see the near-duplicate row). `--fresh` does not bypass this check. | Look for it with `git status sources/`. If it is untracked, delete it and re-run; if it is tracked, the same content was ingested before. |
 | `gemini returned 429: ... limit: 0` | Your Google project has Gemini API quota of zero (free tier is disabled or not enabled). | Enable the Generative Language API in the Google Cloud Console and attach a billing account, or switch to a different provider. |
 | `SCRIPTORIUM_ANTHROPIC_API_KEY env var is not set` | No API key in the process environment. | `export SCRIPTORIUM_ANTHROPIC_API_KEY=sk-ant-...` or put it in your shell profile, or store it in the macOS Keychain under the `scriptorium-anthropic` service. |
 | `vault tx validation failed: frontmatter.duplicate_id` | Two pages ended up with the same ULID, usually from a bad edit or a merge. | Manually change one of the `id:` fields. Regenerating a ULID via `uuidgen` won't work — use [a ULID generator](https://github.com/ulid/spec) or crib one from the test fixture. |
