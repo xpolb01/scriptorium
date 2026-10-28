@@ -1,12 +1,13 @@
 //! File-system watcher that auto-ingests new sources.
 //!
 //! The watcher is intentionally narrow in v1: it watches `sources/` only,
-//! and fires [`ingest::ingest`] for any new `.md` / `.txt` / `.markdown`
-//! file that lands there. It does **not** watch `wiki/` — that would create
-//! a feedback loop with its own ingest writes, and we'd need a recently-
-//! written cache to break it. Embedding refresh on `wiki/` edits can be
-//! added in a later pass once we can distinguish our own writes from
-//! external ones.
+//! and fires [`ingest::ingest`] for any new markdown, text, HTML, PDF,
+//! Office or EPUB file that lands there (but not the `.extracted.md`
+//! siblings that ingest writes). It does **not** watch `wiki/` — that
+//! would create a feedback loop with its own ingest writes, and we'd need
+//! a recently-written cache to break it. Embedding refresh on `wiki/`
+//! edits can be added in a later pass once we can distinguish our own
+//! writes from external ones.
 //!
 //! The watcher bridges `notify-debouncer-full`'s blocking std-mpsc channel
 //! to a tokio channel via a dedicated thread, so the main async task can

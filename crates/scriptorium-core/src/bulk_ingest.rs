@@ -1,9 +1,11 @@
 //! Bulk import: process an entire directory of source files with checkpoint
 //! resume, error isolation, and progress reporting.
 //!
-//! Each file gets its own [`ingest::ingest`] call (one git commit per file)
-//! for clean history. A checkpoint file at `.scriptorium/bulk-ingest-checkpoint.json`
-//! tracks progress so interrupted imports resume where they left off.
+//! Each file gets its own [`ingest::ingest_with_retrieval`] call (one git
+//! commit per file) for clean history. A checkpoint file at
+//! `.scriptorium/bulk-ingest-checkpoint.json` tracks progress so interrupted
+//! imports resume where they left off. A real run with no failures deletes
+//! it at the end; any other run, a dry run included, saves it.
 //!
 //! Reference: `GBrain`'s `src/commands/import.ts`.
 
@@ -33,7 +35,10 @@ const INGESTABLE_EXTENSIONS: &[&str] = &[
 /// Options for [`bulk_ingest`].
 #[derive(Debug, Clone)]
 pub struct BulkIngestOptions {
-    /// If true, each file is ingested with `dry_run: true`.
+    /// If true, each file is ingested with `dry_run: true`. The checkpoint
+    /// is still saved, so a real run of the same directory afterwards
+    /// skips those files unless the checkpoint is deleted first (the CLI's
+    /// `--fresh`).
     pub dry_run: bool,
     /// Save checkpoint every N files.
     pub checkpoint_interval: usize,
