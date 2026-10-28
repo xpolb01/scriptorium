@@ -54,7 +54,8 @@ pub const MAX_RELEVANT_PAGES: usize = 10;
 /// Summary returned from a successful [`ingest`] call.
 #[derive(Debug, Clone)]
 pub struct IngestReport {
-    /// Vault-relative path where the source was interned.
+    /// Vault-relative path where the source was interned (on a dry run,
+    /// where it would be).
     pub source: Utf8PathBuf,
     /// The git commit id (40-char hex) created for this ingest, or the
     /// string `"dry-run"` if this was a dry-run that did not commit.
@@ -98,9 +99,10 @@ pub async fn ingest(
 pub struct IngestOptions {
     /// If `true`, stage all writes but do not commit — return a
     /// [`IngestReport`] with `commit_id = "dry-run"` and the `dry_run_diff`
-    /// populated so the caller can preview the change set. The source file
-    /// is still interned into `sources/` (that's not the risky part) but
-    /// no pages are written to `wiki/` and no git commit is made.
+    /// populated so the caller can preview the change set. The source is
+    /// not copied into `sources/` (the preview names the path it would
+    /// get), no pages are written to `wiki/` and no git commit is made,
+    /// also when the plan judges the source redundant.
     pub dry_run: bool,
     /// Lifecycle hooks to fire at key points. `None` = no hooks.
     pub hooks: Option<crate::hooks::HooksConfig>,
@@ -174,11 +176,18 @@ pub async fn ingest_with_retrieval(
         }
     }
 
-    // 2. Intern into `sources/`.
+    // 2. Intern into `sources/`. A dry run only works out the path. A copy
+    //    it wrote would sit in `sources/` uncommitted, where other ingests
+    //    take it for an ingested source, even while this one waits on the
+    //    LLM: the near-duplicate gate skips their file as a copy of it.
     // Capture the raw bytes' UTF-8 form now — `raw` is shadowed by the
     // parsed plan later, and converted-source staging needs the original.
     let raw_utf8: Option<String> = std::str::from_utf8(&raw).ok().map(ToString::to_string);
-    let (interned, newly_interned) = intern_source(vault, source_path, &raw)?;
+    let (interned, newly_interned) = if options.dry_run {
+        (interned_path(source_path, &raw), false)
+    } else {
+        intern_source(vault, source_path, &raw)?
+    };
     let mut intern_guard = InternGuard::new(vault, &interned, newly_interned);
 
     // 3. Load and render schema. Budget about 1/4 of the provider context.
@@ -366,6 +375,20 @@ pub async fn ingest_with_retrieval(
             Utf8Path::new("log.md"),
             &format!("\n[skip] redundant — {interned}\n"),
         )?;
+        if options.dry_run {
+            // Preview the skip. Committing it would also make the real
+            // ingest after the dry run skip the file as a near-duplicate
+            // of the committed copy.
+            return Ok(IngestReport {
+                source: interned,
+                commit_id: "dry-run".into(),
+                created: 0,
+                updated: 0,
+                summary: plan.summary,
+                dry_run_diff: tx.diff(),
+                redundant: true,
+            });
+        }
         let commit_id = tx.commit(&format!("[ingest:skip] {interned}"))?;
         intern_guard.defuse();
         if let Some(hooks) = &options.hooks {
@@ -554,7 +577,6 @@ pub async fn ingest_with_retrieval(
 
     // 8. Commit (or preview on dry-run).
     if options.dry_run {
-        intern_guard.defuse(); // dry-run intentionally keeps the interned source
         let diff = tx.diff();
         drop(tx); // explicit rollback; the Drop impl is a no-op anyway
         return Ok(IngestReport {
@@ -979,9 +1001,9 @@ fn is_interned_name(name: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Returns the vault-relative interned path plus whether this call newly
-/// created the file (`false` = it already existed from a prior ingest).
-fn intern_source(vault: &Vault, source_path: &Path, bytes: &[u8]) -> Result<(Utf8PathBuf, bool)> {
+/// The vault-relative path [`intern_source`] files `bytes` read from
+/// `source_path` under: `sources/<category>/<hash12>-<slug>.<ext>`.
+fn interned_path(source_path: &Path, bytes: &[u8]) -> Utf8PathBuf {
     let hash = sha256_hex(bytes);
     let hash_prefix = &hash[..12];
     let ext = source_path
@@ -994,7 +1016,13 @@ fn intern_source(vault: &Vault, source_path: &Path, bytes: &[u8]) -> Result<(Utf
         .and_then(|s| s.to_str())
         .unwrap_or("source");
     let slug = slugify(stem);
-    let rel = Utf8PathBuf::from(format!("sources/{category}/{hash_prefix}-{slug}.{ext}"));
+    Utf8PathBuf::from(format!("sources/{category}/{hash_prefix}-{slug}.{ext}"))
+}
+
+/// Returns the vault-relative interned path plus whether this call newly
+/// created the file (`false` = it already existed from a prior ingest).
+fn intern_source(vault: &Vault, source_path: &Path, bytes: &[u8]) -> Result<(Utf8PathBuf, bool)> {
+    let rel = interned_path(source_path, bytes);
     let abs = vault.root().join(&rel);
     let created = !abs.as_std_path().exists();
     if created {
@@ -1013,9 +1041,9 @@ fn intern_source(vault: &Vault, source_path: &Path, bytes: &[u8]) -> Result<(Utf
 /// cleanup a failed ingest leaves an orphan under `sources/` that is (a)
 /// untracked by git and (b) poisonous to every retry path — bulk-ingest's
 /// interned-dedup skips the file and the near-duplicate gate matches the
-/// orphan at similarity 1.0. Armed only when this run created the file;
-/// call `defuse()` once the outcome (commit, redundant-skip, dry-run) owns
-/// the file.
+/// orphan at similarity 1.0. Armed only when this run created the file
+/// (a dry run interns nothing); call `defuse()` once a commit (ingest or
+/// redundant-skip) owns the file.
 struct InternGuard {
     abs: Option<std::path::PathBuf>,
 }
