@@ -210,7 +210,7 @@ operations; post-hooks are fire-and-forget. Configured in
 |---------|-------------|
 | `init [PATH]` | Scaffold a fresh vault with templates + `git init` |
 | `setup` | Interactive wizard: providers, API keys (macOS Keychain), config |
-| `ingest <SOURCE>` | Ingest a local file or `--url` into the vault (`--dry-run` previews without writing anything; `--force` skips the near-duplicate gate) |
+| `ingest <SOURCE>` | Ingest a local file or `--url` into the vault (`--dry-run` previews the change set without touching `sources/`, `wiki/` or git; `--force` skips the near-duplicate gate) |
 | `bulk-ingest <DIR>` | Ingest every eligible file in a directory, one commit per file, resuming from a checkpoint (`--fresh` discards it; `--dry-run` writes no pages but still saves it) |
 | `ingest-enqueue <SOURCE>` | Queue a source for a later drain, without calling the LLM |
 | `ingest-drain` | Dedup the queue, then ingest the remaining sources one at a time |
@@ -245,13 +245,15 @@ one.
 
 Ingest routes each source through the best available extractor: markdown
 and text natively; local HTML through the same Readability engine as URL
-ingest; **PDF via `pdftotext`** (poppler) when installed, falling back to
-the **`docling` CLI** (which also unlocks docx/pptx/xlsx/epub and OCR for
-scanned documents). External converters are feature-detected
-subprocesses — the scriptorium binary stays pure Rust. Raw bytes are
-interned unchanged under `sources/`; converted binaries additionally get
-a git-tracked `<source>.extracted.md` sibling used for audits and quote
-verification.
+ingest; **PDF via `pdftotext`** (poppler) when installed, or the
+**`docling` CLI** when `pdftotext` is missing or fails; docx/pptx/xlsx/epub
+via `docling`. Scanned PDFs need `docling`'s OCR, which runs only when
+`pdftotext` is not installed: a PDF that `pdftotext` reads as empty is
+rejected, even with `docling` installed. External converters are
+feature-detected subprocesses — the scriptorium binary stays pure Rust.
+Raw bytes are interned unchanged under `sources/`; converted binaries
+additionally get a git-tracked `<source>.extracted.md` sibling used for
+audits and quote verification.
 
 ## Retrieval quality & evaluation
 

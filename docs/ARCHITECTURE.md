@@ -634,7 +634,8 @@ sequenceDiagram
    page path, so the model knows which `[[wikilinks]]` resolve.
 6. **`pre_ingest` hook.** When hooks are passed in, the `pre_ingest` hook
    runs and can abort the ingest. Only the CLI `ingest` command passes them
-   (the vault's configured hooks). See [§3.21](#321-lifecycle-hooks).
+   (the vault's configured hooks), on dry runs too. See
+   [§3.21](#321-lifecycle-hooks).
 7. **Call the LLM.** `llm::prompts::ingest_prompt` puts the rendered schema
    in the system prompt and the source text in the user message, with
    `IngestPlan::schema()` as the response-schema hint. The reply is parsed
@@ -649,9 +650,11 @@ sequenceDiagram
 9. **Clean up the plan.**
    - A page action with an empty body that would create a new page is
      dropped.
-   - Wikilinks are normalized. A link that resolves to no existing page and
-     no page in the plan is unlinked: `[[ghost]]` becomes `ghost`, and
-     `[[ghost|label]]` becomes `label`.
+   - Wikilinks are normalized. A link whose target matches no existing page
+     and no page in the plan, ignoring case, is unlinked: `[[ghost]]`
+     becomes `ghost`, and `[[ghost|label]]` becomes `label`. A link that
+     matches a page only in a different case (`[[Target]]` for
+     `target.md`) is kept, and fails validation at commit (step 12).
    - Paths must start with `wiki/`, end in `.md` and contain no `..`. A
      create whose stem matches exactly one existing page becomes an update
      of that page. An update of a missing path is retargeted to the one page
@@ -671,7 +674,8 @@ sequenceDiagram
       `created` fields are preserved.**
     - Record the action's `source_quote` under `source_quotes`, and its
       `supersedes` list. Each page it supersedes gets a `superseded_by`
-      marker.
+      marker, unless the plan writes that page too: then the plan's
+      version is written as is, without the marker.
 11. **Log and index.** Append `## [YYYY-MM-DD] ingest | <summary>` and the
     plan's log entry to `log.md`, and regenerate `index.md` if it changed.
 12. **Commit.** A dry run returns `tx.diff()` with `commit_id = "dry-run"`
@@ -1121,8 +1125,9 @@ be triggered by cron, Claude Code hooks, or the MCP tool.
 
 [`bulk_ingest`](../crates/scriptorium-core/src/bulk_ingest.rs) ingests
 every eligible file in a directory, with one ingest ([§3.5](#35-ingest-flow))
-and one commit per file. A file that fails is reported and the run goes
-on.
+and one commit per file. A file whose ingest fails is reported and the
+run goes on. A file that can't be read for the already-interned check
+below stops the whole run instead, before the final checkpoint save.
 
 - **Eligible files** are `md`, `markdown`, `txt`, `text`, `feature`,
   `html`, `htm`, `pdf`, `docx`, `pptx`, `xlsx` and `epub` files up to
@@ -1401,9 +1406,9 @@ These were explicitly listed as "deferred" in v1 and are now implemented:
   with macOS Keychain storage. See [§3.20](#320-setup-wizard-and-keychain-integration).
 - **Lifecycle hooks** — configurable shell commands at pipeline events.
   See [§3.21](#321-lifecycle-hooks).
-- **PDF, Office and HTML sources** — PDFs through `pdftotext`, falling
-  back to the `docling` CLI (which also handles docx/pptx/xlsx/epub and
-  OCRs scanned documents); local HTML through Readability. See
+- **PDF, Office and HTML sources** — PDFs through `pdftotext`, or the
+  `docling` CLI when `pdftotext` is missing or fails; docx/pptx/xlsx/epub
+  through `docling`; local HTML through Readability. See
   [Source formats](../README.md#source-formats).
 
 ### Still deferred
@@ -1614,7 +1619,10 @@ ingest DRY RUN: would create 5 page(s), update 0 — nothing written.
   and no LLM call is made. Add `--force` to preview or ingest it anyway.
 - The LLM call *does* happen and *does* cost money. `--dry-run` is a
   "don't commit" flag, not a "don't call the LLM" flag. The usage.jsonl
-  line is still written.
+  line is still written, and a reply that can't be parsed still leaves a
+  record in `.ingest-failures/`.
+- The CLI still runs the `pre_ingest` hook, which can have side effects
+  of its own.
 - `bulk-ingest --dry-run` writes no pages either, but it saves the
   checkpoint ([§3.17](#317-bulk-ingest)), so pass `--fresh` to the real
   run that follows.
@@ -1624,7 +1632,7 @@ ingest DRY RUN: would create 5 page(s), update 0 — nothing written.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `llm ingest returned invalid IngestPlan json: ...` | The LLM returned non-JSON or JSON that doesn't match the `IngestPlan` shape. Rare with Claude/OpenAI strict-mode, more common with Ollama or Gemini JSON mode. | Open the newest file in `<vault>/.ingest-failures/`: it holds the raw reply, the parse error and the prompt. Usually means your schema (in `CLAUDE.md`) is confusing the model; tighten the rules. |
-| `vault tx validation failed: broken_link: ...` | A page links to a page that doesn't exist. Validation covers the whole vault with the staged writes overlaid, so the link can be in a page you edited by hand, not in this write. Ingest unlinks plan links that resolve to nothing, so during an ingest it is an existing page. | `scriptorium lint` lists the broken links. Create the target page or remove the brackets, commit, and retry. |
+| `vault tx validation failed: broken_link: ...` | A page links to a page that doesn't exist. Validation covers the whole vault with the staged writes overlaid, so the link can be in a page you edited by hand, not in this write. During an ingest it can also come from the plan: ingest unlinks targets that match no page in any case, but keeps a link that differs from the page's file name only in case (`[[Target]]` for `target.md`), and links resolve case-sensitively. | Run `scriptorium lint`. It checks the vault on disk, so a link it reports is in an existing page: create the target or remove the brackets, commit, and retry. If lint is clean, the link came from the plan; re-run the ingest. |
 | `ingest: 0 created, 0 updated, commit skipped-near-duplicate`, summary `skipped: near-duplicate of sources/...` | The source is a near-copy (similarity 0.92 or more) of a file interned under `sources/`. If `git status sources/` shows that file as untracked, it is a leftover: from an ingest stopped before its commit, or from a dry run on a build before [#34](https://github.com/xpolb01/scriptorium/pull/34), which copied the source and left it there. | If it really is a copy, nothing to do. Otherwise re-run with `--force`. Delete untracked leftovers so they stop matching. |
 | `bulk-ingest` ingests nothing; the report counts every file under `Skipped (checkpoint)` | A checkpoint from an earlier run of the same directory lists them, for example one from `bulk-ingest --dry-run`. | Re-run with `--fresh`. |
 | `gemini returned 429: ... limit: 0` | Your Google project has Gemini API quota of zero (free tier is disabled or not enabled). | Enable the Generative Language API in the Google Cloud Console and attach a billing account, or switch to a different provider. |
