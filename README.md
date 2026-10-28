@@ -253,9 +253,11 @@ via `docling`. Scanned PDFs need `docling`'s OCR, which runs only when
 `pdftotext` is not installed: a PDF that `pdftotext` reads as empty is
 rejected, even with `docling` installed. External converters are
 feature-detected subprocesses — the scriptorium binary stays pure Rust.
-Raw bytes are interned unchanged under `sources/`; converted binaries
-additionally get a git-tracked `<source>.extracted.md` sibling used for
-audits and quote verification.
+Raw bytes are interned unchanged under `sources/`. Converted sources also
+get a `<source>.extracted.md` sibling, used for audits and quote
+verification. Git tracks the sibling, and the raw file when it is text
+(markdown, plain text, HTML); a raw PDF, Office or EPUB file stays in
+`sources/` untracked.
 
 ## Retrieval quality & evaluation
 
