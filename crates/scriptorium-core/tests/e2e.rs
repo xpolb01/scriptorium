@@ -25,7 +25,7 @@ use scriptorium_core::llm::{
     QueryAnswer,
 };
 use scriptorium_core::query;
-use scriptorium_core::vault::{LinkGraph, Vault};
+use scriptorium_core::vault::{Action, LinkGraph, Vault};
 use tempfile::TempDir;
 
 fn fixture_vault() -> Vault {
@@ -342,9 +342,15 @@ async fn ingest_dry_run_stages_but_does_not_commit() {
     // No log entry.
     assert!(!dir.path().join("log.md").exists());
     // Git history is only the init commit from empty_test_vault (none here).
-    // The source file WAS interned — that's intentional (dry run still tries
-    // the real copy so the LLM sees the real path).
+    // The preview names the interned path as a file to create, but the dry
+    // run writes nothing there. The file it was given stays.
     assert!(report.source.as_str().starts_with("sources/articles/"));
+    assert!(report
+        .dry_run_diff
+        .iter()
+        .any(|c| c.path == report.source && c.action == Action::Create));
+    assert!(!dir.path().join(report.source.as_str()).exists());
+    assert!(source.exists());
 }
 
 #[tokio::test]
@@ -1467,4 +1473,277 @@ async fn ingest_skips_a_create_with_an_empty_body() {
     assert_eq!(report.created, 1);
     assert!(!dir.path().join("wiki/concepts/empty.md").exists());
     assert!(dir.path().join("wiki/concepts/full.md").exists());
+}
+
+/// Regression: a dry run left its interned copy in `sources/`. The real
+/// run of the same file then matched that copy in the near-duplicate gate
+/// (similarity 1.00) and was skipped, so a dry run followed by a commit
+/// always needed `force`.
+#[tokio::test]
+async fn ingest_after_dry_run_commits() {
+    use std::sync::atomic::Ordering;
+
+    let (dir, vault) = empty_test_vault();
+    let outside = TempDir::new().unwrap();
+    let source = outside.path().join("canvas.md");
+    std::fs::write(&source, gate_sized_body("canvas")).unwrap();
+
+    let (mock, calls) = counting_plan_mock();
+    let preview = ingest::ingest_with_options(
+        &vault,
+        &mock,
+        &source,
+        ingest::IngestOptions {
+            dry_run: true,
+            hooks: None,
+            force: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(preview.commit_id, "dry-run");
+
+    let report = ingest::ingest(&vault, &mock, &source).await.unwrap();
+    assert!(!report.redundant, "summary: {}", report.summary);
+    assert_eq!(report.commit_id.len(), 40);
+    assert_eq!(report.created, 1);
+    assert_eq!(report.source, preview.source);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "one LLM call per run");
+    let repo = git2::Repository::open(dir.path()).unwrap();
+    let tree = repo.head().unwrap().peel_to_tree().unwrap();
+    assert!(
+        tree.get_path(report.source.as_std_path()).is_ok(),
+        "the commit is missing the interned source {}",
+        report.source
+    );
+}
+
+/// The dry-run cleanup removes only the dry run's own copy. After a dry
+/// run and a real run of one file, a near-copy of that file is still
+/// skipped before any LLM call, in a dry run and in a real run. `force`
+/// still ingests it.
+#[tokio::test]
+async fn near_duplicate_gate_still_skips_another_source_after_dry_run() {
+    use std::sync::atomic::Ordering;
+
+    let (_dir, vault) = empty_test_vault();
+    let outside = TempDir::new().unwrap();
+    let original = outside.path().join("report.md");
+    let body = gate_sized_body("kept");
+    std::fs::write(&original, &body).unwrap();
+    let options = |dry_run, force| ingest::IngestOptions {
+        dry_run,
+        hooks: None,
+        force,
+    };
+
+    let (mock, calls) = counting_plan_mock();
+    ingest::ingest_with_options(&vault, &mock, &original, options(true, false))
+        .await
+        .unwrap();
+    let first = ingest::ingest(&vault, &mock, &original).await.unwrap();
+    assert!(!first.redundant, "summary: {}", first.summary);
+
+    let copy = outside.path().join("report-copy.md");
+    std::fs::write(&copy, format!("{body}one more line\n")).unwrap();
+    for dry_run in [true, false] {
+        let skipped = ingest::ingest_with_options(&vault, &mock, &copy, options(dry_run, false))
+            .await
+            .unwrap();
+        assert!(skipped.redundant, "dry_run={dry_run}: {}", skipped.summary);
+        assert_eq!(skipped.commit_id, "skipped-near-duplicate");
+        assert_eq!(skipped.source, first.source);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "no LLM call for the copy");
+
+    let forced = ingest::ingest_with_options(&vault, &mock, &copy, options(false, true))
+        .await
+        .unwrap();
+    assert!(!forced.redundant, "summary: {}", forced.summary);
+    assert_eq!(forced.commit_id.len(), 40);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+/// A dry run removes only a copy it interned itself. A forced dry run of
+/// a source that an earlier ingest committed finds the interned copy
+/// already there and keeps it.
+#[tokio::test]
+async fn dry_run_keeps_an_interned_copy_it_did_not_create() {
+    let (dir, vault) = empty_test_vault();
+    let outside = TempDir::new().unwrap();
+    let source = outside.path().join("report.md");
+    std::fs::write(&source, gate_sized_body("committed")).unwrap();
+
+    let (mock, _calls) = counting_plan_mock();
+    let first = ingest::ingest(&vault, &mock, &source).await.unwrap();
+    assert_eq!(first.commit_id.len(), 40);
+
+    let preview = ingest::ingest_with_options(
+        &vault,
+        &mock,
+        &source,
+        ingest::IngestOptions {
+            dry_run: true,
+            hooks: None,
+            force: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(preview.commit_id, "dry-run");
+    assert_eq!(preview.source, first.source);
+    assert!(
+        dir.path().join(first.source.as_str()).exists(),
+        "the dry run removed the committed source {}",
+        first.source
+    );
+}
+
+/// Bulk ingest skips a file whose content is already interned. A bulk dry
+/// run left every file interned, so the real run after it skipped them
+/// all, even with `--fresh` (which deletes the dry run's checkpoint).
+#[tokio::test]
+async fn bulk_ingest_after_dry_run_ingests() {
+    use scriptorium_core::bulk_ingest::{self, BulkIngestOptions};
+    use std::sync::atomic::Ordering;
+
+    let (_dir, vault) = empty_test_vault();
+    let inbox = TempDir::new().unwrap();
+    std::fs::write(inbox.path().join("a.md"), gate_sized_body("bulka")).unwrap();
+    std::fs::write(inbox.path().join("b.md"), gate_sized_body("bulkb")).unwrap();
+
+    let (mock, calls) = counting_plan_mock();
+    let dry_run = BulkIngestOptions {
+        dry_run: true,
+        ..Default::default()
+    };
+    let preview = bulk_ingest::bulk_ingest(&vault, &mock, inbox.path(), &dry_run, |_, _, _| {})
+        .await
+        .unwrap();
+    assert_eq!(preview.ingested, 2);
+    // `--fresh`.
+    std::fs::remove_file(vault.meta_dir().join("bulk-ingest-checkpoint.json")).unwrap();
+
+    let report = bulk_ingest::bulk_ingest(
+        &vault,
+        &mock,
+        inbox.path(),
+        &BulkIngestOptions::default(),
+        |_, _, _| {},
+    )
+    .await
+    .unwrap();
+    assert!(report.failed.is_empty(), "failures: {:?}", report.failed);
+    assert_eq!(report.skipped_already_interned, 0);
+    assert_eq!(report.ingested, 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+}
+
+/// A dry run copies nothing into `sources/`, not even while it waits on
+/// the LLM. Other ingests (the drain, a real ingest of the same file) took
+/// such a copy for an ingested source: the near-duplicate gate skipped
+/// their file as a copy of it, and a real ingest could commit the copy.
+#[tokio::test]
+async fn dry_run_writes_nothing_to_sources_during_the_llm_call() {
+    use scriptorium_core::llm::{CompletionResponse, Usage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let (dir, vault) = empty_test_vault();
+    let outside = TempDir::new().unwrap();
+    let source = outside.path().join("note.md");
+    std::fs::write(&source, gate_sized_body("note")).unwrap();
+
+    let articles = dir.path().join("sources/articles");
+    let seen = Arc::new(AtomicUsize::new(usize::MAX));
+    let seen_in_call = seen.clone();
+    let mock = MockProvider::with_handler(move |_req| {
+        let files = std::fs::read_dir(&articles).unwrap().count();
+        seen_in_call.store(files, Ordering::SeqCst);
+        let plan = IngestPlan {
+            summary: "note".into(),
+            pages: vec![IngestPageAction {
+                action: IngestAction::Create,
+                path: "wiki/concepts/note.md".into(),
+                title: "Note".into(),
+                tags: vec![],
+                body: "Note body.\n".into(),
+                source_quote: None,
+                supersedes: vec![],
+            }],
+            log_entry: "note".into(),
+            redundant: false,
+        };
+        Ok(CompletionResponse {
+            text: serde_json::to_string(&plan).unwrap(),
+            usage: Usage::default(),
+            model: "mock-1".into(),
+        })
+    });
+    let preview = ingest::ingest_with_options(
+        &vault,
+        &mock,
+        &source,
+        ingest::IngestOptions {
+            dry_run: true,
+            hooks: None,
+            force: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(preview.commit_id, "dry-run");
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        0,
+        "files in sources/articles/ during the dry run's LLM call"
+    );
+}
+
+/// A dry run whose plan judges the source redundant committed the
+/// `[ingest:skip]` record anyway. The real run after it then skipped the
+/// file as a near-duplicate of that commit. The dry run now previews the
+/// skip, and the real run makes it.
+#[tokio::test]
+async fn redundant_dry_run_commits_nothing() {
+    let (dir, vault) = empty_test_vault();
+    let plan = IngestPlan {
+        summary: "nothing new".into(),
+        pages: vec![],
+        log_entry: "redundant".into(),
+        redundant: true,
+    };
+    let mock = MockProvider::constant(serde_json::to_string(&plan).unwrap());
+    let outside = TempDir::new().unwrap();
+    let source = outside.path().join("known.md");
+    std::fs::write(&source, gate_sized_body("known")).unwrap();
+
+    let preview = ingest::ingest_with_options(
+        &vault,
+        &mock,
+        &source,
+        ingest::IngestOptions {
+            dry_run: true,
+            hooks: None,
+            force: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(preview.commit_id, "dry-run");
+    assert!(preview.redundant);
+    assert!(preview
+        .dry_run_diff
+        .iter()
+        .any(|c| c.path.as_str() == "log.md" && c.action == Action::Append));
+    assert!(!dir.path().join("log.md").exists());
+    assert!(!dir.path().join(preview.source.as_str()).exists());
+
+    let report = ingest::ingest(&vault, &mock, &source).await.unwrap();
+    assert!(report.redundant);
+    assert_eq!(report.commit_id.len(), 40, "summary: {}", report.summary);
+    let repo = git2::Repository::open(dir.path()).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert!(head.message().unwrap().starts_with("[ingest:skip]"));
 }

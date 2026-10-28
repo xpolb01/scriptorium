@@ -1476,9 +1476,10 @@ trust, pass `--dry-run`:
 scriptorium -C ~/scriptorium-vault ingest --dry-run ./big-source.md
 ```
 
-This does everything the real ingest would — intern the source, load the
-schema, call the LLM, parse the `IngestPlan`, stage all writes in a
-`VaultTx` — but stops before committing. The output shows the change set:
+This does everything the real ingest would — work out the source's
+interned path, load the schema, call the LLM, parse the `IngestPlan`,
+stage all writes in a `VaultTx` — but stops before committing. The output
+shows the change set:
 
 ```
 ingest DRY RUN: would create 5 page(s), update 0 — nothing written.
@@ -1491,11 +1492,11 @@ ingest DRY RUN: would create 5 page(s), update 0 — nothing written.
 
 **Two things to know about dry runs:**
 
-- The source file *is* still copied into `sources/` (interning runs before
-  the LLM call). This is intentional — the LLM needs to see the final
-  interned path in the prompt so the `sources:` frontmatter field is
-  accurate. If you want a truly no-disk-touch preview, copy the file
-  elsewhere first.
+- Nothing lands in `sources/`, `wiki/`, `log.md` or git, also when the
+  plan judges the source redundant. The preview names the path the source
+  will be interned at, so its `sources:` frontmatter is accurate. A copy
+  left in `sources/` would make the real ingest that follows skip the file
+  as a near-duplicate of itself.
 - The LLM call *does* happen and *does* cost money. `--dry-run` is a
   "don't commit" flag, not a "don't call the LLM" flag. The usage.jsonl
   line is still written.

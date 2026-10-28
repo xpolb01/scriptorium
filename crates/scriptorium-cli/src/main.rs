@@ -77,10 +77,10 @@ enum Command {
         #[arg(long)]
         model: Option<String>,
         /// Stage all writes, call the LLM, then print a preview of the
-        /// change set and abort instead of committing. The source file is
-        /// still interned into `sources/` but no wiki pages are written
-        /// and no git commit is made. Use this to preview what an ingest
-        /// would do before you trust it.
+        /// change set and abort instead of committing. The source is not
+        /// copied into `sources/`, no wiki pages are written and no git
+        /// commit is made, so a real ingest of the same file can follow.
+        /// Use this to preview what an ingest would do before you trust it.
         #[arg(long)]
         dry_run: bool,
         /// Ingest even when the source is a near-duplicate of one already
