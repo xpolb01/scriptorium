@@ -1,0 +1,13 @@
+# For live runs on a copy of this vault (see ../README.md). The eval test
+# does not read this file.
+[llm]
+provider = "mock"
+model    = "mock"
+
+[embeddings]
+provider = "ollama"
+model    = "embeddinggemma-2:270m-q8_0-text"
+
+[git]
+auto_commit = false
+auto_init   = false
