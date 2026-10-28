@@ -201,7 +201,7 @@ mod tests {
         );
         let snapshot: Arc<dyn Snapshot> = Arc::new(GitSnapshot::open(dir.path(), "HEAD").unwrap());
         let (registry, issues) = Registry::load(snapshot.as_ref(), "ontology").unwrap();
-        assert!(issues.is_empty());
+        assert_eq!(issues, [] as [crate::registry::RegistryIssue; 0]);
         let subgraphs = build_subgraphs(&registry, &snapshot).unwrap();
         let names: Vec<_> = subgraphs.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["core"]);

@@ -208,7 +208,7 @@ mod tests {
         // Verify each skill loads.
         for entry in &manifest.skills {
             let skill = load_skill(&vault, &entry.name).unwrap();
-            assert!(!skill.content.is_empty());
+            assert_ne!(skill.content, "");
         }
 
         // Second init is a no-op (doesn't overwrite).

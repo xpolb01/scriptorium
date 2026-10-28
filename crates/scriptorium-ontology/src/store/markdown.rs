@@ -869,7 +869,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(linking.len(), 1, "backlinks via the reverse index");
-        assert!(s.notes().unwrap().1.is_empty());
+        assert_eq!(s.notes().unwrap().1, [] as [Problem; 0]);
     }
 
     #[tokio::test]

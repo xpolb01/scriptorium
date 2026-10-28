@@ -989,7 +989,7 @@ mod tests {
         }
         let removed = clear_queue(&vault).expect("clear");
         assert_eq!(removed, 3);
-        assert!(list_queued(&vault).unwrap().is_empty());
+        assert_eq!(list_queued(&vault).unwrap(), [] as [QueueMarker; 0]);
     }
 
     #[test]
@@ -1107,7 +1107,7 @@ mod tests {
         assert_eq!(report.ingested, 1);
         assert_eq!(report.skipped_dup, 2);
         assert_eq!(report.redundant_skips, 0);
-        assert!(list_queued(&vault).unwrap().is_empty());
+        assert_eq!(list_queued(&vault).unwrap(), [] as [QueueMarker; 0]);
 
         let h = canonical_hash("body\n");
         let lines: Vec<String> = fs::read_to_string(hash_store_path(&vault))
@@ -1392,7 +1392,7 @@ mod tests {
         assert_eq!(report.considered, 1);
         assert_eq!(report.skipped_missing, 1);
         assert!(report.failures.is_empty());
-        assert!(list_queued(&vault).unwrap().is_empty());
+        assert_eq!(list_queued(&vault).unwrap(), [] as [QueueMarker; 0]);
     }
 
     #[tokio::test]

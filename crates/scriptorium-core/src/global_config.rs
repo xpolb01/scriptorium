@@ -119,7 +119,7 @@ mod tests {
         let path = dir.path().join("nonexistent.toml");
         let cfg = GlobalConfig::load_from(&path).unwrap();
         assert!(cfg.default.is_none());
-        assert!(cfg.vaults.is_empty());
+        assert_eq!(cfg.vaults, [] as [VaultEntry; 0]);
     }
 
     #[test]

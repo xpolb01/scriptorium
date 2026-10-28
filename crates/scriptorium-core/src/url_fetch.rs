@@ -283,7 +283,7 @@ mod tests {
             <p>A second paragraph also gives the extractor more signal to work with so it does not give up entirely on the page.</p>
             </article></body></html>";
         let doc = convert(html, "https://example.com/untitled", fake_time()).unwrap();
-        assert!(!doc.title.is_empty());
+        assert_ne!(doc.title, "");
         assert!(doc
             .markdown
             .contains("> Source: https://example.com/untitled"));

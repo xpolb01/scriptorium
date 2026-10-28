@@ -496,11 +496,13 @@ async fn references_match_strings_lists_and_string_sets_exactly() {
         .await
         .unwrap();
     assert_eq!(keys(&first_two), ["list", "scalar"]);
-    assert!(store
-        .list("Paper", &references("authors", "nobody", None))
-        .await
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        store
+            .list("Paper", &references("authors", "nobody", None))
+            .await
+            .unwrap(),
+        [] as [Arc<Record>; 0]
+    );
     table.delete().await;
 }
 

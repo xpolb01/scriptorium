@@ -393,7 +393,7 @@ async fn require_remote_pins_match(root: &Path, registry: &Registry) -> Result<(
         };
         let headers = credentials
             .headers_for(&sub.dir, &sub.name, &remote.url)
-            .map_err(&unknown)?;
+            .map_err(unknown)?;
         let served = crate::remote::fetch_sdl(&remote.url, &headers)
             .await
             .map_err(|e| unknown(e.to_string()))?;

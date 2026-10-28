@@ -2150,7 +2150,7 @@ type Query { thing(id: ID!): Thing }
             .map(|i| i.message)
             .collect()
         };
-        assert!(problems(NOTES_TOML).is_empty());
+        assert_eq!(problems(NOTES_TOML), [] as [String; 0]);
         // A misspelling would fill a field no query reads.
         let found = problems(&NOTES_TOML.replace("\"related\"", "\"reltaed\""));
         assert_eq!(found.len(), 1, "{found:?}");

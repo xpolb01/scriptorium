@@ -1074,7 +1074,10 @@ mod tests {
             references: None,
             limit: Some(0),
         };
-        assert!(store.list("Paper", &none).await.unwrap().is_empty());
+        assert_eq!(
+            store.list("Paper", &none).await.unwrap(),
+            [] as [Arc<Record>; 0]
+        );
         assert!(store.client.get().is_none(), "no client was built");
     }
 }

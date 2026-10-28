@@ -359,17 +359,21 @@ mod tests {
     fn empty_graph_returns_empty() {
         let graph = LinkGraph::build(&[]);
         let ranking = personalized_pagerank(&graph, &seed(PageId::new()), &PprConfig::default());
-        assert!(ranking.is_empty());
+        assert_eq!(ranking, [] as [(PageId, f32); 0]);
     }
 
     #[test]
     fn empty_or_unknown_seeds_return_empty() {
         let a = page("a", "A", "Body.\n");
         let graph = LinkGraph::build(&[a]);
-        assert!(personalized_pagerank(&graph, &HashMap::new(), &PprConfig::default()).is_empty());
+        assert_eq!(
+            personalized_pagerank(&graph, &HashMap::new(), &PprConfig::default()),
+            [] as [(PageId, f32); 0]
+        );
         // A seed the graph has never heard of contributes nothing.
-        assert!(
-            personalized_pagerank(&graph, &seed(PageId::new()), &PprConfig::default()).is_empty()
+        assert_eq!(
+            personalized_pagerank(&graph, &seed(PageId::new()), &PprConfig::default()),
+            [] as [(PageId, f32); 0]
         );
     }
 
