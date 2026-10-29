@@ -193,13 +193,15 @@ fn is_ingestable_source(path: &Path) -> bool {
     // Everything the extract router can handle (binary formats included) —
     // extraction failures surface as ingest errors, not watcher crashes.
     // `.extracted.md` siblings of converted binaries are our own writes, as
-    // are the `<hash>-…` copies ingest interns. Ingesting an interned copy
-    // interns it again under a longer name, which lands here again: a
-    // source too short for the near-duplicate gate would loop forever.
+    // are the copies ingest interns, named after their content's hash.
+    // Ingesting an interned copy interns it again under a longer name,
+    // which lands here again: a source too short for the near-duplicate
+    // gate would loop forever.
     if path
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.ends_with(".extracted.md") || ingest::is_interned_name(n))
+        .is_some_and(|n| n.ends_with(".extracted.md"))
+        || ingest::is_interned_copy(path)
     {
         return false;
     }
@@ -246,10 +248,16 @@ mod tests {
         std::fs::write(&sibling, "body").unwrap();
         assert!(!is_ingestable_source(&sibling));
 
-        // So are the copies ingest interns.
-        let interned = dir.path().join("4ed163f8d545-foo.md");
+        // So are the copies ingest interns, named after their content's
+        // hash: the SHA-256 of "body" starts with `230d8358dc8e`.
+        let interned = dir.path().join("230d8358dc8e-foo.md");
         std::fs::write(&interned, "body").unwrap();
         assert!(!is_ingestable_source(&interned));
+
+        // A timestamped name only has the shape of one.
+        let stamped = dir.path().join("202610291230-meeting.md");
+        std::fs::write(&stamped, "body").unwrap();
+        assert!(is_ingestable_source(&stamped));
 
         // Unknown binary formats stay rejected.
         let zip = dir.path().join("qux.zip");

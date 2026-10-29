@@ -295,6 +295,36 @@ impl Fixture {
             .filter(|subject| subject.starts_with("[ingest]"))
             .count()
     }
+
+    /// Whether git tracks a file under `sources/` whose name ends with
+    /// `suffix`.
+    fn tracks_source_ending_with(&self, suffix: &str) -> bool {
+        let files = std::process::Command::new("git")
+            .arg("-C")
+            .arg(self.vault.path())
+            .args(["ls-files", "sources"])
+            .output()
+            .expect("git ls-files");
+        String::from_utf8(files.stdout)
+            .unwrap()
+            .lines()
+            .any(|path| path.ends_with(suffix))
+    }
+}
+
+/// Check `done` every 200 ms until it holds or `timeout` passes. Returns
+/// whether it held.
+fn wait_for(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if done() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 #[test]
@@ -565,16 +595,29 @@ fn watch_ingests_a_new_source_once() {
     let fixture = Fixture::new();
     let articles = fixture.vault.path().join("sources/articles");
     std::fs::create_dir_all(&articles).unwrap();
-    let watch = fixture.start_watch();
+    let mut watch = fixture.start_watch();
 
     std::fs::write(articles.join("kestrel.md"), NOTE).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while fixture.ingest_commits() == 0 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    // Leave time for a second ingest: the watcher debounces events for
-    // 2 s, and an ingest against the stub takes well under a second.
-    std::thread::sleep(Duration::from_secs(6));
+    assert!(
+        wait_for(Duration::from_secs(60), || fixture.ingest_commits() >= 1),
+        "watch made no ingest commit within 60 s"
+    );
+    // The watcher handles events in order. Once it has committed a second
+    // source, it has handled the event for the first one's interned copy.
+    std::fs::write(
+        articles.join("plover.md"),
+        "# Plover survey\n\nThe plover survey counts nests along the shore.\n",
+    )
+    .unwrap();
+    assert!(
+        wait_for(Duration::from_secs(60), || fixture
+            .tracks_source_ending_with("-plover.md")),
+        "watch did not commit the second source within 60 s"
+    );
+    assert!(
+        watch.0.try_wait().unwrap().is_none(),
+        "watch exited while it ran"
+    );
     drop(watch);
 
     let mut files: Vec<String> = std::fs::read_dir(&articles)
@@ -584,13 +627,13 @@ fn watch_ingests_a_new_source_once() {
     files.sort();
     assert_eq!(
         fixture.ingest_commits(),
-        1,
-        "one ingest commit expected; sources/articles holds {files:?}"
+        2,
+        "one ingest commit per source expected; sources/articles holds {files:?}"
     );
     assert_eq!(
         files.len(),
-        2,
-        "the source and its interned copy: {files:?}"
+        4,
+        "each source and its interned copy: {files:?}"
     );
     assert!(
         fixture.embedded_pages() >= 1,

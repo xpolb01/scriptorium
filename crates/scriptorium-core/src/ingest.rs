@@ -1047,13 +1047,25 @@ fn find_near_duplicate_source(vault: &Vault, text: &str) -> Option<(Utf8PathBuf,
 
 /// True for the file names [`intern_source`] writes: a 12-character
 /// lowercase hex hash prefix, then `-`.
-pub(crate) fn is_interned_name(name: &str) -> bool {
+fn is_interned_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     bytes.len() > 13
         && bytes[12] == b'-'
         && bytes[..12]
             .iter()
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// True when `path` is a copy [`intern_source`] wrote: its name starts with
+/// the first 12 hex digits of its own content's SHA-256, as
+/// [`interned_path`] names it. A name that only has that shape, such as a
+/// `YYYYMMDDhhmm-…` timestamp, does not match its content.
+pub(crate) fn is_interned_copy(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    is_interned_name(name)
+        && fs::read(path).is_ok_and(|bytes| sha256_hex(&bytes).starts_with(&name[..12]))
 }
 
 /// The vault-relative path [`intern_source`] files `bytes` read from
@@ -1399,6 +1411,21 @@ mod tests {
         assert!(!is_interned_name("5BCCDA2DF7F3-upper.md"));
         assert!(!is_interned_name("5bccda2df7f-short.md"));
         assert!(!is_interned_name("5bccda2df7f3-"));
+    }
+
+    #[test]
+    fn is_interned_copy_requires_a_name_its_content_hashes_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"# Plover\n\nThe plover survey counts nests.\n";
+        let rel = interned_path(Path::new("plover.md"), bytes);
+        let copy = dir.path().join(rel.file_name().unwrap());
+        fs::write(&copy, bytes).unwrap();
+        assert!(is_interned_copy(&copy));
+
+        // A timestamp has the shape of a hash prefix, not its value.
+        let stamped = dir.path().join("202610291230-meeting.md");
+        fs::write(&stamped, bytes).unwrap();
+        assert!(!is_interned_copy(&stamped));
     }
 
     use crate::llm::prompts::{IngestAction, IngestPageAction, IngestPlan};
