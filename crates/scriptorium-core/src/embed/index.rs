@@ -273,6 +273,35 @@ pub async fn reindex_contextual(
     strategy: ChunkStrategy,
     chat: Option<&dyn LlmProvider>,
 ) -> Result<usize> {
+    reindex_under_lock(vault, store, provider, model, strategy, chat, false).await
+}
+
+/// Like [`reindex_contextual`], but first drops every cached row, so a
+/// strategy or contextual-mode change re-embeds every page. The drop
+/// happens under the embed lock: a run that held the lock while this one
+/// waited would otherwise refill the store, and this run would take those
+/// rows for cache hits.
+pub async fn rebuild_contextual(
+    vault: &Vault,
+    store: &EmbeddingsStore,
+    provider: &dyn LlmProvider,
+    model: &str,
+    strategy: ChunkStrategy,
+    chat: Option<&dyn LlmProvider>,
+) -> Result<usize> {
+    reindex_under_lock(vault, store, provider, model, strategy, chat, true).await
+}
+
+/// Take the embed lock, then run [`reindex_locked`]. See [`reindex`].
+async fn reindex_under_lock(
+    vault: &Vault,
+    store: &EmbeddingsStore,
+    provider: &dyn LlmProvider,
+    model: &str,
+    strategy: ChunkStrategy,
+    chat: Option<&dyn LlmProvider>,
+    rebuild: bool,
+) -> Result<usize> {
     let meta = vault.meta_dir().into_std_path_buf();
     std::fs::create_dir_all(&meta).map_err(|e| Error::io(&meta, e))?;
     let lock_path = meta.join(EMBED_LOCK_FILE);
@@ -289,7 +318,8 @@ pub async fn reindex_contextual(
     loop {
         match lock.try_write() {
             Ok(_guard) => {
-                return reindex_locked(vault, store, provider, model, strategy, chat).await;
+                return reindex_locked(vault, store, provider, model, strategy, chat, rebuild)
+                    .await;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(Error::io(&lock_path, e)),
@@ -298,7 +328,8 @@ pub async fn reindex_contextual(
     }
 }
 
-/// The body of [`reindex_contextual`], run while it holds the embed lock.
+/// The body of a reindex run, run while it holds the embed lock. A
+/// `rebuild` drops every cached row first.
 async fn reindex_locked(
     vault: &Vault,
     store: &EmbeddingsStore,
@@ -306,7 +337,11 @@ async fn reindex_locked(
     model: &str,
     strategy: ChunkStrategy,
     chat: Option<&dyn LlmProvider>,
+    rebuild: bool,
 ) -> Result<usize> {
+    if rebuild {
+        store.retain_page_versions(&[])?;
+    }
     let scan = vault.scan()?;
     let mut total = 0;
 
@@ -346,7 +381,9 @@ mod tests {
     use camino::Utf8PathBuf;
     use chrono::{TimeZone, Utc};
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::future::Future;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::{Notify, Semaphore};
 
     fn make_page(stem: &str, body: &str) -> Page {
@@ -403,8 +440,20 @@ mod tests {
     /// that it started, then waits until the test opens `gate`.
     struct GatedEmbedder {
         inner: MockProvider,
-        entered: Arc<Notify>,
-        gate: Arc<Semaphore>,
+        reached: AtomicBool,
+        entered: Notify,
+        gate: Semaphore,
+    }
+
+    impl GatedEmbedder {
+        fn new() -> Self {
+            Self {
+                inner: MockProvider::constant(""),
+                reached: AtomicBool::new(false),
+                entered: Notify::new(),
+                gate: Semaphore::new(0),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -417,6 +466,7 @@ mod tests {
         }
 
         async fn embed(&self, texts: &[String]) -> std::result::Result<Vec<Vec<f32>>, LlmError> {
+            self.reached.store(true, Ordering::SeqCst);
             self.entered.notify_one();
             let _permit = self.gate.acquire().await.expect("gate is never closed");
             self.inner.embed(texts).await
@@ -435,43 +485,80 @@ mod tests {
         }
     }
 
+    /// Runs `first`, which must reach `gated`'s provider, and, once it waits
+    /// there, `then`. The gate opens 500 ms after `then` starts, so `then`
+    /// overlaps the rest of `first`. Fails rather than hangs when a run
+    /// stalls or `first` returns before it reaches the provider.
+    async fn overlap<A: Future, B: Future>(
+        gated: &GatedEmbedder,
+        first: A,
+        then: B,
+    ) -> (A::Output, B::Output)
+    where
+        A::Output: std::fmt::Debug,
+    {
+        let run_first = async {
+            let out = first.await;
+            // Lets `then` start if `first` returned before the provider.
+            gated.entered.notify_one();
+            out
+        };
+        let run_then = async {
+            gated.entered.notified().await;
+            let open_gate_later = async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                gated.gate.add_permits(1);
+            };
+            tokio::join!(then, open_gate_later).0
+        };
+        let outputs = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(run_first, run_then)
+        })
+        .await
+        .expect("both runs finish");
+        assert!(
+            gated.reached.load(Ordering::SeqCst),
+            "the first run never reached the provider, so nothing overlapped it: {:?}",
+            outputs.0
+        );
+        outputs
+    }
+
+    /// Writes `page` under `root` at its vault path.
+    fn write_page(root: &Path, page: &Page) {
+        let path = root.join(page.path.as_str());
+        std::fs::write(path, page.to_markdown().unwrap()).unwrap();
+    }
+
+    /// A vault in a temp dir with one page, `stem`.
+    fn vault_with_page(stem: &str) -> (tempfile::TempDir, Vault) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("wiki")).unwrap();
+        write_page(dir.path(), &make_page(stem, &format!("{stem} body.\n")));
+        let vault = Vault::open(dir.path()).unwrap();
+        (dir, vault)
+    }
+
     /// Run A scans, then stalls in the provider. A page is written and run B
     /// indexes it. When A finishes, its prune must keep B's rows for the new
     /// page.
     #[tokio::test]
     async fn concurrent_reindex_keeps_rows_of_a_page_written_after_its_scan() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("wiki")).unwrap();
-        let vault = Vault::open(dir.path()).unwrap();
-        let write = |page: &Page| {
-            let path = dir.path().join(page.path.as_str());
-            std::fs::write(path, page.to_markdown().unwrap()).unwrap();
-        };
-        write(&make_page("alpha", "Alpha body.\n"));
+        let (dir, vault) = vault_with_page("alpha");
         let store = EmbeddingsStore::in_memory().unwrap();
-        let entered = Arc::new(Notify::new());
-        let gate = Arc::new(Semaphore::new(0));
-        let gated = GatedEmbedder {
-            inner: MockProvider::constant(""),
-            entered: Arc::clone(&entered),
-            gate: Arc::clone(&gate),
-        };
+        let gated = GatedEmbedder::new();
         let plain = MockProvider::constant("");
 
-        let run_a = reindex(&vault, &store, &gated, "mock-1");
-        let write_then_run_b = async {
-            // Run A has scanned and waits in the provider.
-            entered.notified().await;
-            write(&make_page("beta", "Beta body.\n"));
-            let open_gate_later = async {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                gate.add_permits(1);
-            };
-            let (run_b, ()) =
-                tokio::join!(reindex(&vault, &store, &plain, "mock-1"), open_gate_later);
-            run_b
+        let write_beta_then_reindex = async {
+            write_page(dir.path(), &make_page("beta", "beta body.\n"));
+            reindex(&vault, &store, &plain, "mock-1").await
         };
-        let (run_a, run_b) = tokio::join!(run_a, write_then_run_b);
+        let (run_a, run_b) = overlap(
+            &gated,
+            reindex(&vault, &store, &gated, "mock-1"),
+            write_beta_then_reindex,
+        )
+        .await;
         run_a.unwrap();
         run_b.unwrap();
 
@@ -485,5 +572,39 @@ mod tests {
                 page.path
             );
         }
+    }
+
+    /// A rebuild that waits for the lock must drop the cached rows only once
+    /// it holds the lock. Dropped earlier, the rows the lock holder writes
+    /// meanwhile would pass for cache hits, and the rebuild would re-embed
+    /// nothing.
+    #[tokio::test]
+    async fn rebuild_waiting_for_the_lock_re_embeds_rows_written_meanwhile() {
+        let (_dir, vault) = vault_with_page("alpha");
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let gated = GatedEmbedder::new();
+        let plain = MockProvider::constant("");
+
+        let rebuild_run = rebuild_contextual(
+            &vault,
+            &store,
+            &plain,
+            "mock-1",
+            ChunkStrategy::default(),
+            None,
+        );
+        let (run_a, re_embedded) = overlap(
+            &gated,
+            reindex(&vault, &store, &gated, "mock-1"),
+            rebuild_run,
+        )
+        .await;
+        let written = run_a.unwrap();
+        assert!(written > 0);
+        assert_eq!(
+            re_embedded.unwrap(),
+            written,
+            "the rebuild re-embeds every chunk"
+        );
     }
 }
