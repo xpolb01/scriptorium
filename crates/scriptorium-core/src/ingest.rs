@@ -133,6 +133,10 @@ const NEAR_DUP_THRESHOLD: f32 = 0.92;
 /// Sources larger than this are not compared (cost guard).
 const NEAR_DUP_MAX_BYTES: u64 = 512 * 1024;
 
+/// [`IngestReport::commit_id`] when the near-duplicate gate skipped the
+/// source. Nothing was written or committed.
+pub const NEAR_DUPLICATE_SKIP: &str = "skipped-near-duplicate";
+
 /// Run the ingest pipeline with configurable options. See [`ingest`] for the
 /// default path and [`IngestOptions`] for the knobs.
 #[allow(clippy::too_many_lines)]
@@ -176,7 +180,7 @@ pub async fn ingest_with_retrieval(
         if let Some((existing, sim)) = find_near_duplicate_source(vault, &source_text) {
             return Ok(IngestReport {
                 source: existing.clone(),
-                commit_id: "skipped-near-duplicate".into(),
+                commit_id: NEAR_DUPLICATE_SKIP.into(),
                 created: 0,
                 updated: 0,
                 summary: format!(
