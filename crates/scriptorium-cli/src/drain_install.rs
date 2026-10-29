@@ -252,6 +252,69 @@ pub fn uninstall() -> Result<UninstallReport> {
     })
 }
 
+const WITHHELD: &str = "<rest withheld: an environment value spans lines>\n";
+
+/// Replace every value in the `environment = {` blocks of `launchctl print`
+/// output with `<redacted>`, keeping the variable names. The job's
+/// environment holds the API keys `install()` wrote into the plist.
+///
+/// A value that spans lines makes the layout ambiguous, so the first line
+/// that does not fit it ends the output with [`WITHHELD`]: inside a block,
+/// anything but `NAME => value` or the closing `}`; after a block's `}`,
+/// anything but the blank line launchctl prints there. This keeps the job's
+/// own values out of the output. It does not see through a value written to
+/// imitate launchctl's layout: whoever sets the job's environment already
+/// holds its values.
+fn redact_environment(print: &str) -> String {
+    let mut out = String::with_capacity(print.len());
+    // Indent of the open block's header; the block ends at the `}` printed
+    // at that same indent.
+    let mut block_indent: Option<&str> = None;
+    let mut block_closed = false;
+    for line in print.lines() {
+        if let Some(open) = block_indent {
+            if line
+                .strip_prefix(open)
+                .is_some_and(|rest| rest.trim_end() == "}")
+            {
+                block_indent = None;
+                block_closed = true;
+                out.push_str(line);
+            } else if let Some(name) = env_entry_name(line, open) {
+                let _ = write!(out, "{open}\t{name} => <redacted>");
+            } else {
+                out.push_str(WITHHELD);
+                return out;
+            }
+        } else if block_closed && !line.trim().is_empty() {
+            out.push_str(WITHHELD);
+            return out;
+        } else {
+            block_closed = false;
+            out.push_str(line);
+            if line.trim_end().ends_with("environment = {") {
+                block_indent = Some(&line[..line.len() - line.trim_start().len()]);
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The name in a `NAME => value` line of an environment block whose header
+/// is indented by `open`, if the line has that shape.
+fn env_entry_name<'a>(line: &'a str, open: &str) -> Option<&'a str> {
+    let (name, _) = line
+        .strip_prefix(open)?
+        .strip_prefix('\t')?
+        .split_once(" => ")?;
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    ((first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    .then_some(name)
+}
+
 pub fn status(vault: Option<PathBuf>) -> Result<StatusReport> {
     let home = home()?;
     let plist_path = home
@@ -268,11 +331,11 @@ pub fn status(vault: Option<PathBuf>) -> Result<StatusReport> {
     let (loaded, launchctl_print) = match &print_out {
         Ok(o) => (
             o.status.success(),
-            format!(
+            redact_environment(&format!(
                 "{}{}",
                 String::from_utf8_lossy(&o.stdout),
                 String::from_utf8_lossy(&o.stderr)
-            ),
+            )),
         ),
         Err(e) => (false, format!("launchctl print failed: {e}")),
     };
@@ -348,5 +411,87 @@ mod tests {
         let out = render_plist("/b", "/v", "/l", env_block);
         assert!(out.contains("<key>FOO_KEY</key><string>val</string>"));
         assert!(out.contains("<key>EnvironmentVariables</key>"));
+    }
+
+    #[test]
+    fn redact_environment_hides_values_and_keeps_names() {
+        let print = "gui/501/com.bogdan.scriptorium-drain = {\n\
+            \tpath = /Users/u/Library/LaunchAgents/com.bogdan.scriptorium-drain.plist\n\
+            \targuments = {\n\
+            \t\t/Users/u/.cargo/bin/scriptorium\n\
+            \t\tingest-drain\n\
+            \t}\n\
+            \n\
+            \tinherited environment = {\n\
+            \t\tSSH_AUTH_SOCK => /private/tmp/com.apple.launchd.x/Listeners\n\
+            \t}\n\
+            \n\
+            \tenvironment = {\n\
+            \t\tOPENAI_API_KEY => test-secret-1\n\
+            \t\tPATH => /usr/bin:/bin\n\
+            \t}\n\
+            \n\
+            \tdomain = gui/501 [100005]\n\
+            }\n";
+        let expected = "gui/501/com.bogdan.scriptorium-drain = {\n\
+            \tpath = /Users/u/Library/LaunchAgents/com.bogdan.scriptorium-drain.plist\n\
+            \targuments = {\n\
+            \t\t/Users/u/.cargo/bin/scriptorium\n\
+            \t\tingest-drain\n\
+            \t}\n\
+            \n\
+            \tinherited environment = {\n\
+            \t\tSSH_AUTH_SOCK => <redacted>\n\
+            \t}\n\
+            \n\
+            \tenvironment = {\n\
+            \t\tOPENAI_API_KEY => <redacted>\n\
+            \t\tPATH => <redacted>\n\
+            \t}\n\
+            \n\
+            \tdomain = gui/501 [100005]\n\
+            }\n";
+        assert_eq!(redact_environment(print), expected);
+    }
+
+    #[test]
+    fn redact_environment_handles_crlf() {
+        let print =
+            "\tenvironment = {\r\n\t\tKEY => test-secret-1\r\n\t}\r\n\r\n\tstate = running\r\n";
+        assert_eq!(
+            redact_environment(print),
+            "\tenvironment = {\n\t\tKEY => <redacted>\n\t}\n\n\tstate = running\n"
+        );
+    }
+
+    #[test]
+    fn redact_environment_withholds_the_rest_after_a_line_it_cannot_place() {
+        let cases = [
+            // A value's second line.
+            "\tenvironment = {\n\t\tKEY => first\nSECRET\n\t}\n\n\tstate = running\n",
+            // A value's second line holding ` => `.
+            "\tenvironment = {\n\t\tKEY => first\nSECRET => tail\n\t}\n",
+            // The same at the header's indent.
+            "\tenvironment = {\n\t\tKEY => first\n\tSECRET => tail\n\t}\n",
+            // A value's second line equal to the block's closing brace.
+            "\tenvironment = {\n\t\tKEY => first\n\t}\nSECRET\n\t}\n",
+            // The same under an unindented header.
+            "environment = {\nKEY => first\n}\nSECRET\n}\n",
+            // A name with a space in it.
+            "\tenvironment = {\n\t\tSECRET KEY => first\n\t}\n",
+        ];
+        for print in cases {
+            let out = redact_environment(print);
+            assert!(out.ends_with(WITHHELD), "{print:?} gave {out:?}");
+            for value in ["first", "SECRET", "tail"] {
+                assert!(!out.contains(value), "{print:?} gave {out:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn redact_environment_keeps_text_outside_environment_blocks() {
+        let not_loaded = "Bad request.\nCould not find service \"x\" in domain for user gui: 501\n";
+        assert_eq!(redact_environment(not_loaded), not_loaded);
     }
 }
