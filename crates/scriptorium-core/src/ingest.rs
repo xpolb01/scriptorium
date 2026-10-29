@@ -1126,6 +1126,11 @@ fn intern_source(vault: &Vault, source_path: &Path, bytes: &[u8]) -> Result<(Utf
 /// to tell interned copies from sources, and would take a copy it caught
 /// half written for a new source. The temporary name has no extension,
 /// which `watch` skips.
+///
+/// On exFAT, macOS refuses the rename that keeps an existing name, and
+/// exFAT has no hard links to stand in for it. There a plain rename does:
+/// the file still appears whole, but a file that appears between the check
+/// and the rename is replaced, as `std::fs::write` would replace it.
 fn create_new_file(path: &Path, bytes: &[u8]) -> Result<bool> {
     use std::io::Write;
 
@@ -1140,8 +1145,11 @@ fn create_new_file(path: &Path, bytes: &[u8]) -> Result<bool> {
     tmp.write_all(bytes).map_err(|e| Error::io(tmp.path(), e))?;
     match tmp.persist_noclobber(path) {
         Ok(_) => Ok(true),
-        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(Error::io(path, e.error)),
+        Err(_) if path.exists() => Ok(false),
+        Err(e) => match e.file.persist(path) {
+            Ok(_) => Ok(true),
+            Err(e) => Err(Error::io(path, e.error)),
+        },
     }
 }
 
