@@ -185,8 +185,9 @@ fn queue_dir_path(vault: &Vault) -> PathBuf {
 ///
 /// Markers younger than `cfg.debounce` are skipped (left on disk). For
 /// each survivor: (1) read marker, (2) read source file, (3) canonicalize
-/// and hash, (4) check `source-hashes.txt` — if hit, delete marker,
-/// increment `skipped_dup`, continue; (5) call `ingest_with_retrieval`,
+/// and hash, (4) check `source-hashes.txt` — if hit, and for a staged
+/// session note git holds a copy, delete marker, increment `skipped_dup`,
+/// continue; (5) call `ingest_with_retrieval`,
 /// (6) on success append hash, delete marker, (7) on failure leave
 /// marker in place (next drain retries) and record a [`DrainFailure`].
 /// A near-duplicate skip counts as a failure unless HEAD holds the matched
@@ -196,9 +197,12 @@ fn queue_dir_path(vault: &Vault) -> PathBuf {
 /// A staged session note is deleted only when git holds a copy of its
 /// content: after an ingest commit, after a near-duplicate skip of an
 /// unchanged committed file, or as a duplicate of a committed source. A
-/// note changed since the drain read it, such as one a resumed session
-/// exported again during the LLM call, keeps its marker, so the next drain
-/// handles the new content.
+/// staged note whose hash is recorded but whose content git does not hold
+/// is ingested like a new one. A note changed since the drain read it,
+/// such as one a resumed session exported again during the LLM call, keeps
+/// its marker, so the next drain handles the new content. The drain reads
+/// a note one last time just before deleting it; a write that lands
+/// between that read and the delete is lost.
 ///
 /// Errors short-circuit only on lock-acquisition or fatal IO; per-marker
 /// errors accumulate in `DrainFailure`.
@@ -332,29 +336,8 @@ pub async fn drain(
         };
 
         let hash = canonical_hash(&text);
-        match hash_store_contains(vault, &hash) {
-            Ok(true) => {
-                report.skipped_dup += 1;
-                // The content was ingested before, so a staged session note
-                // is redundant, as on the success path below. Delete it only
-                // when a stored copy exists: the hash store also holds
-                // hashes of notes that were never stored. The near-duplicate
-                // gate once skipped every session note as a copy of itself,
-                // and the drain recorded the hash anyway. A note changed
-                // since the drain read it keeps its marker.
-                if !cfg.dry_run
-                    && is_staged_session_note(vault, &marker.source)
-                    && stored
-                        .get_or_insert_with(|| stored_canonical_hashes(vault))
-                        .contains(&hash)
-                    && !remove_note_if_unchanged(&marker.source, &hash)
-                {
-                    continue;
-                }
-                let _ = fs::remove_file(&marker_path);
-                continue;
-            }
-            Ok(false) => {}
+        let recorded = match hash_store_contains(vault, &hash) {
+            Ok(recorded) => recorded,
             Err(e) => {
                 report.failures.push(DrainFailure {
                     marker: marker_path.clone(),
@@ -362,6 +345,29 @@ pub async fn drain(
                 });
                 continue;
             }
+        };
+        // The content was ingested before, so a staged session note is
+        // redundant, as on the success path below, but only when git holds
+        // a copy of it. The hash store also holds hashes of notes that were
+        // never stored: the near-duplicate gate once skipped every session
+        // note as a copy of itself, and the drain recorded the hash anyway.
+        // A hash recorded after a near-duplicate skip has only a near-copy
+        // in git. Such a note is ingested like a new one, so the gate or the
+        // LLM settles it. A note changed since the drain read it keeps its
+        // marker. A dry run deletes no note.
+        let staged = !cfg.dry_run && is_staged_session_note(vault, &marker.source);
+        if recorded
+            && (!staged
+                || stored
+                    .get_or_insert_with(|| stored_canonical_hashes(vault))
+                    .contains(&hash))
+        {
+            report.skipped_dup += 1;
+            if staged && !remove_note_if_unchanged(&marker.source, &hash) {
+                continue;
+            }
+            let _ = fs::remove_file(&marker_path);
+            continue;
         }
 
         if cfg.dry_run {
@@ -403,12 +409,14 @@ pub async fn drain(
                     });
                     continue;
                 }
-                if let Err(e) = hash_store_append(vault, &hash) {
-                    report.failures.push(DrainFailure {
-                        marker: marker_path.clone(),
-                        error: format!("hash-store append: {e}"),
-                    });
-                    continue;
+                if !recorded {
+                    if let Err(e) = hash_store_append(vault, &hash) {
+                        report.failures.push(DrainFailure {
+                            marker: marker_path.clone(),
+                            error: format!("hash-store append: {e}"),
+                        });
+                        continue;
+                    }
                 }
                 stored = None;
                 report.ingested += 1;
@@ -711,6 +719,10 @@ fn is_staged_session_note(vault: &Vault, source: &Path) -> bool {
 /// text with the canonical hash `hash`: the content the drain read before
 /// ingesting or matching it. A note changed since, or unreadable, is left
 /// in place and the result is false.
+///
+/// The read and the delete are two steps, so a write that lands between
+/// them is still lost. Closing that gap needs the exporter's help: a lock
+/// the drain shares, or a new file name for every export.
 fn remove_note_if_unchanged(path: &Path, hash: &str) -> bool {
     let unchanged = fs::read(path)
         .ok()
@@ -741,15 +753,14 @@ fn is_committed_as_on_disk(vault: &Vault, rel: &Path) -> bool {
         .is_ok_and(|blob| blob.content() == on_disk.as_slice())
 }
 
-/// Canonical hashes of the files committed under `sources/` at HEAD,
-/// staged session notes excepted. Files over 2 MiB or not UTF-8 are
-/// skipped, so a match always proves that git holds a copy. A file that is
-/// only on disk, such as the leftover of an ingest stopped before its
-/// commit, does not count. The staging directory is compared by its real
-/// path, so a staged note can never count as a stored copy of itself.
+/// Canonical hashes of the UTF-8 files committed under `sources/` at
+/// HEAD, staged session notes excepted, so a match always proves that git
+/// holds a copy. A file that is only on disk, such as the leftover of an
+/// ingest stopped before its commit, does not count. The staging directory
+/// is compared by its real path, so a staged note can never count as a
+/// stored copy of itself.
 fn stored_canonical_hashes(vault: &Vault) -> std::collections::HashSet<String> {
     use git2::{ObjectType, TreeWalkMode, TreeWalkResult};
-    const MAX_BYTES: usize = 2 * 1024 * 1024;
     let mut hashes = std::collections::HashSet::new();
     let root = vault.root().as_std_path();
     let Ok(repo) = git2::Repository::open(root) else {
@@ -777,13 +788,10 @@ fn stored_canonical_hashes(vault: &Vault) -> std::collections::HashSet<String> {
                 }
             }
             Some(ObjectType::Blob) => {
-                if let Some(hash) = repo
-                    .find_blob(entry.id())
-                    .ok()
-                    .filter(|blob| blob.size() <= MAX_BYTES)
-                    .and_then(|blob| std::str::from_utf8(blob.content()).ok().map(canonical_hash))
-                {
-                    hashes.insert(hash);
+                if let Ok(blob) = repo.find_blob(entry.id()) {
+                    if let Ok(text) = std::str::from_utf8(blob.content()) {
+                        hashes.insert(canonical_hash(text));
+                    }
                 }
             }
             _ => {}
@@ -1315,9 +1323,11 @@ mod tests {
     }
 
     /// The hash store can name content that was never stored. A staged
-    /// note with that content is then the only copy, so the drain keeps it.
+    /// note with that content is then the only copy: the drain ingests it
+    /// like a new note, instead of dropping its marker and leaving it
+    /// behind un-ingested.
     #[tokio::test]
-    async fn drain_keeps_duplicate_session_note_without_stored_copy() {
+    async fn drain_ingests_session_note_whose_recorded_hash_has_no_stored_copy() {
         let (dir, vault) = make_ingest_vault();
         let sessions = dir.path().join("sources").join("sessions");
         fs::create_dir_all(&sessions).unwrap();
@@ -1330,14 +1340,17 @@ mod tests {
             debounce: Duration::from_secs(0),
             ..Default::default()
         };
-        let report = drain(&vault, &dummy_provider(), cfg).await.unwrap();
-        assert_eq!(report.skipped_dup, 1);
-        assert!(note.exists(), "the only copy of the content must be kept");
+        let report = drain(&vault, &ingest_plan_mock(), cfg).await.unwrap();
+        assert_eq!((report.skipped_dup, report.ingested), (0, 1));
+        assert!(stored_canonical_hashes(&vault).contains(&canonical_hash(body)));
+        assert!(!note.exists(), "git holds the content now");
+        assert_eq!(list_queued(&vault).unwrap(), [] as [QueueMarker; 0]);
     }
 
     /// `sources/sessions` may be a symlink to another directory under
     /// `sources/`. The scan must not reach the staged note through that
-    /// directory's real name and count it as its own stored copy.
+    /// directory's real name and count it as its own stored copy, even
+    /// when git tracks the note there.
     #[cfg(unix)]
     #[tokio::test]
     async fn drain_keeps_duplicate_when_staging_dir_is_a_symlink() {
@@ -1352,6 +1365,12 @@ mod tests {
             "note.md",
             body,
         );
+        crate::git::commit_paths(
+            dir.path(),
+            &[PathBuf::from("sources/staging/note.md")],
+            "track the staged note",
+        )
+        .unwrap();
         enqueue(&vault, &note, None).unwrap();
 
         let cfg = DrainConfig {
@@ -1359,7 +1378,7 @@ mod tests {
             ..Default::default()
         };
         let report = drain(&vault, &dummy_provider(), cfg).await.unwrap();
-        assert_eq!(report.skipped_dup, 1);
+        assert_eq!(report.skipped_dup, 0, "the note is not its own copy");
         assert!(note.exists(), "the only copy of the content must be kept");
     }
 
@@ -1527,31 +1546,76 @@ mod tests {
     /// The hash store can name content whose only other copy is an
     /// untracked file in `sources/`, such as the leftover of an ingest
     /// stopped before its commit. That file is not a stored copy, so the
-    /// drain keeps the note.
+    /// drain ingests the note, and the near-duplicate gate's match on the
+    /// leftover keeps the note and its marker. Once the leftover is moved
+    /// away, the next drain ingests the note.
     #[tokio::test]
     async fn drain_keeps_duplicate_session_note_with_only_untracked_copy() {
         let (dir, vault) = make_ingest_vault();
         crate::git::commit_paths(dir.path(), &[PathBuf::from("CLAUDE.md")], "init").unwrap();
         let sessions = dir.path().join("sources").join("sessions");
         fs::create_dir_all(&sessions).unwrap();
-        let body = "Session ID: U\nuntracked copy body\n";
-        hash_store_append(&vault, &canonical_hash(body)).unwrap();
-        fs::write(
-            dir.path()
-                .join("sources/articles/0123456789ab-untracked.md"),
-            body,
-        )
-        .unwrap();
-        let note = write_source(&sessions, "2026-10-29-session-uuuu0000.md", body);
-        enqueue(&vault, &note, None).unwrap();
-
-        let cfg = DrainConfig {
+        let cfg = || DrainConfig {
             debounce: Duration::from_secs(0),
             ..Default::default()
         };
-        let report = drain(&vault, &dummy_provider(), cfg).await.unwrap();
-        assert_eq!(report.skipped_dup, 1);
+        let body = long_body("untracked");
+        hash_store_append(&vault, &canonical_hash(&body)).unwrap();
+        let leftover = dir
+            .path()
+            .join("sources/articles/0123456789ab-untracked.md");
+        fs::write(&leftover, &body).unwrap();
+        let note = write_source(&sessions, "2026-10-29-session-uuuu0000.md", &body);
+        enqueue(&vault, &note, None).unwrap();
+
+        let report = drain(&vault, &dummy_provider(), cfg()).await.unwrap();
+        assert_eq!((report.skipped_dup, report.failures.len()), (0, 1));
         assert!(note.exists(), "an untracked file is not a stored copy");
+        assert_eq!(list_queued(&vault).unwrap().len(), 1);
+
+        fs::rename(&leftover, dir.path().join("moved-aside.md")).unwrap();
+        let report = drain(&vault, &ingest_plan_mock(), cfg()).await.unwrap();
+        assert_eq!((report.ingested, report.failures.len()), (1, 0));
+        assert!(!note.exists(), "git holds the content now");
+        assert_eq!(list_queued(&vault).unwrap(), [] as [QueueMarker; 0]);
+    }
+
+    /// A near-duplicate skip of a committed file records the source's hash,
+    /// although git holds only the near-copy it matched. A later note with
+    /// that content must not lose its marker as a duplicate without a
+    /// stored copy: the drain ingests it, the gate skips it as a
+    /// near-duplicate of the committed file, and the note is deleted.
+    #[tokio::test]
+    async fn drain_deletes_note_whose_recorded_hash_has_only_a_committed_near_copy() {
+        let (dir, vault) = make_ingest_vault();
+        let sessions = dir.path().join("sources").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let cfg = || DrainConfig {
+            debounce: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let first = write_source(&sessions, "first.md", &long_body("near"));
+        enqueue(&vault, &first, None).unwrap();
+        assert_eq!(
+            drain(&vault, &ingest_plan_mock(), cfg())
+                .await
+                .unwrap()
+                .ingested,
+            1
+        );
+        let near = format!("{}one closing line\n", long_body("near"));
+        let second = write_source(&sessions, "second.md", &near);
+        enqueue(&vault, &second, None).unwrap();
+        let report = drain(&vault, &dummy_provider(), cfg()).await.unwrap();
+        assert_eq!((report.redundant_skips, report.failures.len()), (1, 0));
+        assert!(!second.exists());
+
+        let third = write_source(&sessions, "third.md", &near);
+        enqueue(&vault, &third, None).unwrap();
+        let report = drain(&vault, &dummy_provider(), cfg()).await.unwrap();
+        assert_eq!((report.skipped_dup, report.redundant_skips), (0, 1));
+        assert!(!third.exists(), "git holds a near-copy");
+        assert_eq!(list_queued(&vault).unwrap(), [] as [QueueMarker; 0]);
     }
 
     #[tokio::test]
