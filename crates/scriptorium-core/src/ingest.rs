@@ -1040,7 +1040,7 @@ fn find_near_duplicate_source(vault: &Vault, text: &str) -> Option<(Utf8PathBuf,
             // from. A binary source stays out of git, so a clone may lack
             // it: siblings count by name.
             if !name.ends_with(".extracted.md")
-                && !sha256_hex(existing_text.as_bytes()).starts_with(&name[..12])
+                && !names_its_content(name, existing_text.as_bytes())
             {
                 continue;
             }
@@ -1065,16 +1065,25 @@ fn is_interned_name(name: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// True when `path` is a copy [`intern_source`] wrote: its name starts with
-/// the first 12 hex digits of its own content's SHA-256, as
-/// [`interned_path`] names it. A name that only has that shape, such as a
-/// `YYYYMMDDhhmm-…` timestamp, does not match its content.
+/// True when `path` is a copy [`intern_source`] wrote: see
+/// [`names_its_content`].
 pub(crate) fn is_interned_copy(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
+    is_interned_name(name) && fs::File::open(path).is_ok_and(|file| names_its_content(name, file))
+}
+
+/// True when `name` starts with the first 12 hex digits of the SHA-256 of
+/// `content`, as [`interned_path`] names a copy. A git checkout may have
+/// turned the copy's line endings from LF to CRLF or back
+/// (`core.autocrlf`, `eol` attributes), so either conversion counts. A
+/// name that only has the shape, such as a `YYYYMMDDhhmm-…` timestamp,
+/// does not match its content.
+fn names_its_content(name: &str, content: impl std::io::Read) -> bool {
     is_interned_name(name)
-        && sha256_hex_of_file(path).is_ok_and(|digest| digest.starts_with(&name[..12]))
+        && sha256_hex_of_line_endings(content)
+            .is_ok_and(|digests| digests.iter().any(|d| d.starts_with(&name[..12])))
 }
 
 /// The vault-relative path [`intern_source`] files `bytes` read from
@@ -1099,16 +1108,41 @@ fn interned_path(source_path: &Path, bytes: &[u8]) -> Utf8PathBuf {
 /// created the file (`false` = it already existed from a prior ingest).
 fn intern_source(vault: &Vault, source_path: &Path, bytes: &[u8]) -> Result<(Utf8PathBuf, bool)> {
     let rel = interned_path(source_path, bytes);
-    let abs = vault.root().join(&rel);
-    let created = !abs.as_std_path().exists();
-    if created {
-        if let Some(parent) = abs.as_std_path().parent() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::io(parent.to_path_buf(), e))?;
-        }
-        std::fs::write(abs.as_std_path(), bytes)
-            .map_err(|e| Error::io(abs.clone().into_std_path_buf(), e))?;
+    let abs = vault.root().join(&rel).into_std_path_buf();
+    if abs.exists() {
+        return Ok((rel, false));
     }
+    let created = create_new_file(&abs, bytes)?;
     Ok((rel, created))
+}
+
+/// Creates `path`, and its directory, holding `bytes`, and returns `true`;
+/// returns `false` and leaves the file alone when one is there already,
+/// as when another ingest interned the same bytes meanwhile. Only the
+/// ingest that created a copy removes it when that ingest fails.
+///
+/// The file appears whole: it is written to a temporary file beside it,
+/// then renamed into place. `watch` hashes each new file under `sources/`
+/// to tell interned copies from sources, and would take a copy it caught
+/// half written for a new source. The temporary name has no extension,
+/// which `watch` skips.
+fn create_new_file(path: &Path, bytes: &[u8]) -> Result<bool> {
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".intern-");
+    // The permissions `std::fs::write` gives a new file, not owner-only.
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
+    let mut tmp = builder.tempfile_in(dir).map_err(|e| Error::io(dir, e))?;
+    tmp.write_all(bytes).map_err(|e| Error::io(tmp.path(), e))?;
+    match tmp.persist_noclobber(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(Error::io(path, e.error)),
+    }
 }
 
 /// Removes a freshly-interned source when its ingest fails before commit.
@@ -1209,22 +1243,48 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// [`sha256_hex`] of the file at `path`, read in blocks so a large file is
-/// never held in memory whole.
-fn sha256_hex_of_file(path: &Path) -> std::io::Result<String> {
-    use std::io::Read;
-
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
+/// [`sha256_hex`] of what `content` yields: as it is, with its CRLF line
+/// endings turned into LF, and with its LF line endings turned into CRLF.
+/// It reads in blocks, so a large file is never held in memory whole.
+fn sha256_hex_of_line_endings(mut content: impl std::io::Read) -> std::io::Result<[String; 3]> {
+    let (mut as_is, mut lf, mut crlf) = (Sha256::new(), Sha256::new(), Sha256::new());
     let mut block = vec![0_u8; 64 * 1024];
+    let (mut lf_block, mut crlf_block) = (Vec::new(), Vec::new());
+    // A CR that ends a block may begin a CRLF that the next block ends.
+    let mut held_cr = false;
     loop {
-        match file.read(&mut block) {
-            Ok(0) => return Ok(crate::hex::lower(&hasher.finalize())),
-            Ok(n) => hasher.update(&block[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+        let n = match content.read(&mut block) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
+        };
+        as_is.update(&block[..n]);
+        lf_block.clear();
+        for &b in &block[..n] {
+            if held_cr && b != b'\n' {
+                lf_block.push(b'\r');
+            }
+            held_cr = b == b'\r';
+            if !held_cr {
+                lf_block.push(b);
+            }
         }
+        crlf_block.clear();
+        for &b in &lf_block {
+            if b == b'\n' {
+                crlf_block.push(b'\r');
+            }
+            crlf_block.push(b);
+        }
+        lf.update(&lf_block);
+        crlf.update(&crlf_block);
     }
+    if held_cr {
+        lf.update(b"\r");
+        crlf.update(b"\r");
+    }
+    Ok([as_is, lf, crlf].map(|hasher| crate::hex::lower(&hasher.finalize())))
 }
 
 /// Write a JSON record of a failed ingest to `<vault>/.ingest-failures/`
@@ -1453,6 +1513,77 @@ mod tests {
         let stamped = dir.path().join("202610291230-meeting.md");
         fs::write(&stamped, bytes).unwrap();
         assert!(!is_interned_copy(&stamped));
+    }
+
+    #[test]
+    fn is_interned_copy_allows_for_line_endings_a_checkout_converts() {
+        let dir = tempfile::tempdir().unwrap();
+        let lf = b"# Plover\n\nThe plover survey counts nests.\n";
+        let crlf = b"# Plover\r\n\r\nThe plover survey counts nests.\r\n";
+        // Interned with LF and checked out with CRLF, and the other way.
+        for (interned, on_disk) in [(&lf[..], &crlf[..]), (&crlf[..], &lf[..])] {
+            let rel = interned_path(Path::new("plover.md"), interned);
+            let copy = dir.path().join(rel.file_name().unwrap());
+            fs::write(&copy, on_disk).unwrap();
+            assert!(is_interned_copy(&copy), "{}", copy.display());
+        }
+    }
+
+    #[test]
+    fn line_ending_hashes_carry_a_cr_across_blocks() {
+        // Each CR below is the last byte of the first 64 KiB block.
+        let lf = format!("{}\nb\n", "a".repeat(64 * 1024 - 1));
+        let crlf = lf.replace('\n', "\r\n");
+        let lone_cr = format!("{}\rb\n", "a".repeat(64 * 1024 - 1));
+        let hashes = |text: &str| sha256_hex_of_line_endings(text.as_bytes()).unwrap();
+
+        assert_eq!(hashes(&lf)[0], sha256_hex(lf.as_bytes()));
+        assert_eq!(hashes(&crlf)[1], sha256_hex(lf.as_bytes()));
+        assert_eq!(hashes(&lf)[2], sha256_hex(crlf.as_bytes()));
+        assert_eq!(hashes(&lone_cr)[1], sha256_hex(lone_cr.as_bytes()));
+        // A CR that ends the content is no line ending either.
+        assert_eq!(hashes("a\r")[1], sha256_hex(b"a\r"));
+    }
+
+    /// The names in `dir`, to show no temporary file is left there.
+    fn names_in(dir: &Path) -> Vec<std::ffi::OsString> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect()
+    }
+
+    #[test]
+    fn create_new_file_writes_the_file_as_fs_write_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sources/articles/copy.md");
+        let bytes = b"# Plover\n\nThe plover survey counts nests.\n";
+
+        assert!(create_new_file(&path, bytes).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            names_in(path.parent().unwrap()),
+            [path.file_name().unwrap()]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let written = dir.path().join("written.md");
+            fs::write(&written, bytes).unwrap();
+            let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), mode(&written));
+        }
+    }
+
+    #[test]
+    fn create_new_file_leaves_a_file_already_there_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copy.md");
+        fs::write(&path, "first").unwrap();
+
+        assert!(!create_new_file(&path, b"second").unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
+        assert_eq!(names_in(dir.path()), [path.file_name().unwrap()]);
     }
 
     use crate::llm::prompts::{IngestAction, IngestPageAction, IngestPlan};

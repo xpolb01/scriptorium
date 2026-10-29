@@ -1416,6 +1416,36 @@ async fn near_duplicate_gate_still_skips_copies_of_interned_sources() {
     assert_eq!(calls.load(Ordering::SeqCst), 1, "no LLM call for the copy");
 }
 
+/// A checkout may turn an interned copy's line endings into CRLF
+/// (`core.autocrlf`); the gate still counts it as a copy.
+#[tokio::test]
+async fn near_duplicate_gate_still_skips_copies_checked_out_with_crlf() {
+    use std::sync::atomic::Ordering;
+
+    let (dir, vault) = empty_test_vault();
+    let outside = TempDir::new().unwrap();
+    let original = outside.path().join("report.md");
+    let body = gate_sized_body("doc");
+    std::fs::write(&original, &body).unwrap();
+
+    let (mock, calls) = counting_plan_mock();
+    let first = ingest::ingest(&vault, &mock, &original).await.unwrap();
+    assert!(!first.redundant);
+    let interned = dir.path().join(first.source.as_str());
+    std::fs::write(&interned, body.replace('\n', "\r\n")).unwrap();
+
+    let sessions = dir.path().join("sources/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let copy = sessions.join("2026-10-08-session-feedbeef.md");
+    std::fs::write(&copy, format!("{body}one more line\n")).unwrap();
+    let second = ingest::ingest(&vault, &mock, &copy).await.unwrap();
+
+    assert!(second.redundant);
+    assert_eq!(second.commit_id, "skipped-near-duplicate");
+    assert_eq!(second.source, first.source);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no LLM call for the copy");
+}
+
 fn page_action(action: IngestAction, path: &str, body: &str) -> IngestPageAction {
     IngestPageAction {
         action,
