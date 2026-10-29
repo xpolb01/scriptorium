@@ -11,9 +11,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderValue, StatusCode};
-use axum::response::{Html, IntoResponse, Json};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
@@ -468,16 +469,11 @@ async fn hook_summary_handler(
     })))
 }
 
-/// Whether `origin` is `http://localhost` or `http://127.0.0.1`, with an
-/// optional port. A prefix match would also admit
-/// `http://localhost.evil.example`.
-fn is_loopback_origin(origin: &[u8]) -> bool {
-    let Some(rest) = origin.strip_prefix(b"http://") else {
-        return false;
-    };
-    match rest
+/// Whether `host` is `localhost` or `127.0.0.1`, with an optional port.
+fn is_loopback_host(host: &[u8]) -> bool {
+    match host
         .strip_prefix(b"localhost")
-        .or_else(|| rest.strip_prefix(b"127.0.0.1"))
+        .or_else(|| host.strip_prefix(b"127.0.0.1"))
     {
         Some([]) => true,
         Some([b':', port @ ..]) => {
@@ -488,7 +484,46 @@ fn is_loopback_origin(origin: &[u8]) -> bool {
     }
 }
 
-/// The dashboard's routes behind a localhost-only CORS layer.
+/// Whether `origin` is `http://localhost` or `http://127.0.0.1`, with an
+/// optional port. A prefix match would also admit
+/// `http://localhost.evil.example`.
+fn is_loopback_origin(origin: &[u8]) -> bool {
+    origin
+        .strip_prefix(b"http://")
+        .is_some_and(is_loopback_host)
+}
+
+/// Refuse a request unless it names `localhost` or `127.0.0.1` as its host.
+/// The server listens on 127.0.0.1 only, but a page whose own DNS name
+/// resolves to 127.0.0.1 (DNS rebinding) is same-origin with it, so CORS
+/// does not apply; such a page still sends its own name as the host.
+async fn require_loopback_host(request: Request, next: Next) -> Response {
+    let mut hosts = request.headers().get_all(header::HOST).iter();
+    let host = hosts.next().map(HeaderValue::as_bytes);
+    // A second Host header leaves the host ambiguous (RFC 9112, 3.2).
+    let repeated = hosts.next().is_some();
+    // An absolute request target carries the host the client meant.
+    let authority = request.uri().authority().map(|a| a.as_str().as_bytes());
+    if !repeated
+        && (host.is_some() || authority.is_some())
+        && host.is_none_or(is_loopback_host)
+        && authority.is_none_or(is_loopback_host)
+    {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::MISDIRECTED_REQUEST,
+            Json(serde_json::json!({
+                "error": "foreign_host",
+                "detail": "this dashboard answers only requests for localhost or 127.0.0.1",
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// The dashboard's routes, for loopback hosts only, behind a localhost-only
+/// CORS layer.
 fn router(state: Arc<AppState>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
@@ -514,6 +549,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/mcp/summary", get(mcp_summary_handler))
         .route("/api/hook/summary", get(hook_summary_handler))
         .layer(cors)
+        .layer(middleware::from_fn(require_loopback_host))
         .with_state(state)
 }
 
@@ -523,7 +559,8 @@ fn router(state: Arc<AppState>) -> Router {
 ///
 /// 1. If `jsonl_path` is provided and exists, imports events first.
 /// 2. Opens the [`HooksStore`] at `db_path` to verify accessibility.
-/// 3. Builds the axum router with CORS for localhost origins.
+/// 3. Builds the axum router, which answers only requests for `localhost`
+///    or `127.0.0.1` and allows CORS from those origins.
 /// 4. Binds to `127.0.0.1:{port}` (never `0.0.0.0`).
 /// 5. Serves until SIGINT (Ctrl-C).
 pub async fn start_dashboard(
@@ -768,6 +805,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/traces/{trace_id}"))
+                    .header("host", "localhost:3457")
                     .header("origin", "http://localhost:3000")
                     .body(Body::empty())
                     .unwrap(),
@@ -823,6 +861,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/events")
+                    .header("host", "127.0.0.1:3457")
                     .header("origin", "http://localhost.evil.example")
                     .body(Body::empty())
                     .unwrap(),
@@ -833,5 +872,84 @@ mod tests {
         assert!(!response
             .headers()
             .contains_key("access-control-allow-origin"));
+    }
+
+    async fn oneshot_router(uri: &str, headers: &[(&str, &str)]) -> Response {
+        let mut request = Request::builder().uri(uri);
+        for &(name, value) in headers {
+            request = request.header(name, value);
+        }
+        router(tmp_state("router-host.sqlite"))
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn production_router_answers_loopback_hosts_only() {
+        const ORIGIN: (&str, &str) = ("origin", "http://localhost:3000");
+        for host in ["localhost", "localhost:3457", "127.0.0.1", "127.0.0.1:3457"] {
+            let response = oneshot_router("/api/events", &[("host", host), ORIGIN]).await;
+            assert_eq!(response.status(), StatusCode::OK, "{host} must be answered");
+        }
+        for host in [
+            "rebound.example:3457",
+            "localhost.evil.example",
+            "127.0.0.1.evil.example:3457",
+            "localhost:3457.evil.example",
+            "localhost:",
+            "localhost.:3457",
+            "LOCALHOST:3457",
+        ] {
+            let response = oneshot_router("/api/events", &[("host", host), ORIGIN]).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::MISDIRECTED_REQUEST,
+                "{host} must be refused"
+            );
+            // Refused before CORS runs: no grant even for an allowed origin.
+            assert!(!response
+                .headers()
+                .contains_key("access-control-allow-origin"));
+        }
+        // The dashboard page's own same-origin GETs carry no Origin.
+        let response = oneshot_router("/api/events", &[("host", "127.0.0.1:3457")]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // A second Host header is refused even when the first is loopback.
+        let hosts = [("host", "localhost:3457"), ("host", "rebound.example:3457")];
+        let response = oneshot_router("/api/events", &hosts).await;
+        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+        // Neither a Host header nor an authority in the request target.
+        let response = oneshot_router("/api/events", &[]).await;
+        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+        // An absolute request target names the host the client meant; it and
+        // the Host header must both be loopback.
+        for (uri, host) in [
+            ("http://rebound.example:3457/api/events", "localhost"),
+            ("http://127.0.0.1:3457/api/events", "rebound.example"),
+        ] {
+            let response = oneshot_router(uri, &[("host", host)]).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::MISDIRECTED_REQUEST,
+                "{uri} with {host}"
+            );
+        }
+        let response = oneshot_router("http://127.0.0.1:3457/api/events", &[]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn refused_host_gets_the_json_error_shape() {
+        let response = oneshot_router("/", &[("host", "rebound.example:3457")]).await;
+        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "foreign_host");
+        assert!(json["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("localhost")));
     }
 }
