@@ -1832,7 +1832,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     let cfg = load_config(&vault);
                     let provider =
                         build_chat_provider(provider.unwrap_or_else(|| provider_from(&cfg)), &cfg)?;
-                    println!(
+                    // Printed once the watcher is armed, since it promises
+                    // that a file dropped from then on is picked up.
+                    let banner = format!(
                         "watch: watching {}/sources/ — drop new files there to auto-ingest",
                         vault.root()
                     );
@@ -1852,9 +1854,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         model: &cfg.embeddings.model,
                         contextual: cfg.embeddings.contextual,
                     };
-                    core::watch::watch(vault, provider, hooks, embed)
-                        .await
-                        .into_diagnostic()?;
+                    core::watch::watch(vault, provider, hooks, embed, move || {
+                        println!("{banner}");
+                    })
+                    .await
+                    .into_diagnostic()?;
                     Ok(ExitCode::SUCCESS)
                 }
                 Command::Social(sub) => {

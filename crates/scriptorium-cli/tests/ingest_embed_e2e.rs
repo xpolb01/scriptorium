@@ -250,6 +250,51 @@ impl Fixture {
             .success();
         String::from_utf8(out.get_output().stdout.clone()).unwrap()
     }
+
+    /// Start `scriptorium watch` on the vault and wait, up to 30 s, for the
+    /// banner it prints once the watcher is armed.
+    fn start_watch(&self) -> KillOnDrop {
+        let mut watch = KillOnDrop(
+            scriptorium(self.home.path(), &self.chat_url)
+                .arg("-C")
+                .arg(self.vault.path())
+                .arg("watch")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start watch"),
+        );
+        let stdout = watch.0.stdout.take().unwrap();
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+        // Keep reading after the banner, so a full pipe never blocks the
+        // watcher. The sender drops if the watcher exits first.
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line.contains("watch: watching") {
+                    let _ = armed_tx.send(());
+                }
+            }
+        });
+        armed_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("watch exited, or printed no banner within 30 s");
+        watch
+    }
+
+    /// Commits whose subject starts with `[ingest]`.
+    fn ingest_commits(&self) -> usize {
+        let log = std::process::Command::new("git")
+            .arg("-C")
+            .arg(self.vault.path())
+            .args(["log", "--format=%s"])
+            .output()
+            .expect("git log");
+        String::from_utf8(log.stdout)
+            .unwrap()
+            .lines()
+            .filter(|subject| subject.starts_with("[ingest]"))
+            .count()
+    }
 }
 
 #[test]
@@ -491,26 +536,7 @@ fn watch_embeds_contextually_when_configured() {
     let fixture = Fixture::with_contextual(true);
     let articles = fixture.vault.path().join("sources/articles");
     std::fs::create_dir_all(&articles).unwrap();
-    let mut watch = KillOnDrop(
-        scriptorium(fixture.home.path(), &fixture.chat_url)
-            .arg("-C")
-            .arg(fixture.vault.path())
-            .arg("watch")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start watch"),
-    );
-    let mut lines = BufReader::new(watch.0.stdout.take().unwrap()).lines();
-    // The banner comes just before the watcher arms.
-    let banner = lines
-        .by_ref()
-        .map_while(Result::ok)
-        .find(|line| line.contains("watch: watching"));
-    assert!(banner.is_some(), "watch exited before its banner");
-    // Keep reading, so a full pipe never blocks the watcher.
-    std::thread::spawn(move || lines.for_each(drop));
-    std::thread::sleep(Duration::from_secs(1));
+    let watch = fixture.start_watch();
 
     std::fs::write(articles.join("kestrel.md"), NOTE).unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -527,6 +553,48 @@ fn watch_embeds_contextually_when_configured() {
     assert_eq!(
         hits, 2,
         "both chunks of {PAGE} should carry a situating header"
+    );
+}
+
+/// `watch` ingests a new source once, and embeds it. The copy its ingest
+/// interns under `sources/` is its own write: ingesting that copy too
+/// would intern it again under a longer name, and a source as short as
+/// this one, below the near-duplicate gate, would loop without end.
+#[test]
+fn watch_ingests_a_new_source_once() {
+    let fixture = Fixture::new();
+    let articles = fixture.vault.path().join("sources/articles");
+    std::fs::create_dir_all(&articles).unwrap();
+    let watch = fixture.start_watch();
+
+    std::fs::write(articles.join("kestrel.md"), NOTE).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while fixture.ingest_commits() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Leave time for a second ingest: the watcher debounces events for
+    // 2 s, and an ingest against the stub takes well under a second.
+    std::thread::sleep(Duration::from_secs(6));
+    drop(watch);
+
+    let mut files: Vec<String> = std::fs::read_dir(&articles)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    files.sort();
+    assert_eq!(
+        fixture.ingest_commits(),
+        1,
+        "one ingest commit expected; sources/articles holds {files:?}"
+    );
+    assert_eq!(
+        files.len(),
+        2,
+        "the source and its interned copy: {files:?}"
+    );
+    assert!(
+        fixture.embedded_pages() >= 1,
+        "the page watch wrote should be in the embeddings store"
     );
 }
 

@@ -51,13 +51,16 @@ pub struct WatchEmbed<'a> {
 }
 
 /// Run the watcher until the returned task is dropped or the watch loop
-/// encounters a fatal error. Blocks the calling task. The pages of each
-/// ingest that commits are embedded through `embed`.
+/// encounters a fatal error. Blocks the calling task. `on_ready` runs once
+/// the watcher is armed: a file that lands in `sources/` after it runs is
+/// picked up. The pages of each ingest that commits are embedded through
+/// `embed`.
 pub async fn watch(
     vault: Vault,
     provider: Arc<dyn LlmProvider>,
     hooks: Option<HooksConfig>,
     embed: WatchEmbed<'_>,
+    on_ready: impl FnOnce(),
 ) -> Result<()> {
     let sources_dir: PathBuf = vault.sources_dir().into_std_path_buf();
     if !sources_dir.is_dir() {
@@ -89,6 +92,7 @@ pub async fn watch(
         .watch(&sources_dir, RecursiveMode::Recursive)
         .map_err(|e| Error::Other(anyhow::anyhow!("watch {}: {e}", sources_dir.display())))?;
     info!(dir = %sources_dir.display(), "watch: started");
+    on_ready();
 
     let mut dedupe: HashMap<PathBuf, Instant> = HashMap::new();
     while let Some(path) = tokio_rx.recv().await {
@@ -188,11 +192,14 @@ fn is_ingestable_source(path: &Path) -> bool {
     };
     // Everything the extract router can handle (binary formats included) —
     // extraction failures surface as ingest errors, not watcher crashes.
-    // `.extracted.md` siblings of converted binaries are our own writes.
+    // `.extracted.md` siblings of converted binaries are our own writes, as
+    // are the `<hash>-…` copies ingest interns. Ingesting an interned copy
+    // interns it again under a longer name, which lands here again: a
+    // source too short for the near-duplicate gate would loop forever.
     if path
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.ends_with(".extracted.md"))
+        .is_some_and(|n| n.ends_with(".extracted.md") || ingest::is_interned_name(n))
     {
         return false;
     }
@@ -238,6 +245,11 @@ mod tests {
         let sibling = dir.path().join("baz.pdf.extracted.md");
         std::fs::write(&sibling, "body").unwrap();
         assert!(!is_ingestable_source(&sibling));
+
+        // So are the copies ingest interns.
+        let interned = dir.path().join("4ed163f8d545-foo.md");
+        std::fs::write(&interned, "body").unwrap();
+        assert!(!is_ingestable_source(&interned));
 
         // Unknown binary formats stay rejected.
         let zip = dir.path().join("qux.zip");

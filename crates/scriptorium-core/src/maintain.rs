@@ -126,8 +126,9 @@ pub async fn maintain(
             auto_fixed = fix_report.fixed.len();
         }
 
-        // Re-embed stale pages.
-        if !stale_embedding_pages.is_empty() {
+        // Re-embed stale pages, and the pages the fix just rewrote: a new
+        // timestamp changes a page's content hash.
+        if !stale_embedding_pages.is_empty() || auto_fixed > 0 {
             if let Some(provider) = embed_provider {
                 match embed::reindex_contextual(
                     vault,
@@ -358,6 +359,69 @@ mod tests {
             .keyword_search("zephyrctx", "mock", "mock-1", 10)
             .unwrap();
         assert_eq!(hits.len(), 2, "each chunk carries its header");
+    }
+
+    /// `fix` embeds the pages its timestamp fix rewrites, even when every
+    /// page was current before the fix.
+    #[tokio::test]
+    async fn fix_re_embeds_the_pages_its_timestamp_fix_rewrites() {
+        use crate::llm::MockProvider;
+        use crate::vault::{Frontmatter, Page};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("wiki")).unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        let mut frontmatter = Frontmatter::new("Skewed");
+        frontmatter.updated = frontmatter.created - chrono::Duration::days(1);
+        let page = Page {
+            path: "wiki/skewed.md".into(),
+            frontmatter,
+            body: "Body of a page whose update predates its creation.\n".into(),
+        };
+        std::fs::write(
+            dir.path().join("wiki/skewed.md"),
+            page.to_markdown().unwrap(),
+        )
+        .unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let embedder = MockProvider::constant("");
+        embed::reindex_contextual(
+            &vault,
+            &store,
+            &embedder,
+            "mock-1",
+            ChunkStrategy::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let report = maintain(
+            &vault,
+            &store,
+            Some(&embedder),
+            "mock-1",
+            None,
+            &MaintainOptions { fix: true },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.stale_embedding_pages, [] as [String; 0]);
+        assert_eq!(report.auto_fixed, 1);
+        let fixed = vault
+            .scan()
+            .unwrap()
+            .pages
+            .into_iter()
+            .find(|p| p.path == "wiki/skewed.md")
+            .unwrap();
+        assert!(fixed.frontmatter.updated >= fixed.frontmatter.created);
+        let hash = fixed.content_hash().unwrap();
+        assert!(
+            store.has_any_version(fixed.frontmatter.id, &hash).unwrap(),
+            "the rewritten page must be embedded at its new content hash"
+        );
     }
 
     mod prune_telemetry {

@@ -1047,7 +1047,7 @@ fn find_near_duplicate_source(vault: &Vault, text: &str) -> Option<(Utf8PathBuf,
 
 /// True for the file names [`intern_source`] writes: a 12-character
 /// lowercase hex hash prefix, then `-`.
-fn is_interned_name(name: &str) -> bool {
+pub(crate) fn is_interned_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     bytes.len() > 13
         && bytes[12] == b'-'
