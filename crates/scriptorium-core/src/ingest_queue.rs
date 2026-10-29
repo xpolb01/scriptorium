@@ -187,22 +187,25 @@ fn queue_dir_path(vault: &Vault) -> PathBuf {
 /// each survivor: (1) read marker, (2) read source file, (3) canonicalize
 /// and hash, (4) check `source-hashes.txt` — if hit, and for a staged
 /// session note git holds a copy, delete marker, increment `skipped_dup`,
-/// continue; (5) call `ingest_with_retrieval`,
-/// (6) on success append hash, delete marker, (7) on failure leave
+/// continue; (5) ingest the bytes read in (2), not the file as it is by
+/// then, (6) on success append hash, delete marker, (7) on failure leave
 /// marker in place (next drain retries) and record a [`DrainFailure`].
-/// A near-duplicate skip counts as a failure unless HEAD holds the matched
-/// file as it is on disk; an untracked or edited match fails. Nothing was
-/// committed, so the match and the source may be the only copies.
+/// A near-duplicate skip counts as a failure unless the version of the
+/// matched file in HEAD is a near-duplicate of the source too: the gate
+/// compared the file on disk, which may be untracked or edited. Nothing
+/// was committed, so the match and the source may be the only copies.
 ///
-/// A staged session note is deleted only when git holds a copy of its
-/// content: after an ingest commit, after a near-duplicate skip of an
-/// unchanged committed file, or as a duplicate of a committed source. A
+/// A staged session note is deleted only when git holds its content, or a
+/// near-copy after a near-duplicate skip: after an ingest commit, after a
+/// skip whose match HEAD holds in a near-duplicate version, or as a
+/// duplicate of a committed source. A
 /// staged note whose hash is recorded but whose content git does not hold
 /// is ingested like a new one. A note changed since the drain read it,
 /// such as one a resumed session exported again during the LLM call, keeps
-/// its marker, so the next drain handles the new content. The drain reads
-/// a note one last time just before deleting it; a write that lands
-/// between that read and the delete is lost.
+/// its marker, so the next drain handles the new content. So does a note
+/// the drain fails to delete, with a [`DrainFailure`]. The drain reads a
+/// note one last time just before deleting it; a write that lands between
+/// that read and the delete is lost.
 ///
 /// Errors short-circuit only on lock-acquisition or fatal IO; per-marker
 /// errors accumulate in `DrainFailure`.
@@ -363,8 +366,22 @@ pub async fn drain(
                     .contains(&hash))
         {
             report.skipped_dup += 1;
-            if staged && !remove_note_if_unchanged(&marker.source, &hash) {
-                continue;
+            if staged {
+                match remove_note_if_unchanged(&marker.source, &hash) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => {
+                        report.failures.push(DrainFailure {
+                            marker: marker_path.clone(),
+                            error: format!(
+                                "cannot delete {}: {e}; kept its marker, and the next drain \
+                                 retries",
+                                marker.source.display()
+                            ),
+                        });
+                        continue;
+                    }
+                }
             }
             let _ = fs::remove_file(&marker_path);
             continue;
@@ -375,35 +392,41 @@ pub async fn drain(
             continue;
         }
 
-        match crate::ingest::ingest_with_retrieval(
+        match crate::ingest::ingest_bytes(
             vault,
             provider,
             &marker.source,
+            &raw,
             crate::ingest::IngestOptions::default(),
-            None,
-            None,
-            None,
         )
         .await
         {
             Ok(ingest_report) => {
                 // A near-duplicate skip commits nothing, and the gate
-                // compared the matched file as it is on disk. Unless HEAD
-                // holds those exact bytes (the file is untracked, such as
-                // the leftover of an ingest stopped before its commit, or
-                // edited since its commit), that file and this source may
-                // be the only copies of the content: keep both, and the
-                // marker, so the next drain retries once the match is fixed.
+                // compared the matched file as it is on disk: it may be
+                // untracked, such as the leftover of an ingest stopped
+                // before its commit, edited since its commit, or changed
+                // since the gate read it. Unless the version HEAD holds is
+                // a near-duplicate of the source too, that file and this
+                // source may be the only copies of the content: keep both,
+                // and the marker, so the next drain retries once the match
+                // is fixed.
                 if ingest_report.commit_id == crate::ingest::NEAR_DUPLICATE_SKIP
-                    && !is_committed_as_on_disk(vault, ingest_report.source.as_std_path())
+                    && !head_holds_near_duplicate(
+                        vault,
+                        ingest_report.source.as_std_path(),
+                        &marker.source,
+                        &raw,
+                    )
                 {
                     report.failures.push(DrainFailure {
                         marker: marker_path.clone(),
                         error: format!(
-                            "near-duplicate of {}, which git does not hold as it is on \
-                             disk; kept the source and its marker. Move that file out of \
-                             sources/ if it is untracked, or commit or restore it if it \
-                             is modified, and the next drain retries",
+                            "near-duplicate of {} on disk, but git holds no version of \
+                             that file close enough to the source; kept the source and \
+                             its marker. Move that file out of sources/ if it is \
+                             untracked, or commit or restore it if it is modified, and \
+                             the next drain retries",
                             ingest_report.source
                         ),
                     });
@@ -426,12 +449,25 @@ pub async fn drain(
                 // Session source files are redundant after ingest — the
                 // interned copy in sources/articles/, or the committed file
                 // a near-duplicate skip matched, is canonical in git. The
-                // ingest read the note before the LLM call; a note changed
-                // since keeps its marker, so the next drain handles it.
-                if is_staged_session_note(vault, &marker.source)
-                    && !remove_note_if_unchanged(&marker.source, &hash)
-                {
-                    continue;
+                // ingest used the bytes the drain hashed; a note changed
+                // since, or one the drain cannot delete, keeps its marker,
+                // so the next drain handles it.
+                if is_staged_session_note(vault, &marker.source) {
+                    match remove_note_if_unchanged(&marker.source, &hash) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            report.failures.push(DrainFailure {
+                                marker: marker_path.clone(),
+                                error: format!(
+                                    "cannot delete {}: {e}; kept its marker, and the next drain \
+                                     retries",
+                                    marker.source.display()
+                                ),
+                            });
+                            continue;
+                        }
+                    }
                 }
                 let _ = fs::remove_file(&marker_path);
             }
@@ -715,42 +751,53 @@ fn is_staged_session_note(vault: &Vault, source: &Path) -> bool {
         .is_ok_and(|sessions| source.starts_with(sessions))
 }
 
-/// Deletes the note at `path` and returns true when it still holds UTF-8
-/// text with the canonical hash `hash`: the content the drain read before
-/// ingesting or matching it. A note changed since, or unreadable, is left
-/// in place and the result is false.
+/// Deletes the note at `path` when it still holds UTF-8 text with the
+/// canonical hash `hash`: the content the drain read before ingesting or
+/// matching it, and returns whether the note is gone. A note changed since,
+/// or unreadable, is left in place and the result is `Ok(false)`. A delete
+/// that fails is an error, so the caller keeps the marker.
 ///
 /// The read and the delete are two steps, so a write that lands between
 /// them is still lost. Closing that gap needs the exporter's help: a lock
 /// the drain shares, or a new file name for every export.
-fn remove_note_if_unchanged(path: &Path, hash: &str) -> bool {
+fn remove_note_if_unchanged(path: &Path, hash: &str) -> std::io::Result<bool> {
     let unchanged = fs::read(path)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .is_some_and(|text| canonical_hash(&text) == hash);
-    if unchanged {
-        let _ = fs::remove_file(path);
+    if !unchanged {
+        return Ok(false);
     }
-    unchanged
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(true),
+    }
 }
 
-/// True when HEAD's tree holds the vault-relative file `rel` with the same
-/// bytes as on disk. Any git or read error, such as a vault with no commit
-/// yet, counts as false, and so does a file git stores through a filter
-/// such as `core.autocrlf`.
-fn is_committed_as_on_disk(vault: &Vault, rel: &Path) -> bool {
-    let root = vault.root().as_std_path();
-    let Ok(repo) = git2::Repository::open(root) else {
+/// True when the version of the vault-relative file `rel` in HEAD is a
+/// near-duplicate, by the near-duplicate gate's measure, of the text
+/// extracted from `raw`, read from `source_path`. The file on disk plays no
+/// part: it can differ from HEAD and change at any time. Any git, read or
+/// extraction error counts as false, and so does a vault with no commit.
+fn head_holds_near_duplicate(vault: &Vault, rel: &Path, source_path: &Path, raw: &[u8]) -> bool {
+    let Ok(repo) = git2::Repository::open(vault.root().as_std_path()) else {
         return false;
     };
-    let Ok(on_disk) = fs::read(root.join(rel)) else {
-        return false;
-    };
-    repo.head()
+    let Ok(blob) = repo
+        .head()
         .and_then(|head| head.peel_to_tree())
         .and_then(|tree| tree.get_path(rel))
         .and_then(|entry| repo.find_blob(entry.id()))
-        .is_ok_and(|blob| blob.content() == on_disk.as_slice())
+    else {
+        return false;
+    };
+    let (Ok(committed), Ok(source)) = (
+        std::str::from_utf8(blob.content()),
+        crate::extract::extract_source_text(source_path, raw),
+    ) else {
+        return false;
+    };
+    crate::extract::shingle_jaccard(&source.text, committed) >= crate::ingest::NEAR_DUP_THRESHOLD
 }
 
 /// Canonical hashes of the UTF-8 files committed under `sources/` at
@@ -1109,13 +1156,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hash = canonical_hash("Session ID: a\nbody line\n");
         let same = write_source(dir.path(), "same.md", "Session ID: b\nbody line\n");
-        assert!(remove_note_if_unchanged(&same, &hash));
+        assert!(remove_note_if_unchanged(&same, &hash).unwrap());
         assert!(!same.exists());
         let changed = write_source(dir.path(), "changed.md", "Session ID: a\nnew line\n");
-        assert!(!remove_note_if_unchanged(&changed, &hash));
+        assert!(!remove_note_if_unchanged(&changed, &hash).unwrap());
         assert!(changed.exists());
         let gone = dir.path().join("gone.md");
-        assert!(!remove_note_if_unchanged(&gone, &hash));
+        assert!(!remove_note_if_unchanged(&gone, &hash).unwrap());
     }
 
     fn write_marker_file(vault: &Vault, name: &str, marker: &QueueMarker) {
@@ -1505,10 +1552,41 @@ mod tests {
         assert_eq!(list_queued(&vault).unwrap().len(), 1);
     }
 
-    /// The ingest reads a note before the LLM call. A writer that replaces
-    /// the note meanwhile, such as a resumed session exporting it again,
-    /// leaves content git does not hold: the drain keeps the note and its
-    /// marker, and the next drain ingests the new content.
+    /// The gate compares the matched file as it is on disk, which can change
+    /// between the gate's read and the drain's check, for example when an
+    /// edit is undone with `git restore`. Only the version in HEAD decides,
+    /// so a note that is a near-copy of the undone edit does not count as
+    /// stored.
+    #[test]
+    fn head_holds_near_duplicate_reads_head_not_the_file_on_disk() {
+        let (dir, vault) = make_ingest_vault();
+        let rel = Path::new("sources/articles/0123456789ab-match.md");
+        let committed = long_body("committed");
+        fs::write(dir.path().join(rel), &committed).unwrap();
+        crate::git::commit_paths(dir.path(), &[rel.to_path_buf()], "commit the match").unwrap();
+        let note = dir.path().join("sources/sessions/note.md");
+        let holds =
+            |rel: &Path, text: &str| head_holds_near_duplicate(&vault, rel, &note, text.as_bytes());
+
+        let near = format!("{committed}one closing line\n");
+        let edit = long_body("edited");
+        assert!(holds(rel, &near));
+        assert!(
+            !holds(rel, &edit),
+            "the file on disk equals HEAD, which is no near-copy of the edit"
+        );
+        fs::write(dir.path().join(rel), &edit).unwrap();
+        assert!(!holds(rel, &edit), "an edit only on disk is not in git");
+        assert!(holds(rel, &near), "HEAD still holds a near-copy");
+        let untracked = Path::new("sources/articles/0123456789ab-untracked.md");
+        fs::write(dir.path().join(untracked), &near).unwrap();
+        assert!(!holds(untracked, &near));
+    }
+
+    /// The drain ingests a note as it read it, before the LLM call. A writer
+    /// that replaces the note meanwhile, such as a resumed session exporting
+    /// it again, leaves content git does not hold: the drain keeps the note
+    /// and its marker, and the next drain ingests the new content.
     #[tokio::test]
     async fn drain_keeps_session_note_changed_during_ingest() {
         use crate::llm::{CompletionResponse, Usage};
@@ -1540,6 +1618,105 @@ mod tests {
         let report = drain(&vault, &distinct_plan_mock(), cfg()).await.unwrap();
         assert_eq!((report.ingested, report.failures.len()), (1, 0));
         assert!(!note.exists(), "git holds the new content");
+        assert_eq!(list_queued(&vault).unwrap(), [] as [QueueMarker; 0]);
+    }
+
+    /// The drain ingests the bytes it hashed, not the file as it is later.
+    /// Here a note whose hash is recorded, with no stored copy, changes from
+    /// A to B after the drain reads it and back to A during the LLM call.
+    /// An ingest that read the file again would commit B, and the drain
+    /// would then delete A as unchanged. A FIFO in place of the hash store
+    /// holds the drain between its read of the note and its ingest while
+    /// the note changes to B.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_ingests_note_as_read_when_it_changes_and_changes_back() {
+        use crate::llm::{CompletionResponse, Usage};
+        let (dir, vault) = make_ingest_vault();
+        let sessions = dir.path().join("sources").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let (a, b) = (long_body("before"), long_body("between"));
+        let note = write_source(&sessions, "reverted.md", &a);
+        enqueue(&vault, &note, None).unwrap();
+
+        let store = hash_store_path(&vault);
+        let mkfifo = std::process::Command::new("mkfifo").arg(&store).status();
+        assert!(mkfifo.unwrap().success());
+        let (rewrite, stale) = (note.clone(), canonical_hash(&a));
+        let (done, writer_done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Opening a FIFO to write waits for a reader: the drain, which
+            // has read the note by then.
+            let mut fifo = OpenOptions::new().write(true).open(&store).unwrap();
+            fs::write(&rewrite, b).unwrap();
+            writeln!(fifo, "{stale}").unwrap();
+            drop(fifo);
+            done.send(()).unwrap();
+        });
+        let (revert, reverted, plan) = (note.clone(), a.clone(), ingest_plan_json());
+        let reverting_provider = crate::llm::MockProvider::with_handler(move |_req| {
+            fs::write(&revert, &reverted).unwrap();
+            Ok(CompletionResponse {
+                text: plan.clone(),
+                usage: Usage::default(),
+                model: "mock-1".into(),
+            })
+        });
+
+        let cfg = DrainConfig {
+            debounce: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let report = drain(&vault, &reverting_provider, cfg).await.unwrap();
+        writer_done
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the drain reads the hash store after the note");
+        assert_eq!((report.ingested, report.failures.len()), (1, 0));
+        assert!(!note.exists());
+        assert!(
+            stored_canonical_hashes(&vault).contains(&canonical_hash(&a)),
+            "the drain deleted A, so git must hold A"
+        );
+        assert_eq!(list_queued(&vault).unwrap(), [] as [QueueMarker; 0]);
+    }
+
+    /// A staged note the drain fails to delete keeps its marker, after an
+    /// ingest and after a duplicate hit alike, and the drain reports the
+    /// failure. Without the marker, no later drain would delete the note.
+    /// A read-only `sources/sessions/` makes the delete fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_keeps_marker_of_note_it_cannot_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, vault) = make_ingest_vault();
+        let sessions = dir.path().join("sources").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let cfg = || DrainConfig {
+            debounce: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let note = write_source(&sessions, "locked.md", &long_body("locked"));
+        enqueue(&vault, &note, None).unwrap();
+        let set_mode = |mode| fs::set_permissions(&sessions, fs::Permissions::from_mode(mode));
+        set_mode(0o555).unwrap();
+        if fs::write(sessions.join("probe"), "").is_ok() {
+            // The mode bits do not bind root.
+            set_mode(0o755).unwrap();
+            return;
+        }
+
+        let ingested = drain(&vault, &ingest_plan_mock(), cfg()).await.unwrap();
+        let duplicate = drain(&vault, &ingest_plan_mock(), cfg()).await.unwrap();
+        set_mode(0o755).unwrap();
+        assert_eq!((ingested.ingested, ingested.failures.len()), (1, 1));
+        assert!(ingested.failures[0].error.contains("cannot delete"));
+        assert_eq!((duplicate.skipped_dup, duplicate.failures.len()), (1, 1));
+        assert!(note.exists());
+        assert_eq!(list_queued(&vault).unwrap().len(), 1);
+
+        let report = drain(&vault, &ingest_plan_mock(), cfg()).await.unwrap();
+        assert_eq!((report.skipped_dup, report.failures.len()), (1, 0));
+        assert!(!note.exists());
         assert_eq!(list_queued(&vault).unwrap(), [] as [QueueMarker; 0]);
     }
 
