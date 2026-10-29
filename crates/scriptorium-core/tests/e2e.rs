@@ -1345,6 +1345,24 @@ async fn near_duplicate_gate_ignores_the_source_itself() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
+/// Nor may it when its name has the shape of an interned copy, such as a
+/// timestamp: a copy is named after its own content's hash.
+#[tokio::test]
+async fn near_duplicate_gate_ignores_a_timestamped_source_itself() {
+    use std::sync::atomic::Ordering;
+
+    let (dir, vault) = empty_test_vault();
+    let source = dir.path().join("sources/articles/202610291230-meeting.md");
+    std::fs::write(&source, gate_sized_body("meeting")).unwrap();
+
+    let (mock, calls) = counting_plan_mock();
+    let report = ingest::ingest(&vault, &mock, &source).await.unwrap();
+
+    assert!(!report.redundant, "summary: {}", report.summary);
+    assert_eq!(report.created, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 /// Staged files that were never ingested are not existing sources. A
 /// near-copy among them (the same session's note from an earlier day)
 /// must not make the gate skip the source.
@@ -1385,6 +1403,36 @@ async fn near_duplicate_gate_still_skips_copies_of_interned_sources() {
     let first = ingest::ingest(&vault, &mock, &original).await.unwrap();
     assert!(!first.redundant);
     assert!(first.source.as_str().starts_with("sources/articles/"));
+
+    let sessions = dir.path().join("sources/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let copy = sessions.join("2026-10-08-session-feedbeef.md");
+    std::fs::write(&copy, format!("{body}one more line\n")).unwrap();
+    let second = ingest::ingest(&vault, &mock, &copy).await.unwrap();
+
+    assert!(second.redundant);
+    assert_eq!(second.commit_id, "skipped-near-duplicate");
+    assert_eq!(second.source, first.source);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no LLM call for the copy");
+}
+
+/// A checkout may turn an interned copy's line endings into CRLF
+/// (`core.autocrlf`); the gate still counts it as a copy.
+#[tokio::test]
+async fn near_duplicate_gate_still_skips_copies_checked_out_with_crlf() {
+    use std::sync::atomic::Ordering;
+
+    let (dir, vault) = empty_test_vault();
+    let outside = TempDir::new().unwrap();
+    let original = outside.path().join("report.md");
+    let body = gate_sized_body("doc");
+    std::fs::write(&original, &body).unwrap();
+
+    let (mock, calls) = counting_plan_mock();
+    let first = ingest::ingest(&vault, &mock, &original).await.unwrap();
+    assert!(!first.redundant);
+    let interned = dir.path().join(first.source.as_str());
+    std::fs::write(&interned, body.replace('\n', "\r\n")).unwrap();
 
     let sessions = dir.path().join("sources/sessions");
     std::fs::create_dir_all(&sessions).unwrap();

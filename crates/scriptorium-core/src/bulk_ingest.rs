@@ -64,6 +64,9 @@ pub struct BulkIngestReport {
     pub skipped_checkpoint: usize,
     /// Files successfully ingested.
     pub ingested: usize,
+    /// Files whose ingest committed. A dry run or a near-duplicate skip
+    /// counts as ingested but commits nothing.
+    pub committed: usize,
     /// Files that failed to ingest (error isolated, did not stop the batch).
     pub failed: Vec<BulkIngestError>,
     /// Total elapsed time.
@@ -75,6 +78,17 @@ pub struct BulkIngestReport {
 pub struct BulkIngestError {
     pub path: PathBuf,
     pub error: String,
+}
+
+impl BulkIngestError {
+    /// Log that `path` failed at `step`, and describe the failure.
+    fn logged(path: &Path, step: &str, error: &Error) -> Self {
+        warn!(path = %path.display(), error = %error, "{step} failed");
+        Self {
+            path: path.to_path_buf(),
+            error: error.to_string(),
+        }
+    }
 }
 
 /// Checkpoint for resume support.
@@ -120,22 +134,17 @@ pub async fn bulk_ingest_with_retrieval(
 
     // 2. Load checkpoint.
     let checkpoint_path = vault.meta_dir().join("bulk-ingest-checkpoint.json");
-    let checkpoint = load_checkpoint(checkpoint_path.as_std_path());
     let dir_canonical = dir
         .canonicalize()
         .unwrap_or_else(|_| dir.to_path_buf())
         .to_string_lossy()
         .to_string();
-
-    let checkpoint_set: std::collections::HashSet<String> = checkpoint
-        .as_ref()
-        .filter(|c| c.dir == dir_canonical)
-        .map(|c| c.processed.iter().cloned().collect())
-        .unwrap_or_default();
+    let checkpoint_set = checkpointed_files(checkpoint_path.as_std_path(), &dir_canonical);
     let skipped_checkpoint = checkpoint_set.len();
 
     // 3. Process files.
     let mut ingested = 0usize;
+    let mut committed = 0usize;
     let mut skipped_already_interned = 0usize;
     let mut failed = Vec::new();
     let mut processed_paths: Vec<String> = checkpoint_set.iter().cloned().collect();
@@ -158,10 +167,20 @@ pub async fn bulk_ingest_with_retrieval(
             continue;
         }
 
-        // Skip if already interned.
-        if is_already_interned(vault, file_path)? {
-            skipped_already_interned += 1;
-            continue;
+        // Skip if already interned. A file that cannot be read for this
+        // check fails on its own, as a failed ingest does: ending the run
+        // here would lose the report, and with it the count of the files
+        // already committed, which the caller embeds.
+        match is_already_interned(vault, file_path) {
+            Ok(true) => {
+                skipped_already_interned += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                failed.push(BulkIngestError::logged(file_path, "interned check", &e));
+                continue;
+            }
         }
 
         progress(i + 1, total_discovered, file_path);
@@ -187,15 +206,12 @@ pub async fn bulk_ingest_with_retrieval(
                     "ingested"
                 );
                 ingested += 1;
+                if !options.dry_run && report.commit_id != ingest::NEAR_DUPLICATE_SKIP {
+                    committed += 1;
+                }
                 processed_paths.push(rel);
             }
-            Err(e) => {
-                warn!(path = %file_path.display(), error = %e, "ingest failed");
-                failed.push(BulkIngestError {
-                    path: file_path.clone(),
-                    error: e.to_string(),
-                });
-            }
+            Err(e) => failed.push(BulkIngestError::logged(file_path, "ingest", &e)),
         }
 
         // Save checkpoint periodically.
@@ -225,6 +241,7 @@ pub async fn bulk_ingest_with_retrieval(
         skipped_already_interned,
         skipped_checkpoint,
         ingested,
+        committed,
         failed,
         elapsed: start.elapsed(),
     })
@@ -293,6 +310,15 @@ fn content_hash_prefix(bytes: &[u8]) -> String {
     crate::hex::lower(&digest)[..12].to_string()
 }
 
+/// The files the checkpoint at `path` lists as processed, if it was saved
+/// for the directory `dir_canonical`.
+fn checkpointed_files(path: &Path, dir_canonical: &str) -> std::collections::HashSet<String> {
+    load_checkpoint(path)
+        .filter(|c| c.dir == dir_canonical)
+        .map(|c| c.processed.into_iter().collect())
+        .unwrap_or_default()
+}
+
 fn load_checkpoint(path: &Path) -> Option<Checkpoint> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
@@ -351,5 +377,126 @@ mod tests {
         let loaded = load_checkpoint(&path).unwrap();
         assert_eq!(loaded.dir, "/some/dir");
         assert_eq!(loaded.processed.len(), 2);
+    }
+
+    /// A vault that ingest can write to, and an empty directory of sources
+    /// outside it.
+    fn bulk_fixture() -> (tempfile::TempDir, Vault, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("wiki/concepts")).unwrap();
+        std::fs::create_dir_all(dir.path().join("sources/articles")).unwrap();
+        std::fs::write(
+            dir.path().join("CLAUDE.md"),
+            "# Vault Rules\n\nBe concise.\n",
+        )
+        .unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        (dir, vault, tempfile::tempdir().unwrap())
+    }
+
+    /// A provider that answers every ingest with a plan for one new page.
+    fn plan_mock() -> crate::llm::MockProvider {
+        use crate::llm::prompts::{IngestAction, IngestPageAction, IngestPlan};
+        let plan = IngestPlan {
+            summary: "bulk test".into(),
+            pages: vec![IngestPageAction {
+                action: IngestAction::Create,
+                path: "wiki/concepts/bulk-target.md".into(),
+                title: "Bulk Target".into(),
+                tags: vec![],
+                body: "Body without wikilinks.\n".into(),
+                source_quote: None,
+                supersedes: vec![],
+            }],
+            log_entry: "bulk ingest".into(),
+            redundant: false,
+        };
+        crate::llm::MockProvider::constant(serde_json::to_string(&plan).unwrap())
+    }
+
+    #[tokio::test]
+    async fn dry_run_counts_ingested_files_but_no_commits() {
+        let (_dir, vault, sources) = bulk_fixture();
+        std::fs::write(sources.path().join("a.md"), "# A\n\nAlpha source.\n").unwrap();
+        let options = BulkIngestOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+
+        let report = bulk_ingest(&vault, &plan_mock(), sources.path(), &options, |_, _, _| {})
+            .await
+            .unwrap();
+
+        assert_eq!((report.ingested, report.committed), (1, 0));
+    }
+
+    /// A near-duplicate skip counts as ingested but commits nothing.
+    #[tokio::test]
+    async fn near_duplicate_skip_counts_no_commit() {
+        let (_dir, vault, sources) = bulk_fixture();
+        let words: Vec<String> = (0..120).map(|i| format!("bulk{i}")).collect();
+        let body = format!("{}\n", words.join(" "));
+        std::fs::write(sources.path().join("a.md"), &body).unwrap();
+        let options = BulkIngestOptions::default();
+        let first = bulk_ingest(&vault, &plan_mock(), sources.path(), &options, |_, _, _| {})
+            .await
+            .unwrap();
+        assert_eq!(first.committed, 1, "{:?}", first.failed);
+
+        let again = tempfile::tempdir().unwrap();
+        std::fs::write(
+            again.path().join("b.md"),
+            format!("{body}one closing line\n"),
+        )
+        .unwrap();
+        let no_plan = crate::llm::MockProvider::constant("{}");
+        let second = bulk_ingest(&vault, &no_plan, again.path(), &options, |_, _, _| {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (second.ingested, second.committed),
+            (1, 0),
+            "{:?}",
+            second.failed
+        );
+    }
+
+    /// A file that cannot be read fails on its own. The run goes on, and its
+    /// report still counts the commit made before it, which the caller
+    /// embeds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_file_fails_alone_and_keeps_the_commits_before_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, vault, sources) = bulk_fixture();
+        std::fs::write(sources.path().join("a.md"), "# A\n\nAlpha source.\n").unwrap();
+        let unreadable = sources.path().join("b.md");
+        std::fs::write(&unreadable, "# B\n\nBeta source.\n").unwrap();
+        let set_mode =
+            |mode| std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(mode));
+        set_mode(0o000).unwrap();
+        if std::fs::File::open(&unreadable).is_ok() {
+            // The mode bits do not bind root.
+            set_mode(0o644).unwrap();
+            return;
+        }
+
+        let report = bulk_ingest(
+            &vault,
+            &plan_mock(),
+            sources.path(),
+            &BulkIngestOptions::default(),
+            |_, _, _| {},
+        )
+        .await;
+        set_mode(0o644).unwrap();
+        let report = report.expect("one unreadable file does not end the run");
+
+        assert_eq!(
+            (report.ingested, report.committed, report.failed.len()),
+            (1, 1, 1)
+        );
+        assert_eq!(report.failed[0].path, unreadable);
     }
 }
