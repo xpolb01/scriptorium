@@ -189,13 +189,13 @@ fn queue_dir_path(vault: &Vault) -> PathBuf {
 /// increment `skipped_dup`, continue; (5) call `ingest_with_retrieval`,
 /// (6) on success append hash, delete marker, (7) on failure leave
 /// marker in place (next drain retries) and record a [`DrainFailure`].
-/// A near-duplicate skip whose match git does not track counts as a
-/// failure: nothing was committed, so the match and the source may be
-/// the only copies.
+/// A near-duplicate skip counts as a failure unless HEAD holds the matched
+/// file as it is on disk; an untracked or edited match fails. Nothing was
+/// committed, so the match and the source may be the only copies.
 ///
 /// A staged session note is deleted only when git holds a copy of its
-/// content: after an ingest commit, after a near-duplicate skip of a
-/// committed file, or as a duplicate of a committed source.
+/// content: after an ingest commit, after a near-duplicate skip of an
+/// unchanged committed file, or as a duplicate of a committed source.
 ///
 /// Errors short-circuit only on lock-acquisition or fatal IO; per-marker
 /// errors accumulate in `DrainFailure`.
@@ -376,20 +376,23 @@ pub async fn drain(
         .await
         {
             Ok(ingest_report) => {
-                // A near-duplicate skip commits nothing. If git does not
-                // track the file it matched, such as the leftover of an
-                // ingest stopped before its commit, that file and this
-                // source may be the only copies: keep both, and the marker,
-                // so the next drain retries once the match is moved away.
+                // A near-duplicate skip commits nothing, and the gate
+                // compared the matched file as it is on disk. Unless HEAD
+                // holds those exact bytes (the file is untracked, such as
+                // the leftover of an ingest stopped before its commit, or
+                // edited since its commit), that file and this source may
+                // be the only copies of the content: keep both, and the
+                // marker, so the next drain retries once the match is fixed.
                 if ingest_report.commit_id == crate::ingest::NEAR_DUPLICATE_SKIP
-                    && !is_committed(vault, ingest_report.source.as_std_path())
+                    && !is_committed_as_on_disk(vault, ingest_report.source.as_std_path())
                 {
                     report.failures.push(DrainFailure {
                         marker: marker_path.clone(),
                         error: format!(
-                            "near-duplicate of {}, which git does not track; kept the \
-                             source and its marker: move that file out of sources/ and \
-                             the next drain ingests the source",
+                            "near-duplicate of {}, which git does not hold as it is on \
+                             disk; kept the source and its marker. Move that file out of \
+                             sources/ if it is untracked, or commit or restore it if it \
+                             is modified, and the next drain retries",
                             ingest_report.source
                         ),
                     });
@@ -695,16 +698,23 @@ fn is_staged_session_note(vault: &Vault, source: &Path) -> bool {
         .is_ok_and(|sessions| source.starts_with(sessions))
 }
 
-/// True when HEAD's tree holds a file at the vault-relative path `rel`.
-/// Any git error, such as a vault with no commit yet, counts as false.
-fn is_committed(vault: &Vault, rel: &Path) -> bool {
-    let Ok(repo) = git2::Repository::open(vault.root().as_std_path()) else {
+/// True when HEAD's tree holds the vault-relative file `rel` with the same
+/// bytes as on disk. Any git or read error, such as a vault with no commit
+/// yet, counts as false, and so does a file git stores through a filter
+/// such as `core.autocrlf`.
+fn is_committed_as_on_disk(vault: &Vault, rel: &Path) -> bool {
+    let root = vault.root().as_std_path();
+    let Ok(repo) = git2::Repository::open(root) else {
+        return false;
+    };
+    let Ok(on_disk) = fs::read(root.join(rel)) else {
         return false;
     };
     repo.head()
         .and_then(|head| head.peel_to_tree())
         .and_then(|tree| tree.get_path(rel))
-        .is_ok_and(|entry| entry.kind() == Some(git2::ObjectType::Blob))
+        .and_then(|entry| repo.find_blob(entry.id()))
+        .is_ok_and(|blob| blob.content() == on_disk.as_slice())
 }
 
 /// Canonical hashes of the files committed under `sources/` at HEAD,
@@ -1392,6 +1402,45 @@ mod tests {
             "a near-copy of a committed source is redundant"
         );
         assert_eq!(list_queued(&vault).unwrap(), [] as [QueueMarker; 0]);
+    }
+
+    /// The gate compares the matched file as it is on disk. A committed
+    /// file edited since its commit is not a stored copy of the edit:
+    /// restoring the file would lose it, so a note that is a near-copy of
+    /// the edit is kept with its marker.
+    #[tokio::test]
+    async fn drain_keeps_session_note_skipped_as_near_duplicate_of_edited_committed_copy() {
+        let (dir, vault) = make_ingest_vault();
+        let sessions = dir.path().join("sources").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let cfg = || DrainConfig {
+            debounce: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let first = write_source(&sessions, "first.md", &long_body("original"));
+        enqueue(&vault, &first, None).unwrap();
+        assert_eq!(
+            drain(&vault, &ingest_plan_mock(), cfg())
+                .await
+                .unwrap()
+                .ingested,
+            1
+        );
+
+        let interned = fs::read_dir(dir.path().join("sources/articles"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.to_string_lossy().ends_with("-first.md"))
+            .expect("the committed interned copy");
+        let edited = long_body("edited");
+        fs::write(&interned, &edited).unwrap();
+        let note = write_source(&sessions, "edited.md", &edited);
+        enqueue(&vault, &note, None).unwrap();
+
+        let report = drain(&vault, &dummy_provider(), cfg()).await.unwrap();
+        assert_eq!((report.ingested, report.failures.len()), (0, 1));
+        assert!(note.exists(), "HEAD does not hold the edited content");
+        assert_eq!(list_queued(&vault).unwrap().len(), 1);
     }
 
     /// The hash store can name content whose only other copy is an
