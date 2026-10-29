@@ -1241,6 +1241,26 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                             eprintln!("  fail: {} — {}", f.marker.display(), f.error);
                         }
                     }
+                    // Embed what the drain ingested, as `ingest` does, so the
+                    // new pages are searchable without a manual `reindex`.
+                    // `embed::reindex` is cache-aware, so only new or changed
+                    // chunks reach the embeddings provider. A dry run ingests
+                    // nothing.
+                    if !dry_run && report.ingested > 0 {
+                        let store = open_store(&vault)?;
+                        let embed_provider = build_provider(embed_provider_from(&cfg))?;
+                        let embedded = scriptorium_core::embed::reindex(
+                            &vault,
+                            &store,
+                            embed_provider.as_ref(),
+                            &cfg.embeddings.model,
+                        )
+                        .await
+                        .into_diagnostic()?;
+                        if embedded > 0 && !json {
+                            println!("drain: embedded {embedded} new chunk(s)");
+                        }
+                    }
                     Ok(ExitCode::SUCCESS)
                 }
                 Command::IngestQueue {

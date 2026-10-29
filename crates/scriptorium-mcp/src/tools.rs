@@ -879,6 +879,20 @@ async fn drain_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolErro
     let report = core::ingest_queue::drain(&ctx.vault, ctx.llm_provider.as_ref(), cfg)
         .await
         .map_err(|e| ToolError::Failed(format!("drain: {e}")))?;
+    // Embed what the drain ingested, as `ingest_tool` does, so the new
+    // pages are searchable without a manual `reindex`. A dry run ingests
+    // nothing.
+    if !args.dry_run && report.ingested > 0 {
+        let store = open_store(ctx)?;
+        scriptorium_core::embed::reindex(
+            &ctx.vault,
+            &store,
+            ctx.embed_provider.as_ref(),
+            &ctx.embeddings_model,
+        )
+        .await
+        .map_err(|e| ToolError::Failed(format!("post-drain reindex: {e}")))?;
+    }
     serde_json::to_string_pretty(&report)
         .map_err(|e| ToolError::Failed(format!("serialize drain report: {e}")))
 }
@@ -1203,6 +1217,64 @@ mod tests {
         assert!(
             chunks_after_second >= chunks_after_first,
             "store must grow monotonically: {chunks_after_first} -> {chunks_after_second}"
+        );
+    }
+
+    // ---------- drain_tool: post-drain auto-reindex coverage ----------
+    //
+    // A drain ingests queued sources through the same pipeline as
+    // `ingest_tool`, so it must refresh the embeddings store the same way.
+    // Without that step, drained pages stayed invisible to
+    // scriptorium_search / scriptorium_query until a manual `reindex`.
+
+    /// A drain that ingests a queued source leaves the embeddings store
+    /// populated, so the new page is retrievable at once.
+    #[tokio::test]
+    async fn drain_tool_embeds_ingested_pages_into_store() {
+        let plan = make_simple_plan(
+            "wiki/concepts/queued.md",
+            "Queued",
+            "## Overview\n\nBody for the queued page.\n",
+        );
+        let (_dir, ctx, source) = make_test_context(&plan, "queued-source.md", "queued contents");
+        core::ingest_queue::enqueue(&ctx.vault, &source, None).expect("enqueue");
+
+        let out = drain_tool(json!({"debounce_secs": 0}), &ctx)
+            .await
+            .expect("drain_tool succeeds");
+
+        let report: Value = serde_json::from_str(&out).expect("drain report JSON");
+        assert_eq!(report["ingested"], 1, "drain report: {out}");
+        let store = open_store(&ctx).expect("open store");
+        assert!(
+            store.len().expect("count rows") > 0,
+            "expected the drained page in the embeddings store; drain report: {out}"
+        );
+    }
+
+    /// A dry-run drain ingests nothing, so it must not touch the
+    /// embeddings store.
+    #[tokio::test]
+    async fn drain_tool_dry_run_does_not_touch_embeddings_store() {
+        let plan = make_simple_plan(
+            "wiki/concepts/queued.md",
+            "Queued",
+            "## Overview\n\nBody for the queued page.\n",
+        );
+        let (_dir, ctx, source) = make_test_context(&plan, "queued-source.md", "queued contents");
+        core::ingest_queue::enqueue(&ctx.vault, &source, None).expect("enqueue");
+
+        let out = drain_tool(json!({"debounce_secs": 0, "dry_run": true}), &ctx)
+            .await
+            .expect("dry-run drain_tool succeeds");
+
+        let report: Value = serde_json::from_str(&out).expect("drain report JSON");
+        assert_eq!(report["ingested"], 0, "drain report: {out}");
+        let store = open_store(&ctx).expect("open store");
+        assert_eq!(
+            store.len().expect("count"),
+            0,
+            "a dry run must not write embeddings"
         );
     }
 }
