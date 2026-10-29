@@ -38,6 +38,10 @@ pub struct ServerContext {
     pub llm_provider: Arc<dyn LlmProvider>,
     pub embed_provider: Arc<dyn LlmProvider>,
     pub embeddings_model: String,
+    /// `[embeddings] contextual` in `config.toml`. The drain tool then
+    /// embeds with the chat provider's situating headers, as
+    /// `scriptorium reindex` does.
+    pub embeddings_contextual: bool,
     /// Query-time retrieval options from `[search]` in `config.toml`.
     pub search: scriptorium_core::config::SearchConfig,
 }

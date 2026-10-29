@@ -6,8 +6,10 @@
 //!
 //! Each test runs the `scriptorium` binary against a fresh vault. The
 //! vault's chat provider is `openai`, pointed at a local stub that answers
-//! every chat completion with one fixed ingest plan. Embeddings use the mock
-//! provider. No test reaches the network or the keychain.
+//! every chat completion with one fixed ingest plan, or with one situating
+//! header per chunk when the request asks for contextual headers.
+//! Embeddings use the mock provider. No test reaches the network or the
+//! keychain.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::missing_panics_doc)]
 
@@ -19,12 +21,18 @@ use assert_cmd::Command;
 use scriptorium_core::embed::EmbeddingsStore;
 use tempfile::TempDir;
 
-/// The page the stubbed LLM tells every ingest to create.
+/// The page the stubbed LLM tells every ingest to create. Its two
+/// sections make two chunks.
 const PAGE: &str = "wiki/concepts/kestrel-relay.md";
 
-/// Answer every HTTP request on a fresh local port with a chat completion
-/// whose content is an ingest plan that creates [`PAGE`]. Returns the base
-/// URL.
+/// A word in every situating header the stub writes, to find those headers
+/// in the store's keyword index.
+const CONTEXT_MARKER: &str = "zephyrctx";
+
+/// Answer every HTTP request on a fresh local port with a chat completion.
+/// A request for contextual headers, which lists the page's chunks, gets
+/// one header per chunk, each carrying [`CONTEXT_MARKER`]. Any other request
+/// gets an ingest plan that creates [`PAGE`]. Returns the base URL.
 fn spawn_chat_stub() -> String {
     let plan = serde_json::json!({
         "summary": "Kestrel relay test note",
@@ -33,19 +41,14 @@ fn spawn_chat_stub() -> String {
             "path": PAGE,
             "title": "Kestrel Relay",
             "tags": ["concept", "domain/test"],
-            "body": "## Overview\n\nThe Kestrel relay forwards each message to two peers.\n",
+            "body": "## Overview\n\nThe Kestrel relay forwards each message to two peers.\n\n\
+                     ## Failover\n\nA peer that misses three beacons is dropped.\n",
             "source_quote": null,
             "supersedes": []
         }],
         "log_entry": "ingested the Kestrel relay test note",
         "redundant": false
     });
-    let body = serde_json::json!({
-        "model": "stub",
-        "choices": [{"message": {"content": plan.to_string()}}],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-    })
-    .to_string();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     std::thread::spawn(move || {
@@ -61,7 +64,23 @@ fn spawn_chat_stub() -> String {
                 }
                 line.clear();
             }
-            let _ = reader.read_exact(&mut vec![0; len]);
+            let mut request = vec![0; len];
+            let _ = reader.read_exact(&mut request);
+            let request = String::from_utf8_lossy(&request);
+            let content = if request.contains("situating") {
+                let headers: Vec<String> = (0..request.matches("--- chunk ").count())
+                    .map(|i| format!("{CONTEXT_MARKER} header for chunk {i}"))
+                    .collect();
+                serde_json::json!({ "contexts": headers }).to_string()
+            } else {
+                plan.to_string()
+            };
+            let body = serde_json::json!({
+                "model": "stub",
+                "choices": [{"message": {"content": content}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })
+            .to_string();
             let _ = write!(
                 stream,
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
@@ -89,7 +108,8 @@ fn scriptorium(home: &Path, chat_url: &str) -> Command {
 
 /// A fresh HOME, a vault initialised in its own tempdir and switched to the
 /// stubbed chat provider and the mock embedder, a session note queued in
-/// that vault, and the stub's URL.
+/// that vault, and the stub's URL. Contextual retrieval is off unless the
+/// fixture comes from [`Fixture::with_contextual`].
 struct Fixture {
     home: TempDir,
     vault: TempDir,
@@ -98,6 +118,12 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_contextual(false)
+    }
+
+    /// Like [`Fixture::new`], with `[embeddings] contextual` set to
+    /// `contextual`.
+    fn with_contextual(contextual: bool) -> Self {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".scriptorium")).unwrap();
         let vault = tempfile::tempdir().unwrap();
@@ -114,8 +140,11 @@ impl Fixture {
             .success();
         std::fs::write(
             fixture.vault.path().join(".scriptorium/config.toml"),
-            "[llm]\nprovider = \"openai\"\nmodel = \"stub\"\n\n\
-             [embeddings]\nprovider = \"mock\"\nmodel = \"mock-embed\"\n",
+            format!(
+                "[llm]\nprovider = \"openai\"\nmodel = \"stub\"\n\n\
+                 [embeddings]\nprovider = \"mock\"\nmodel = \"mock-embed\"\n\
+                 contextual = {contextual}\n"
+            ),
         )
         .unwrap();
         let sessions = fixture.vault.path().join("sources/sessions");
@@ -150,6 +179,16 @@ impl Fixture {
         self.vault.path().join(".scriptorium/embeddings.sqlite")
     }
 
+    /// Chunks in the store whose text carries a situating header from the
+    /// stub.
+    fn context_hits(&self) -> usize {
+        let store = EmbeddingsStore::open(&self.store_path()).expect("open store");
+        store
+            .keyword_search(CONTEXT_MARKER, "mock", "mock-embed", 10)
+            .expect("keyword search")
+            .len()
+    }
+
     /// Run `ingest-drain` with no debounce and return its stdout.
     fn drain(&self, extra: &[&str]) -> String {
         let out = self
@@ -180,6 +219,32 @@ fn drain_embeds_the_pages_it_ingests() {
     assert!(
         store.distinct_page_count().expect("count pages") >= 1,
         "the page the drain wrote should be in the embeddings store"
+    );
+    assert_eq!(
+        fixture.context_hits(),
+        0,
+        "contextual retrieval is off, so no chunk carries a header"
+    );
+}
+
+/// With `[embeddings] contextual = true`, the drain embeds as `reindex`
+/// does: the chat provider writes a situating header for each chunk.
+/// Plain rows would pass for cache hits in a later `reindex` and never get
+/// their headers.
+#[test]
+fn drain_embeds_contextually_when_configured() {
+    let fixture = Fixture::with_contextual(true);
+
+    let stdout = fixture.drain(&[]);
+
+    assert!(
+        stdout.contains("drain: embedded "),
+        "drain output: {stdout}"
+    );
+    assert_eq!(
+        fixture.context_hits(),
+        2,
+        "both chunks of {PAGE} should carry a situating header; output: {stdout}"
     );
 }
 

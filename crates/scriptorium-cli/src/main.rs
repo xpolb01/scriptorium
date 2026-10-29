@@ -1244,17 +1244,23 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     // Embed what the drain committed, as `ingest` does, so
                     // the new pages are searchable without a manual
                     // `reindex`. `committed` counts a commit even when the
-                    // drain's bookkeeping after it failed. `embed::reindex`
-                    // is cache-aware, so only new or changed chunks reach the
+                    // drain's bookkeeping after it failed. The embed is
+                    // cache-aware, so only new or changed chunks reach the
                     // embeddings provider. A dry run commits nothing.
                     if report.committed > 0 {
                         let store = open_store(&vault)?;
                         let embed_provider = build_provider(embed_provider_from(&cfg))?;
-                        let embedded = scriptorium_core::embed::reindex(
+                        // With `[embeddings] contextual`, embed as `reindex`
+                        // does. Plain rows would pass for cache hits there
+                        // and never get their situating headers.
+                        let contextual_chat = cfg.embeddings.contextual.then_some(llm.as_ref());
+                        let embedded = scriptorium_core::embed::reindex_contextual(
                             &vault,
                             &store,
                             embed_provider.as_ref(),
                             &cfg.embeddings.model,
+                            scriptorium_core::config::ChunkStrategy::default(),
+                            contextual_chat,
                         )
                         .await
                         .into_diagnostic()?;
@@ -1820,6 +1826,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         llm_provider,
                         embed_provider,
                         embeddings_model: cfg.embeddings.model.clone(),
+                        embeddings_contextual: cfg.embeddings.contextual,
                         search: cfg.search.clone(),
                     };
                     scriptorium_mcp::serve_stdio(context)

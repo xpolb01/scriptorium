@@ -882,14 +882,21 @@ async fn drain_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolErro
     // Embed what the drain committed, as `ingest_tool` does, so the new
     // pages are searchable without a manual `reindex`. `committed` counts a
     // commit even when the drain's bookkeeping after it failed. A dry run
-    // commits nothing.
+    // commits nothing. With `[embeddings] contextual`, embed as
+    // `scriptorium reindex` does: plain rows would pass for cache hits there
+    // and never get their situating headers.
     if report.committed > 0 {
         let store = open_store(ctx)?;
-        scriptorium_core::embed::reindex(
+        let contextual_chat = ctx
+            .embeddings_contextual
+            .then_some(ctx.llm_provider.as_ref());
+        scriptorium_core::embed::reindex_contextual(
             &ctx.vault,
             &store,
             ctx.embed_provider.as_ref(),
             &ctx.embeddings_model,
+            scriptorium_core::config::ChunkStrategy::default(),
+            contextual_chat,
         )
         .await
         .map_err(|e| ToolError::Failed(format!("post-drain reindex: {e}")))?;
@@ -1050,6 +1057,7 @@ mod tests {
             llm_provider: llm,
             embed_provider: embed,
             embeddings_model: "mock-embed-test".into(),
+            embeddings_contextual: false,
             search: scriptorium_core::config::SearchConfig::default(),
         };
 
@@ -1194,6 +1202,7 @@ mod tests {
             llm_provider: llm2,
             embed_provider: ctx.embed_provider.clone(),
             embeddings_model: ctx.embeddings_model.clone(),
+            embeddings_contextual: false,
             search: scriptorium_core::config::SearchConfig::default(),
         };
         let source2 = ctx
@@ -1276,6 +1285,44 @@ mod tests {
             store.len().expect("count"),
             0,
             "a dry run must not write embeddings"
+        );
+    }
+
+    /// With `[embeddings] contextual = true`, the drain embeds as
+    /// `scriptorium reindex` does: the chat provider writes a situating
+    /// header for each chunk of a multi-chunk page. Plain rows would pass for
+    /// cache hits in a later reindex and never get their headers.
+    #[tokio::test]
+    async fn drain_tool_embeds_contextually_when_configured() {
+        let plan = make_simple_plan(
+            "wiki/concepts/queued.md",
+            "Queued",
+            "## Overview\n\nBody for the queued page.\n\n## Details\n\nMore about the queued page.\n",
+        );
+        let (_dir, mut ctx, source) =
+            make_test_context(&plan, "queued-source.md", "queued contents");
+        ctx.embeddings_contextual = true;
+        ctx.llm_provider = Arc::new(MockProvider::with_fixtures([
+            (
+                "situating".to_string(),
+                r#"{"contexts": ["zephyrctx overview", "zephyrctx details"]}"#.to_string(),
+            ),
+            (String::new(), serde_json::to_string(&plan).unwrap()),
+        ]));
+        core::ingest_queue::enqueue(&ctx.vault, &source, None).expect("enqueue");
+
+        let out = drain_tool(json!({"debounce_secs": 0}), &ctx)
+            .await
+            .expect("drain_tool succeeds");
+
+        let store = open_store(&ctx).expect("open store");
+        let hits = store
+            .keyword_search("zephyrctx", "mock", "mock-embed-test", 10)
+            .expect("keyword search");
+        assert_eq!(
+            hits.len(),
+            2,
+            "each chunk should carry its situating header; drain report: {out}"
         );
     }
 
