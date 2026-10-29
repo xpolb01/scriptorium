@@ -468,14 +468,31 @@ async fn hook_summary_handler(
     })))
 }
 
+/// Whether `origin` is `http://localhost` or `http://127.0.0.1`, with an
+/// optional port. A prefix match would also admit
+/// `http://localhost.evil.example`.
+fn is_loopback_origin(origin: &[u8]) -> bool {
+    let Some(rest) = origin.strip_prefix(b"http://") else {
+        return false;
+    };
+    match rest
+        .strip_prefix(b"localhost")
+        .or_else(|| rest.strip_prefix(b"127.0.0.1"))
+    {
+        Some([]) => true,
+        Some([b':', port @ ..]) => {
+            port.iter().all(u8::is_ascii_digit)
+                && std::str::from_utf8(port).is_ok_and(|p| p.parse::<u16>().is_ok())
+        }
+        _ => false,
+    }
+}
+
 /// The dashboard's routes behind a localhost-only CORS layer.
 fn router(state: Arc<AppState>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
-            |origin: &HeaderValue, _parts: &_| {
-                origin.as_bytes().starts_with(b"http://127.0.0.1")
-                    || origin.as_bytes().starts_with(b"http://localhost")
-            },
+            |origin: &HeaderValue, _parts: &_| is_loopback_origin(origin.as_bytes()),
         ))
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any)
@@ -772,5 +789,49 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["trace_id"], trace_id);
+    }
+
+    #[test]
+    fn loopback_origin_matches_exact_hosts_only() {
+        for ok in [
+            "http://localhost",
+            "http://localhost:3000",
+            "http://127.0.0.1",
+            "http://127.0.0.1:3457",
+        ] {
+            assert!(is_loopback_origin(ok.as_bytes()), "{ok} must be allowed");
+        }
+        for bad in [
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://localhost:3000.evil.example",
+            "http://localhost:",
+            "http://localhost:+80",
+            "http://localhost:65536",
+            "https://localhost",
+            "http://evil.example",
+            "null",
+        ] {
+            assert!(!is_loopback_origin(bad.as_bytes()), "{bad} must be refused");
+        }
+    }
+
+    #[tokio::test]
+    async fn production_router_refuses_lookalike_origin() {
+        let app = router(tmp_state("router-t2.sqlite"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .header("origin", "http://localhost.evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response
+            .headers()
+            .contains_key("access-control-allow-origin"));
     }
 }
