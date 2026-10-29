@@ -11,6 +11,9 @@
 //! network for real providers. The mock provider returns immediately so the
 //! integration tests stay fast.
 
+use std::fs::OpenOptions;
+use std::time::Duration;
+
 use tracing::debug;
 
 use super::{
@@ -228,6 +231,11 @@ async fn contextualize_chunks(
 /// [`EmbeddingsStore::retain_page_versions`] directly, or inspect
 /// [`EmbeddingsStore::len`] before and after. Most callers just want
 /// "how many new chunks did I pay to embed this run", which is `total`.
+///
+/// Runs take `<vault>/.scriptorium/embed.lock` in turn, across processes,
+/// from the scan to the prune. Without it, a run that scanned before
+/// another run committed and embedded a page would prune that page's rows.
+/// A run waits for as long as another run holds the lock.
 pub async fn reindex(
     vault: &Vault,
     store: &EmbeddingsStore,
@@ -248,6 +256,13 @@ pub async fn reindex_with_strategy(
     reindex_contextual(vault, store, provider, model, strategy, None).await
 }
 
+/// File, under the vault's meta dir, that reindex runs take in turn across
+/// processes. See [`reindex`].
+const EMBED_LOCK_FILE: &str = "embed.lock";
+
+/// How long a reindex run waits before it tries [`EMBED_LOCK_FILE`] again.
+const EMBED_LOCK_RETRY: Duration = Duration::from_millis(200);
+
 /// Like [`reindex_with_strategy`], with optional contextual chunk
 /// augmentation via `chat` (see [`embed_page_contextual`]).
 pub async fn reindex_contextual(
@@ -258,6 +273,75 @@ pub async fn reindex_contextual(
     strategy: ChunkStrategy,
     chat: Option<&dyn LlmProvider>,
 ) -> Result<usize> {
+    reindex_under_lock(vault, store, provider, model, strategy, chat, false).await
+}
+
+/// Like [`reindex_contextual`], but first drops every cached row, so a
+/// strategy or contextual-mode change re-embeds every page. The drop
+/// happens under the embed lock: a run that held the lock while this one
+/// waited would otherwise refill the store, and this run would take those
+/// rows for cache hits.
+pub async fn rebuild_contextual(
+    vault: &Vault,
+    store: &EmbeddingsStore,
+    provider: &dyn LlmProvider,
+    model: &str,
+    strategy: ChunkStrategy,
+    chat: Option<&dyn LlmProvider>,
+) -> Result<usize> {
+    reindex_under_lock(vault, store, provider, model, strategy, chat, true).await
+}
+
+/// Take the embed lock, then run [`reindex_locked`]. See [`reindex`].
+async fn reindex_under_lock(
+    vault: &Vault,
+    store: &EmbeddingsStore,
+    provider: &dyn LlmProvider,
+    model: &str,
+    strategy: ChunkStrategy,
+    chat: Option<&dyn LlmProvider>,
+    rebuild: bool,
+) -> Result<usize> {
+    let meta = vault.meta_dir().into_std_path_buf();
+    std::fs::create_dir_all(&meta).map_err(|e| Error::io(&meta, e))?;
+    let lock_path = meta.join(EMBED_LOCK_FILE);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| Error::io(&lock_path, e))?;
+    let mut lock = fd_lock::RwLock::new(file);
+    // Poll rather than block: a blocking wait would stall the async
+    // runtime's thread, and another task in this process may hold the lock.
+    loop {
+        match lock.try_write() {
+            Ok(_guard) => {
+                return reindex_locked(vault, store, provider, model, strategy, chat, rebuild)
+                    .await;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(Error::io(&lock_path, e)),
+        }
+        tokio::time::sleep(EMBED_LOCK_RETRY).await;
+    }
+}
+
+/// The body of a reindex run, run while it holds the embed lock. A
+/// `rebuild` drops every cached row first.
+async fn reindex_locked(
+    vault: &Vault,
+    store: &EmbeddingsStore,
+    provider: &dyn LlmProvider,
+    model: &str,
+    strategy: ChunkStrategy,
+    chat: Option<&dyn LlmProvider>,
+    rebuild: bool,
+) -> Result<usize> {
+    if rebuild {
+        store.retain_page_versions(&[])?;
+    }
     let scan = vault.scan()?;
     let mut total = 0;
 
@@ -292,11 +376,15 @@ pub async fn reindex_contextual(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::MockProvider;
+    use crate::llm::{CompletionRequest, CompletionResponse, LlmError, MockProvider};
     use crate::vault::page::{Frontmatter, PageId};
     use camino::Utf8PathBuf;
     use chrono::{TimeZone, Utc};
     use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::{Notify, Semaphore};
 
     fn make_page(stem: &str, body: &str) -> Page {
         let now = Utc.with_ymd_and_hms(2026, 4, 6, 12, 0, 0).unwrap();
@@ -346,5 +434,177 @@ mod tests {
             .unwrap();
         assert_eq!(inserted, 0);
         assert_eq!(store.len().unwrap(), 0);
+    }
+
+    /// Embeds like [`MockProvider`], but each `embed` call first reports
+    /// that it started, then waits until the test opens `gate`.
+    struct GatedEmbedder {
+        inner: MockProvider,
+        reached: AtomicBool,
+        entered: Notify,
+        gate: Semaphore,
+    }
+
+    impl GatedEmbedder {
+        fn new() -> Self {
+            Self {
+                inner: MockProvider::constant(""),
+                reached: AtomicBool::new(false),
+                entered: Notify::new(),
+                gate: Semaphore::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for GatedEmbedder {
+        async fn complete(
+            &self,
+            req: CompletionRequest,
+        ) -> std::result::Result<CompletionResponse, LlmError> {
+            self.inner.complete(req).await
+        }
+
+        async fn embed(&self, texts: &[String]) -> std::result::Result<Vec<Vec<f32>>, LlmError> {
+            self.reached.store(true, Ordering::SeqCst);
+            self.entered.notify_one();
+            let _permit = self.gate.acquire().await.expect("gate is never closed");
+            self.inner.embed(texts).await
+        }
+
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn context_window(&self) -> usize {
+            self.inner.context_window()
+        }
+
+        fn embedding_dim(&self) -> usize {
+            self.inner.embedding_dim()
+        }
+    }
+
+    /// Runs `first`, which must reach `gated`'s provider, and, once it waits
+    /// there, `then`. The gate opens 500 ms after `then` starts, so `then`
+    /// overlaps the rest of `first`. Fails rather than hangs when a run
+    /// stalls or `first` returns before it reaches the provider.
+    async fn overlap<A: Future, B: Future>(
+        gated: &GatedEmbedder,
+        first: A,
+        then: B,
+    ) -> (A::Output, B::Output)
+    where
+        A::Output: std::fmt::Debug,
+    {
+        let run_first = async {
+            let out = first.await;
+            // Lets `then` start if `first` returned before the provider.
+            gated.entered.notify_one();
+            out
+        };
+        let run_then = async {
+            gated.entered.notified().await;
+            let open_gate_later = async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                gated.gate.add_permits(1);
+            };
+            tokio::join!(then, open_gate_later).0
+        };
+        let outputs = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(run_first, run_then)
+        })
+        .await
+        .expect("both runs finish");
+        assert!(
+            gated.reached.load(Ordering::SeqCst),
+            "the first run never reached the provider, so nothing overlapped it: {:?}",
+            outputs.0
+        );
+        outputs
+    }
+
+    /// Writes `page` under `root` at its vault path.
+    fn write_page(root: &Path, page: &Page) {
+        let path = root.join(page.path.as_str());
+        std::fs::write(path, page.to_markdown().unwrap()).unwrap();
+    }
+
+    /// A vault in a temp dir with one page, `stem`.
+    fn vault_with_page(stem: &str) -> (tempfile::TempDir, Vault) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("wiki")).unwrap();
+        write_page(dir.path(), &make_page(stem, &format!("{stem} body.\n")));
+        let vault = Vault::open(dir.path()).unwrap();
+        (dir, vault)
+    }
+
+    /// Run A scans, then stalls in the provider. A page is written and run B
+    /// indexes it. When A finishes, its prune must keep B's rows for the new
+    /// page.
+    #[tokio::test]
+    async fn concurrent_reindex_keeps_rows_of_a_page_written_after_its_scan() {
+        let (dir, vault) = vault_with_page("alpha");
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let gated = GatedEmbedder::new();
+        let plain = MockProvider::constant("");
+
+        let write_beta_then_reindex = async {
+            write_page(dir.path(), &make_page("beta", "beta body.\n"));
+            reindex(&vault, &store, &plain, "mock-1").await
+        };
+        let (run_a, run_b) = overlap(
+            &gated,
+            reindex(&vault, &store, &gated, "mock-1"),
+            write_beta_then_reindex,
+        )
+        .await;
+        run_a.unwrap();
+        run_b.unwrap();
+
+        let pages = vault.scan().unwrap().pages;
+        assert_eq!(pages.len(), 2);
+        for page in pages {
+            let hash = page.content_hash().unwrap();
+            assert!(
+                store.has_any_version(page.frontmatter.id, &hash).unwrap(),
+                "{} lost its embeddings",
+                page.path
+            );
+        }
+    }
+
+    /// A rebuild that waits for the lock must drop the cached rows only once
+    /// it holds the lock. Dropped earlier, the rows the lock holder writes
+    /// meanwhile would pass for cache hits, and the rebuild would re-embed
+    /// nothing.
+    #[tokio::test]
+    async fn rebuild_waiting_for_the_lock_re_embeds_rows_written_meanwhile() {
+        let (_dir, vault) = vault_with_page("alpha");
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let gated = GatedEmbedder::new();
+        let plain = MockProvider::constant("");
+
+        let rebuild_run = rebuild_contextual(
+            &vault,
+            &store,
+            &plain,
+            "mock-1",
+            ChunkStrategy::default(),
+            None,
+        );
+        let (run_a, re_embedded) = overlap(
+            &gated,
+            reindex(&vault, &store, &gated, "mock-1"),
+            rebuild_run,
+        )
+        .await;
+        let written = run_a.unwrap();
+        assert!(written > 0);
+        assert_eq!(
+            re_embedded.unwrap(),
+            written,
+            "the rebuild re-embeds every chunk"
+        );
     }
 }

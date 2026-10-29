@@ -32,8 +32,8 @@ pub use chunk::{chunk_page, Chunk};
 pub use chunk_recursive::chunk_page_recursive;
 pub use chunk_semantic::chunk_page_semantic;
 pub use index::{
-    chunk_with_strategy, embed_page, embed_page_contextual, reindex, reindex_contextual,
-    reindex_with_strategy, DEFAULT_CHUNK_CHARS,
+    chunk_with_strategy, embed_page, embed_page_contextual, rebuild_contextual, reindex,
+    reindex_contextual, reindex_with_strategy, DEFAULT_CHUNK_CHARS,
 };
 pub use store::{EmbeddingRow, EmbeddingsStore, SearchHit};
 pub use vector_index::{LinearIndex, VectorIndex};

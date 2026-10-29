@@ -879,6 +879,28 @@ async fn drain_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolErro
     let report = core::ingest_queue::drain(&ctx.vault, ctx.llm_provider.as_ref(), cfg)
         .await
         .map_err(|e| ToolError::Failed(format!("drain: {e}")))?;
+    // Embed what the drain committed, as `ingest_tool` does, so the new
+    // pages are searchable without a manual `reindex`. `committed` counts a
+    // commit even when the drain's bookkeeping after it failed. A dry run
+    // commits nothing. With `[embeddings] contextual`, embed as
+    // `scriptorium reindex` does: plain rows would pass for cache hits there
+    // and never get their situating headers.
+    if report.committed > 0 {
+        let store = open_store(ctx)?;
+        let contextual_chat = ctx
+            .embeddings_contextual
+            .then_some(ctx.llm_provider.as_ref());
+        scriptorium_core::embed::reindex_contextual(
+            &ctx.vault,
+            &store,
+            ctx.embed_provider.as_ref(),
+            &ctx.embeddings_model,
+            scriptorium_core::config::ChunkStrategy::default(),
+            contextual_chat,
+        )
+        .await
+        .map_err(|e| ToolError::Failed(format!("post-drain reindex: {e}")))?;
+    }
     serde_json::to_string_pretty(&report)
         .map_err(|e| ToolError::Failed(format!("serialize drain report: {e}")))
 }
@@ -1035,6 +1057,7 @@ mod tests {
             llm_provider: llm,
             embed_provider: embed,
             embeddings_model: "mock-embed-test".into(),
+            embeddings_contextual: false,
             search: scriptorium_core::config::SearchConfig::default(),
         };
 
@@ -1179,6 +1202,7 @@ mod tests {
             llm_provider: llm2,
             embed_provider: ctx.embed_provider.clone(),
             embeddings_model: ctx.embeddings_model.clone(),
+            embeddings_contextual: false,
             search: scriptorium_core::config::SearchConfig::default(),
         };
         let source2 = ctx
@@ -1203,6 +1227,154 @@ mod tests {
         assert!(
             chunks_after_second >= chunks_after_first,
             "store must grow monotonically: {chunks_after_first} -> {chunks_after_second}"
+        );
+    }
+
+    // ---------- drain_tool: post-drain auto-reindex coverage ----------
+    //
+    // A drain ingests queued sources through the same pipeline as
+    // `ingest_tool`, so it must refresh the embeddings store the same way.
+    // Without that step, drained pages stayed invisible to
+    // scriptorium_search / scriptorium_query until a manual `reindex`.
+
+    /// A drain that ingests a queued source leaves the embeddings store
+    /// populated, so the new page is retrievable at once.
+    #[tokio::test]
+    async fn drain_tool_embeds_ingested_pages_into_store() {
+        let plan = make_simple_plan(
+            "wiki/concepts/queued.md",
+            "Queued",
+            "## Overview\n\nBody for the queued page.\n",
+        );
+        let (_dir, ctx, source) = make_test_context(&plan, "queued-source.md", "queued contents");
+        core::ingest_queue::enqueue(&ctx.vault, &source, None).expect("enqueue");
+
+        let out = drain_tool(json!({"debounce_secs": 0}), &ctx)
+            .await
+            .expect("drain_tool succeeds");
+
+        let report: Value = serde_json::from_str(&out).expect("drain report JSON");
+        assert_eq!(report["ingested"], 1, "drain report: {out}");
+        let store = open_store(&ctx).expect("open store");
+        assert!(
+            store.len().expect("count rows") > 0,
+            "expected the drained page in the embeddings store; drain report: {out}"
+        );
+    }
+
+    /// A dry-run drain ingests nothing, so it must not touch the
+    /// embeddings store.
+    #[tokio::test]
+    async fn drain_tool_dry_run_does_not_touch_embeddings_store() {
+        let plan = make_simple_plan(
+            "wiki/concepts/queued.md",
+            "Queued",
+            "## Overview\n\nBody for the queued page.\n",
+        );
+        let (_dir, ctx, source) = make_test_context(&plan, "queued-source.md", "queued contents");
+        core::ingest_queue::enqueue(&ctx.vault, &source, None).expect("enqueue");
+
+        let out = drain_tool(json!({"debounce_secs": 0, "dry_run": true}), &ctx)
+            .await
+            .expect("dry-run drain_tool succeeds");
+
+        let report: Value = serde_json::from_str(&out).expect("drain report JSON");
+        assert_eq!(report["ingested"], 0, "drain report: {out}");
+        let store = open_store(&ctx).expect("open store");
+        assert_eq!(
+            store.len().expect("count"),
+            0,
+            "a dry run must not write embeddings"
+        );
+    }
+
+    /// With `[embeddings] contextual = true`, the drain embeds as
+    /// `scriptorium reindex` does: the chat provider writes a situating
+    /// header for each chunk of a multi-chunk page. Plain rows would pass for
+    /// cache hits in a later reindex and never get their headers.
+    #[tokio::test]
+    async fn drain_tool_embeds_contextually_when_configured() {
+        let plan = make_simple_plan(
+            "wiki/concepts/queued.md",
+            "Queued",
+            "## Overview\n\nBody for the queued page.\n\n## Details\n\nMore about the queued page.\n",
+        );
+        let (_dir, mut ctx, source) =
+            make_test_context(&plan, "queued-source.md", "queued contents");
+        ctx.embeddings_contextual = true;
+        ctx.llm_provider = Arc::new(MockProvider::with_fixtures([
+            (
+                "situating".to_string(),
+                r#"{"contexts": ["zephyrctx overview", "zephyrctx details"]}"#.to_string(),
+            ),
+            (String::new(), serde_json::to_string(&plan).unwrap()),
+        ]));
+        core::ingest_queue::enqueue(&ctx.vault, &source, None).expect("enqueue");
+
+        let out = drain_tool(json!({"debounce_secs": 0}), &ctx)
+            .await
+            .expect("drain_tool succeeds");
+
+        let store = open_store(&ctx).expect("open store");
+        let hits = store
+            .keyword_search("zephyrctx", "mock", "mock-embed-test", 10)
+            .expect("keyword search");
+        assert_eq!(
+            hits.len(),
+            2,
+            "each chunk should carry its situating header; drain report: {out}"
+        );
+    }
+
+    /// The drain's hash-store append runs after the ingest commit. When it
+    /// fails, the source does not count as ingested, but its page is
+    /// committed, so the tool must still embed it. A read-only hash store
+    /// makes the append fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_tool_embeds_pages_committed_before_a_hash_store_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let plan = make_simple_plan(
+            "wiki/concepts/queued.md",
+            "Queued",
+            "## Overview\n\nBody for the queued page.\n",
+        );
+        let (_dir, ctx, source) = make_test_context(&plan, "queued-source.md", "queued contents");
+        core::ingest_queue::enqueue(&ctx.vault, &source, None).expect("enqueue");
+        let hashes = ctx.vault.meta_dir().join("source-hashes.txt");
+        std::fs::write(&hashes, "").expect("create hash store");
+        let set_mode =
+            |mode| std::fs::set_permissions(&hashes, std::fs::Permissions::from_mode(mode));
+        set_mode(0o444).expect("make the hash store read-only");
+        if std::fs::OpenOptions::new()
+            .append(true)
+            .open(&hashes)
+            .is_ok()
+        {
+            // The mode bits do not bind root.
+            set_mode(0o644).expect("restore mode");
+            return;
+        }
+
+        let out = drain_tool(json!({"debounce_secs": 0}), &ctx).await;
+        set_mode(0o644).expect("restore mode");
+        let out = out.expect("drain_tool succeeds");
+
+        let report: Value = serde_json::from_str(&out).expect("drain report JSON");
+        assert_eq!(report["ingested"], 0, "drain report: {out}");
+        assert_eq!(
+            report["failures"].as_array().map(Vec::len),
+            Some(1),
+            "drain report: {out}"
+        );
+        assert!(
+            report.get("committed").is_none(),
+            "the reply keeps its shape: {out}"
+        );
+        let store = open_store(&ctx).expect("open store");
+        assert!(
+            store.len().expect("count rows") > 0,
+            "expected the committed page in the embeddings store; drain report: {out}"
         );
     }
 }
