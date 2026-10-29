@@ -183,6 +183,62 @@ fn drain_embeds_the_pages_it_ingests() {
     );
 }
 
+/// The drain's hash-store append runs after the ingest commit. When it
+/// fails, the source does not count as ingested, but its pages are
+/// committed and must still be embedded. A read-only hash store makes the
+/// append fail.
+#[cfg(unix)]
+#[test]
+fn drain_embeds_pages_committed_before_a_hash_store_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let hashes = fixture.vault.path().join(".scriptorium/source-hashes.txt");
+    if !hashes.exists() {
+        std::fs::write(&hashes, "").unwrap();
+    }
+    let set_mode = |mode| std::fs::set_permissions(&hashes, std::fs::Permissions::from_mode(mode));
+    set_mode(0o444).unwrap();
+    if std::fs::OpenOptions::new()
+        .append(true)
+        .open(&hashes)
+        .is_ok()
+    {
+        // The mode bits do not bind root.
+        set_mode(0o644).unwrap();
+        return;
+    }
+
+    let out = fixture
+        .run_in_vault(&["ingest-drain", "--debounce", "0"])
+        .assert()
+        .success();
+    set_mode(0o644).unwrap();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+
+    assert!(
+        stdout.contains("ingested=0") && stdout.contains("failures=1"),
+        "drain output: {stdout}"
+    );
+    assert!(
+        stderr.contains("hash-store append"),
+        "drain stderr: {stderr}"
+    );
+    assert!(
+        fixture.vault.path().join(PAGE).is_file(),
+        "drain should have written {PAGE}; output: {stdout}"
+    );
+    assert!(
+        stdout.contains("drain: embedded "),
+        "drain output should report the embedded chunks: {stdout}"
+    );
+    let store = EmbeddingsStore::open(&fixture.store_path()).expect("open store");
+    assert!(
+        store.distinct_page_count().expect("count pages") >= 1,
+        "the page the drain committed should be in the embeddings store"
+    );
+}
+
 #[test]
 fn drain_dry_run_embeds_nothing() {
     let fixture = Fixture::new();

@@ -1241,12 +1241,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                             eprintln!("  fail: {} — {}", f.marker.display(), f.error);
                         }
                     }
-                    // Embed what the drain ingested, as `ingest` does, so the
-                    // new pages are searchable without a manual `reindex`.
-                    // `embed::reindex` is cache-aware, so only new or changed
-                    // chunks reach the embeddings provider. A dry run ingests
-                    // nothing.
-                    if !dry_run && report.ingested > 0 {
+                    // Embed what the drain committed, as `ingest` does, so
+                    // the new pages are searchable without a manual
+                    // `reindex`. `committed` counts a commit even when the
+                    // drain's bookkeeping after it failed. `embed::reindex`
+                    // is cache-aware, so only new or changed chunks reach the
+                    // embeddings provider. A dry run commits nothing.
+                    if report.committed > 0 {
                         let store = open_store(&vault)?;
                         let embed_provider = build_provider(embed_provider_from(&cfg))?;
                         let embedded = scriptorium_core::embed::reindex(

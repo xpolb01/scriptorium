@@ -879,10 +879,11 @@ async fn drain_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolErro
     let report = core::ingest_queue::drain(&ctx.vault, ctx.llm_provider.as_ref(), cfg)
         .await
         .map_err(|e| ToolError::Failed(format!("drain: {e}")))?;
-    // Embed what the drain ingested, as `ingest_tool` does, so the new
-    // pages are searchable without a manual `reindex`. A dry run ingests
-    // nothing.
-    if !args.dry_run && report.ingested > 0 {
+    // Embed what the drain committed, as `ingest_tool` does, so the new
+    // pages are searchable without a manual `reindex`. `committed` counts a
+    // commit even when the drain's bookkeeping after it failed. A dry run
+    // commits nothing.
+    if report.committed > 0 {
         let store = open_store(ctx)?;
         scriptorium_core::embed::reindex(
             &ctx.vault,
@@ -1275,6 +1276,58 @@ mod tests {
             store.len().expect("count"),
             0,
             "a dry run must not write embeddings"
+        );
+    }
+
+    /// The drain's hash-store append runs after the ingest commit. When it
+    /// fails, the source does not count as ingested, but its page is
+    /// committed, so the tool must still embed it. A read-only hash store
+    /// makes the append fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_tool_embeds_pages_committed_before_a_hash_store_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let plan = make_simple_plan(
+            "wiki/concepts/queued.md",
+            "Queued",
+            "## Overview\n\nBody for the queued page.\n",
+        );
+        let (_dir, ctx, source) = make_test_context(&plan, "queued-source.md", "queued contents");
+        core::ingest_queue::enqueue(&ctx.vault, &source, None).expect("enqueue");
+        let hashes = ctx.vault.meta_dir().join("source-hashes.txt");
+        std::fs::write(&hashes, "").expect("create hash store");
+        let set_mode =
+            |mode| std::fs::set_permissions(&hashes, std::fs::Permissions::from_mode(mode));
+        set_mode(0o444).expect("make the hash store read-only");
+        if std::fs::OpenOptions::new()
+            .append(true)
+            .open(&hashes)
+            .is_ok()
+        {
+            // The mode bits do not bind root.
+            set_mode(0o644).expect("restore mode");
+            return;
+        }
+
+        let out = drain_tool(json!({"debounce_secs": 0}), &ctx).await;
+        set_mode(0o644).expect("restore mode");
+        let out = out.expect("drain_tool succeeds");
+
+        let report: Value = serde_json::from_str(&out).expect("drain report JSON");
+        assert_eq!(report["ingested"], 0, "drain report: {out}");
+        assert_eq!(
+            report["failures"].as_array().map(Vec::len),
+            Some(1),
+            "drain report: {out}"
+        );
+        assert!(
+            report.get("committed").is_none(),
+            "the reply keeps its shape: {out}"
+        );
+        let store = open_store(&ctx).expect("open store");
+        assert!(
+            store.len().expect("count rows") > 0,
+            "expected the committed page in the embeddings store; drain report: {out}"
         );
     }
 }

@@ -95,6 +95,13 @@ pub struct DrainReport {
     /// Committed, or skipped as a near-duplicate of a committed file
     /// (includes redundant LLM skips).
     pub ingested: usize,
+    /// Ingests that committed, counted at the commit. The bookkeeping after
+    /// a commit can still fail and keep the source out of `ingested`, but
+    /// the vault changed either way, so callers refresh derived state such
+    /// as embeddings when this is non-zero. Not serialized: the JSON report
+    /// keeps its shape.
+    #[serde(skip)]
+    pub committed: usize,
     /// LLM said `redundant: true`, or the near-duplicate gate skipped the
     /// source as a copy of a committed file.
     pub redundant_skips: usize,
@@ -241,6 +248,7 @@ pub async fn drain(
             skipped_missing: 0,
             skipped_unknown_version: 0,
             ingested: 0,
+            committed: 0,
             redundant_skips: 0,
             failures: Vec::new(),
             started_at,
@@ -257,6 +265,7 @@ pub async fn drain(
         skipped_missing: 0,
         skipped_unknown_version: 0,
         ingested: 0,
+        committed: 0,
         redundant_skips: 0,
         failures: Vec::new(),
         started_at,
@@ -413,6 +422,9 @@ pub async fn drain(
         .await
         {
             Ok(ingest_report) => {
+                if ingest_report.commit_id != crate::ingest::NEAR_DUPLICATE_SKIP {
+                    report.committed += 1;
+                }
                 // A near-duplicate skip commits nothing, and the gate
                 // compared the matched file as it is on disk: it may be
                 // untracked, such as the leftover of an ingest stopped
@@ -1346,6 +1358,45 @@ mod tests {
         assert!(src.exists(), "non-session source should NOT be deleted");
     }
 
+    /// An ingest that committed counts in `committed` even when the
+    /// hash-store append after the commit fails and keeps it out of
+    /// `ingested`: the vault changed, so the caller must still refresh
+    /// embeddings. A read-only hash store makes the append fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_counts_commit_whose_hash_store_append_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, vault) = make_ingest_vault();
+        let src = write_source(
+            dir.path().join("sources/articles").as_path(),
+            "manual-source.md",
+            "manual body\n",
+        );
+        enqueue(&vault, &src, None).unwrap();
+        let hashes = hash_store_path(&vault);
+        fs::create_dir_all(hashes.parent().unwrap()).unwrap();
+        fs::write(&hashes, "").unwrap();
+        let set_mode = |mode| fs::set_permissions(&hashes, fs::Permissions::from_mode(mode));
+        set_mode(0o444).unwrap();
+        if OpenOptions::new().append(true).open(&hashes).is_ok() {
+            // The mode bits do not bind root.
+            set_mode(0o644).unwrap();
+            return;
+        }
+
+        let cfg = DrainConfig {
+            debounce: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let report = drain(&vault, &ingest_plan_mock(), cfg).await.unwrap();
+        set_mode(0o644).unwrap();
+        assert_eq!(
+            (report.committed, report.ingested, report.failures.len()),
+            (1, 0, 1)
+        );
+        assert!(report.failures[0].error.contains("hash-store append"));
+    }
+
     /// A duplicate of an ingested note is redundant once a stored copy
     /// exists, so the drain deletes the staged note, as it does after an
     /// ingest. Before this, duplicates piled up in `sources/sessions/`.
@@ -1518,7 +1569,15 @@ mod tests {
         let again = write_source(&sessions, "again.md", &format!("{body}one closing line\n"));
         enqueue(&vault, &again, None).unwrap();
         let report = drain(&vault, &dummy_provider(), cfg()).await.unwrap();
-        assert_eq!((report.redundant_skips, report.failures.len()), (1, 0));
+        assert_eq!(
+            (
+                report.redundant_skips,
+                report.committed,
+                report.failures.len()
+            ),
+            (1, 0, 0),
+            "a near-duplicate skip commits nothing"
+        );
         assert!(
             !again.exists(),
             "a near-copy of a committed source is redundant"
