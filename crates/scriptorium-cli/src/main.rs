@@ -905,21 +905,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         // Refresh the embeddings store so freshly-ingested pages
                         // are immediately searchable via `query` and the MCP
                         // `scriptorium_search` / `scriptorium_query` tools.
-                        // `embed::reindex` is cache-aware (keyed by content_hash)
+                        // The embed is cache-aware (keyed by content_hash)
                         // so existing chunks are skipped — only new/changed
                         // content pays the embedding cost. Without this step the
                         // store stays stale until a manual `scriptorium reindex`,
                         // which makes new pages invisible to retrieval.
-                        let store = open_store(&vault)?;
-                        let embed_provider = build_provider(embed_provider_from(&cfg))?;
-                        let embedded = scriptorium_core::embed::reindex(
-                            &vault,
-                            &store,
-                            embed_provider.as_ref(),
-                            &cfg.embeddings.model,
-                        )
-                        .await
-                        .into_diagnostic()?;
+                        let embedded = embed_committed(&vault, &cfg, provider.as_ref()).await?;
                         if embedded > 0 {
                             println!("        embedded: {embedded} new chunk(s)");
                         }
@@ -1095,12 +1086,20 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     let store = open_store(&vault)?;
                     let embed_provider =
                         build_provider(provider.unwrap_or_else(|| embed_provider_from(&cfg)))?;
+                    // Contextual retrieval needs the chat provider at index
+                    // time, as in `reindex`. Only `--fix` embeds.
+                    let contextual_chat = if fix && cfg.embeddings.contextual {
+                        Some(build_chat_provider(provider_from(&cfg), &cfg)?)
+                    } else {
+                        None
+                    };
                     let options = scriptorium_core::maintain::MaintainOptions { fix };
                     let report = scriptorium_core::maintain::maintain(
                         &vault,
                         &store,
                         Some(embed_provider.as_ref()),
                         &cfg.embeddings.model,
+                        contextual_chat.as_deref(),
                         &options,
                     )
                     .await
@@ -1168,6 +1167,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         eprintln!("    {} — {}", err.path.display(), err.error);
                     }
                     println!("  Elapsed: {:.1}s", report.elapsed.as_secs_f64());
+                    // Embed what the run committed, as `ingest` does, so the
+                    // new pages are searchable without a manual `reindex`.
+                    // A dry run commits nothing.
+                    if report.committed > 0 {
+                        let embedded = embed_committed(&vault, &cfg, llm.as_ref()).await?;
+                        if embedded > 0 {
+                            println!("  Embedded: {embedded} new chunk(s)");
+                        }
+                    }
                     Ok(ExitCode::SUCCESS)
                 }
                 Command::IngestEnqueue {
@@ -1248,22 +1256,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     // cache-aware, so only new or changed chunks reach the
                     // embeddings provider. A dry run commits nothing.
                     if report.committed > 0 {
-                        let store = open_store(&vault)?;
-                        let embed_provider = build_provider(embed_provider_from(&cfg))?;
-                        // With `[embeddings] contextual`, embed as `reindex`
-                        // does. Plain rows would pass for cache hits there
-                        // and never get their situating headers.
-                        let contextual_chat = cfg.embeddings.contextual.then_some(llm.as_ref());
-                        let embedded = scriptorium_core::embed::reindex_contextual(
-                            &vault,
-                            &store,
-                            embed_provider.as_ref(),
-                            &cfg.embeddings.model,
-                            scriptorium_core::config::ChunkStrategy::default(),
-                            contextual_chat,
-                        )
-                        .await
-                        .into_diagnostic()?;
+                        let embedded = embed_committed(&vault, &cfg, llm.as_ref()).await?;
                         if embedded > 0 && !json {
                             println!("drain: embedded {embedded} new chunk(s)");
                         }
@@ -1848,7 +1841,18 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     } else {
                         Some(cfg.hooks.clone())
                     };
-                    core::watch::watch(vault, provider, hooks)
+                    // Embed what each ingest commits, as `ingest` does, with
+                    // situating headers from the chat provider when
+                    // `[embeddings] contextual` is on, as in `reindex`.
+                    let store = open_store(&vault)?;
+                    let embed_provider = build_provider(embed_provider_from(&cfg))?;
+                    let embed = core::watch::WatchEmbed {
+                        store: &store,
+                        provider: embed_provider.as_ref(),
+                        model: &cfg.embeddings.model,
+                        contextual: cfg.embeddings.contextual,
+                    };
+                    core::watch::watch(vault, provider, hooks, embed)
                         .await
                         .into_diagnostic()?;
                     Ok(ExitCode::SUCCESS)
@@ -2046,16 +2050,7 @@ async fn handle_social_facebook(
     phase3.set_message("Reindexing embeddings...");
     phase3.enable_steady_tick(std::time::Duration::from_millis(80));
 
-    let store = open_store(vault)?;
-    let embed_provider = build_provider(embed_provider_from(&cfg))?;
-    let embedded = scriptorium_core::embed::reindex(
-        vault,
-        &store,
-        embed_provider.as_ref(),
-        &cfg.embeddings.model,
-    )
-    .await
-    .into_diagnostic()?;
+    let embedded = embed_committed(vault, &cfg, llm.as_ref()).await?;
 
     phase3.finish_with_message(format!("Embedded {embedded} new chunk(s)"));
 
@@ -2761,6 +2756,26 @@ fn open_store(vault: &Vault) -> Result<EmbeddingsStore> {
     std::fs::create_dir_all(meta.as_std_path()).into_diagnostic()?;
     let path = meta.join("embeddings.sqlite");
     EmbeddingsStore::open(path.as_std_path()).into_diagnostic()
+}
+
+/// Embed what a command committed, as `reindex` does: cache-aware, under
+/// the embed lock, and with a situating header from `chat` for each chunk
+/// of a multi-chunk page when `[embeddings] contextual` is on. Plain rows
+/// would pass for cache hits in a later `reindex` and never get their
+/// headers.
+async fn embed_committed(vault: &Vault, cfg: &Config, chat: &dyn LlmProvider) -> Result<usize> {
+    let store = open_store(vault)?;
+    let embed_provider = build_provider(embed_provider_from(cfg))?;
+    scriptorium_core::embed::reindex_contextual(
+        vault,
+        &store,
+        embed_provider.as_ref(),
+        &cfg.embeddings.model,
+        scriptorium_core::config::ChunkStrategy::default(),
+        cfg.embeddings.contextual.then_some(chat),
+    )
+    .await
+    .into_diagnostic()
 }
 
 const TPL_CLAUDE_MD: &str = include_str!("../../../templates/CLAUDE.md");

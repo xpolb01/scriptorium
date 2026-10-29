@@ -12,6 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::ChunkStrategy;
 use crate::embed::{self, EmbeddingsStore};
 use crate::error::Result;
 use crate::lint::{self, stale, LintReport, Severity};
@@ -79,11 +80,16 @@ pub struct MaintainSummary {
 ///
 /// `embed_provider` is only needed when `options.fix` is true and there are
 /// stale embeddings to refresh. Pass `None` for report-only mode.
+/// `contextual_chat` gives each chunk of a multi-chunk page a situating
+/// header, as `reindex` does when `[embeddings] contextual` is on. Pass
+/// `None` when it is off: plain rows written while it is on would pass for
+/// cache hits in a later reindex and never get their headers.
 pub async fn maintain(
     vault: &Vault,
     store: &EmbeddingsStore,
     embed_provider: Option<&dyn LlmProvider>,
     embed_model: &str,
+    contextual_chat: Option<&dyn LlmProvider>,
     options: &MaintainOptions,
 ) -> Result<MaintainReport> {
     // 1. Run full lint (includes stale page detection from Phase 5).
@@ -123,7 +129,16 @@ pub async fn maintain(
         // Re-embed stale pages.
         if !stale_embedding_pages.is_empty() {
             if let Some(provider) = embed_provider {
-                match embed::reindex(vault, store, provider, embed_model).await {
+                match embed::reindex_contextual(
+                    vault,
+                    store,
+                    provider,
+                    embed_model,
+                    ChunkStrategy::default(),
+                    contextual_chat,
+                )
+                .await
+                {
                     Ok(n) => chunks_reembedded = n,
                     Err(e) => {
                         tracing::warn!(error = %e, "re-embed during maintain failed");
@@ -282,13 +297,67 @@ mod tests {
         let vault = Vault::open(dir.path()).unwrap();
         let store = EmbeddingsStore::in_memory().unwrap();
 
-        let report = maintain(&vault, &store, None, "mock-1", &MaintainOptions::default())
-            .await
-            .unwrap();
+        let report = maintain(
+            &vault,
+            &store,
+            None,
+            "mock-1",
+            None,
+            &MaintainOptions::default(),
+        )
+        .await
+        .unwrap();
 
         assert!(report.lint.is_clean());
         assert_eq!(report.stale_embedding_pages, [] as [String; 0]);
         assert_eq!(report.embedding_coverage, (0, 0));
+    }
+
+    /// With a chat provider for contextual headers, `fix` re-embeds a stale
+    /// page as `reindex` does: each chunk carries its situating header.
+    #[tokio::test]
+    async fn fix_re_embeds_stale_pages_contextually_when_given_a_chat_provider() {
+        use crate::llm::MockProvider;
+        use crate::vault::{Frontmatter, Page};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("wiki")).unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        let page = Page {
+            path: "wiki/stale.md".into(),
+            frontmatter: Frontmatter::new("Stale"),
+            body: "## Overview\n\nBody for the stale page.\n\n\
+                   ## Details\n\nMore about the stale page.\n"
+                .into(),
+        };
+        std::fs::write(
+            dir.path().join("wiki/stale.md"),
+            page.to_markdown().unwrap(),
+        )
+        .unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let embedder = MockProvider::constant("");
+        let chat = MockProvider::with_fixtures([(
+            "situating".to_string(),
+            r#"{"contexts": ["zephyrctx overview", "zephyrctx details"]}"#.to_string(),
+        )]);
+
+        let report = maintain(
+            &vault,
+            &store,
+            Some(&embedder),
+            "mock-1",
+            Some(&chat),
+            &MaintainOptions { fix: true },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.stale_embedding_pages, ["wiki/stale.md"]);
+        let hits = store
+            .keyword_search("zephyrctx", "mock", "mock-1", 10)
+            .unwrap();
+        assert_eq!(hits.len(), 2, "each chunk carries its header");
     }
 
     mod prune_telemetry {

@@ -453,19 +453,11 @@ async fn ingest_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolErr
     } else {
         // Refresh the embeddings store so the freshly-ingested pages are
         // immediately searchable via `scriptorium_search` and queryable
-        // via `scriptorium_query`. `embed::reindex` is cache-aware
+        // via `scriptorium_query`. The embed is cache-aware
         // (content-hash keyed) so only new/changed chunks are re-embedded
         // — milliseconds when unchanged. Without this step, ingested
         // pages stay invisible to retrieval until a manual `reindex`.
-        let store = open_store(ctx)?;
-        let embedded = scriptorium_core::embed::reindex(
-            &ctx.vault,
-            &store,
-            ctx.embed_provider.as_ref(),
-            &ctx.embeddings_model,
-        )
-        .await
-        .map_err(|e| ToolError::Failed(format!("post-ingest reindex: {e}")))?;
+        let embedded = embed_committed(ctx, "post-ingest").await?;
         let embed_note = if embedded > 0 {
             format!(" (embedded {embedded} new chunk(s))")
         } else {
@@ -659,11 +651,15 @@ async fn maintain_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolE
         .unwrap_or(false);
     let store = open_store(ctx)?;
     let options = scriptorium_core::maintain::MaintainOptions { fix };
+    let contextual_chat = ctx
+        .embeddings_contextual
+        .then_some(ctx.llm_provider.as_ref());
     let report = scriptorium_core::maintain::maintain(
         &ctx.vault,
         &store,
         Some(ctx.embed_provider.as_ref()),
         &ctx.embeddings_model,
+        contextual_chat,
         &options,
     )
     .await
@@ -882,24 +878,9 @@ async fn drain_tool(args: Value, ctx: &ServerContext) -> Result<String, ToolErro
     // Embed what the drain committed, as `ingest_tool` does, so the new
     // pages are searchable without a manual `reindex`. `committed` counts a
     // commit even when the drain's bookkeeping after it failed. A dry run
-    // commits nothing. With `[embeddings] contextual`, embed as
-    // `scriptorium reindex` does: plain rows would pass for cache hits there
-    // and never get their situating headers.
+    // commits nothing.
     if report.committed > 0 {
-        let store = open_store(ctx)?;
-        let contextual_chat = ctx
-            .embeddings_contextual
-            .then_some(ctx.llm_provider.as_ref());
-        scriptorium_core::embed::reindex_contextual(
-            &ctx.vault,
-            &store,
-            ctx.embed_provider.as_ref(),
-            &ctx.embeddings_model,
-            scriptorium_core::config::ChunkStrategy::default(),
-            contextual_chat,
-        )
-        .await
-        .map_err(|e| ToolError::Failed(format!("post-drain reindex: {e}")))?;
+        embed_committed(ctx, "post-drain").await?;
     }
     serde_json::to_string_pretty(&report)
         .map_err(|e| ToolError::Failed(format!("serialize drain report: {e}")))
@@ -938,6 +919,28 @@ fn open_store(ctx: &ServerContext) -> Result<EmbeddingsStore, ToolError> {
     let path = meta.join("embeddings.sqlite");
     EmbeddingsStore::open(path.as_std_path())
         .map_err(|e| ToolError::Failed(format!("open embeddings store: {e}")))
+}
+
+/// Embed what a tool committed, as `scriptorium reindex` does: cache-aware,
+/// under the embed lock, and with a situating header for each chunk of a
+/// multi-chunk page when `[embeddings] contextual` is on. Plain rows would
+/// pass for cache hits in a later reindex and never get their headers.
+/// `step` names the tool's step in the error.
+async fn embed_committed(ctx: &ServerContext, step: &str) -> Result<usize, ToolError> {
+    let store = open_store(ctx)?;
+    let contextual_chat = ctx
+        .embeddings_contextual
+        .then_some(ctx.llm_provider.as_ref());
+    scriptorium_core::embed::reindex_contextual(
+        &ctx.vault,
+        &store,
+        ctx.embed_provider.as_ref(),
+        &ctx.embeddings_model,
+        scriptorium_core::config::ChunkStrategy::default(),
+        contextual_chat,
+    )
+    .await
+    .map_err(|e| ToolError::Failed(format!("{step} reindex: {e}")))
 }
 
 #[cfg(test)]
@@ -1302,25 +1305,15 @@ mod tests {
         let (_dir, mut ctx, source) =
             make_test_context(&plan, "queued-source.md", "queued contents");
         ctx.embeddings_contextual = true;
-        ctx.llm_provider = Arc::new(MockProvider::with_fixtures([
-            (
-                "situating".to_string(),
-                r#"{"contexts": ["zephyrctx overview", "zephyrctx details"]}"#.to_string(),
-            ),
-            (String::new(), serde_json::to_string(&plan).unwrap()),
-        ]));
+        ctx.llm_provider = contextual_chat(&plan);
         core::ingest_queue::enqueue(&ctx.vault, &source, None).expect("enqueue");
 
         let out = drain_tool(json!({"debounce_secs": 0}), &ctx)
             .await
             .expect("drain_tool succeeds");
 
-        let store = open_store(&ctx).expect("open store");
-        let hits = store
-            .keyword_search("zephyrctx", "mock", "mock-embed-test", 10)
-            .expect("keyword search");
         assert_eq!(
-            hits.len(),
+            context_hits(&ctx),
             2,
             "each chunk should carry its situating header; drain report: {out}"
         );
@@ -1375,6 +1368,89 @@ mod tests {
         assert!(
             store.len().expect("count rows") > 0,
             "expected the committed page in the embeddings store; drain report: {out}"
+        );
+    }
+
+    // ---------- contextual retrieval in every tool that embeds ----------
+    //
+    // With `[embeddings] contextual = true`, every tool that writes
+    // embeddings must embed as `scriptorium reindex` does. Plain rows would
+    // pass for cache hits in a later reindex and never get their situating
+    // headers.
+
+    /// A chat provider that answers a request for situating headers with
+    /// one header per chunk of a two-section page, and any other request
+    /// with `plan`.
+    fn contextual_chat(plan: &IngestPlan) -> Arc<dyn scriptorium_core::llm::LlmProvider> {
+        Arc::new(MockProvider::with_fixtures([
+            (
+                "situating".to_string(),
+                r#"{"contexts": ["zephyrctx overview", "zephyrctx details"]}"#.to_string(),
+            ),
+            (String::new(), serde_json::to_string(plan).unwrap()),
+        ]))
+    }
+
+    /// Chunks in the store that carry a situating header from
+    /// [`contextual_chat`].
+    fn context_hits(ctx: &ServerContext) -> usize {
+        open_store(ctx)
+            .expect("open store")
+            .keyword_search("zephyrctx", "mock", "mock-embed-test", 10)
+            .expect("keyword search")
+            .len()
+    }
+
+    fn two_section_plan() -> IngestPlan {
+        make_simple_plan(
+            "wiki/concepts/alpha.md",
+            "Alpha",
+            "## Overview\n\nFirst section body for alpha.\n\n## Details\n\nMore content.\n",
+        )
+    }
+
+    #[tokio::test]
+    async fn ingest_tool_embeds_contextually_when_configured() {
+        let plan = two_section_plan();
+        let (_dir, mut ctx, source) =
+            make_test_context(&plan, "alpha-source.md", "alpha source contents");
+        ctx.embeddings_contextual = true;
+        ctx.llm_provider = contextual_chat(&plan);
+
+        let args = json!({"source": source.to_string_lossy(), "dry_run": false});
+        let out = ingest_tool(args, &ctx).await.expect("ingest_tool succeeds");
+
+        assert_eq!(
+            context_hits(&ctx),
+            2,
+            "each chunk should carry its situating header; output: {out}"
+        );
+    }
+
+    /// `maintain` with `fix` re-embeds a stale page, here one whose rows
+    /// were dropped.
+    #[tokio::test]
+    async fn maintain_tool_fix_embeds_contextually_when_configured() {
+        let plan = two_section_plan();
+        let (_dir, mut ctx, source) =
+            make_test_context(&plan, "alpha-source.md", "alpha source contents");
+        let args = json!({"source": source.to_string_lossy(), "dry_run": false});
+        ingest_tool(args, &ctx).await.expect("ingest_tool succeeds");
+        open_store(&ctx)
+            .expect("open store")
+            .retain_page_versions(&[])
+            .expect("drop every row");
+        ctx.embeddings_contextual = true;
+        ctx.llm_provider = contextual_chat(&plan);
+
+        let out = maintain_tool(json!({"fix": true}), &ctx)
+            .await
+            .expect("maintain_tool succeeds");
+
+        assert_eq!(
+            context_hits(&ctx),
+            2,
+            "each chunk should carry its situating header; report: {out}"
         );
     }
 }
