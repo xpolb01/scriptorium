@@ -192,20 +192,7 @@ fn is_ingestable_source(path: &Path) -> bool {
     };
     // Everything the extract router can handle (binary formats included) —
     // extraction failures surface as ingest errors, not watcher crashes.
-    // `.extracted.md` siblings of converted binaries are our own writes, as
-    // are the copies ingest interns, named after their content's hash.
-    // Ingesting an interned copy interns it again under a longer name,
-    // which lands here again: a source too short for the near-duplicate
-    // gate would loop forever.
-    if path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.ends_with(".extracted.md"))
-        || ingest::is_interned_copy(path)
-    {
-        return false;
-    }
-    matches!(
+    if !matches!(
         ext.to_ascii_lowercase().as_str(),
         "md" | "markdown"
             | "txt"
@@ -217,7 +204,21 @@ fn is_ingestable_source(path: &Path) -> bool {
             | "epub"
             | "html"
             | "htm"
-    )
+    ) {
+        return false;
+    }
+    // `.extracted.md` siblings of converted binaries are our own writes, as
+    // are the copies ingest interns, named after their content's hash.
+    // Ingesting an interned copy interns it again under a longer name,
+    // which lands here again: a source too short for the near-duplicate
+    // gate would loop forever. Telling a copy reads the whole file, so it
+    // comes last.
+    let own_write = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".extracted.md"))
+        || ingest::is_interned_copy(path);
+    !own_write
 }
 
 #[cfg(test)]

@@ -1008,12 +1008,13 @@ const SOURCE_CATEGORIES: [&str; 4] = ["articles", "pdfs", "web", "data"];
 /// first one above [`NEAR_DUP_THRESHOLD`] with its similarity. Only
 /// readable UTF-8 sources under the size cap are compared.
 ///
-/// Only files [`intern_source`] wrote count (`sources/<category>/<hash>-…`
-/// and their `.extracted.md` siblings). Other files under `sources/` are
-/// staged, not ingested: session notes in `sources/sessions/`, chat
-/// imports, files dropped in by hand. The source being ingested is often
-/// one of them, so comparing against them skipped it as a duplicate of
-/// itself.
+/// Only files [`intern_source`] wrote count: copies named after their own
+/// content's hash (`sources/<category>/<hash>-…`), and their
+/// `.extracted.md` siblings. Other files under `sources/` are staged, not
+/// ingested: session notes in `sources/sessions/`, chat imports, files
+/// dropped in by hand, some under a name of the same shape, such as a
+/// timestamp. The source being ingested is often one of them, so comparing
+/// against them skipped it as a duplicate of itself.
 fn find_near_duplicate_source(vault: &Vault, text: &str) -> Option<(Utf8PathBuf, f32)> {
     for category in SOURCE_CATEGORIES {
         let dir = vault.root().join("sources").join(category);
@@ -1035,6 +1036,14 @@ fn find_near_duplicate_source(vault: &Vault, text: &str) -> Option<(Utf8PathBuf,
             let Ok(existing_text) = std::fs::read_to_string(entry.path()) else {
                 continue;
             };
+            // A sibling carries the hash of the source it was extracted
+            // from. A binary source stays out of git, so a clone may lack
+            // it: siblings count by name.
+            if !name.ends_with(".extracted.md")
+                && !sha256_hex(existing_text.as_bytes()).starts_with(&name[..12])
+            {
+                continue;
+            }
             let sim = crate::extract::shingle_jaccard(text, &existing_text);
             if sim >= NEAR_DUP_THRESHOLD {
                 let rel = Utf8PathBuf::from(format!("sources/{category}/{name}"));
@@ -1065,7 +1074,7 @@ pub(crate) fn is_interned_copy(path: &Path) -> bool {
         return false;
     };
     is_interned_name(name)
-        && fs::read(path).is_ok_and(|bytes| sha256_hex(&bytes).starts_with(&name[..12]))
+        && sha256_hex_of_file(path).is_ok_and(|digest| digest.starts_with(&name[..12]))
 }
 
 /// The vault-relative path [`intern_source`] files `bytes` read from
@@ -1198,6 +1207,24 @@ fn sha256_hex(bytes: &[u8]) -> String {
         out.push(HEX_DIGITS[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+/// [`sha256_hex`] of the file at `path`, read in blocks so a large file is
+/// never held in memory whole.
+fn sha256_hex_of_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut block = vec![0_u8; 64 * 1024];
+    loop {
+        match file.read(&mut block) {
+            Ok(0) => return Ok(crate::hex::lower(&hasher.finalize())),
+            Ok(n) => hasher.update(&block[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Write a JSON record of a failed ingest to `<vault>/.ingest-failures/`

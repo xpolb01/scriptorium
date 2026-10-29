@@ -1499,6 +1499,13 @@ mod tests {
         format!("{}\n", words.join(" "))
     }
 
+    /// Where ingest interns `body` under `sources/articles/`: a name that
+    /// starts with its content's hash.
+    fn interned_article(body: &str, slug: &str) -> String {
+        let hash = crate::hex::lower(&Sha256::digest(body.as_bytes()));
+        format!("sources/articles/{}-{slug}.md", &hash[..12])
+    }
+
     /// An ingest stopped before its commit leaves its interned copy in
     /// `sources/`, untracked. A later ingest of the same note is skipped as
     /// a near-duplicate of that copy and commits nothing, so the drain must
@@ -1511,7 +1518,8 @@ mod tests {
         let sessions = dir.path().join("sources").join("sessions");
         fs::create_dir_all(&sessions).unwrap();
         let body = long_body("leftover");
-        let leftover = dir.path().join("sources/articles/0123456789ab-leftover.md");
+        let leftover_rel = interned_article(&body, "leftover");
+        let leftover = dir.path().join(&leftover_rel);
         fs::write(&leftover, &body).unwrap();
         let note = write_source(&sessions, "2026-10-29-session-1eft0000.md", &body);
         enqueue(&vault, &note, None).unwrap();
@@ -1523,9 +1531,7 @@ mod tests {
         let report = drain(&vault, &dummy_provider(), cfg()).await.unwrap();
         assert_eq!((report.ingested, report.failures.len()), (0, 1));
         assert!(
-            report.failures[0]
-                .error
-                .contains("sources/articles/0123456789ab-leftover.md"),
+            report.failures[0].error.contains(&leftover_rel),
             "got: {}",
             report.failures[0].error
         );
@@ -1810,9 +1816,7 @@ mod tests {
         };
         let body = long_body("untracked");
         hash_store_append(&vault, &canonical_hash(&body)).unwrap();
-        let leftover = dir
-            .path()
-            .join("sources/articles/0123456789ab-untracked.md");
+        let leftover = dir.path().join(interned_article(&body, "untracked"));
         fs::write(&leftover, &body).unwrap();
         let note = write_source(&sessions, "2026-10-29-session-uuuu0000.md", &body);
         enqueue(&vault, &note, None).unwrap();

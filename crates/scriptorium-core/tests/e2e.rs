@@ -1345,6 +1345,24 @@ async fn near_duplicate_gate_ignores_the_source_itself() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
+/// Nor may it when its name has the shape of an interned copy, such as a
+/// timestamp: a copy is named after its own content's hash.
+#[tokio::test]
+async fn near_duplicate_gate_ignores_a_timestamped_source_itself() {
+    use std::sync::atomic::Ordering;
+
+    let (dir, vault) = empty_test_vault();
+    let source = dir.path().join("sources/articles/202610291230-meeting.md");
+    std::fs::write(&source, gate_sized_body("meeting")).unwrap();
+
+    let (mock, calls) = counting_plan_mock();
+    let report = ingest::ingest(&vault, &mock, &source).await.unwrap();
+
+    assert!(!report.redundant, "summary: {}", report.summary);
+    assert_eq!(report.created, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 /// Staged files that were never ingested are not existing sources. A
 /// near-copy among them (the same session's note from an earlier day)
 /// must not make the gate skip the source.

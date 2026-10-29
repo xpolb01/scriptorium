@@ -296,15 +296,15 @@ impl Fixture {
             .count()
     }
 
-    /// Whether git tracks a file under `sources/` whose name ends with
-    /// `suffix`.
-    fn tracks_source_ending_with(&self, suffix: &str) -> bool {
+    /// Whether the commit at HEAD holds a file under `sources/` whose name
+    /// ends with `suffix`. Not the index: a commit stages its files first.
+    fn committed_source_ending_with(&self, suffix: &str) -> bool {
         let files = std::process::Command::new("git")
             .arg("-C")
             .arg(self.vault.path())
-            .args(["ls-files", "sources"])
+            .args(["ls-tree", "-r", "--name-only", "HEAD", "--", "sources"])
             .output()
-            .expect("git ls-files");
+            .expect("git ls-tree");
         String::from_utf8(files.stdout)
             .unwrap()
             .lines()
@@ -611,7 +611,7 @@ fn watch_ingests_a_new_source_once() {
     .unwrap();
     assert!(
         wait_for(Duration::from_secs(60), || fixture
-            .tracks_source_ending_with("-plover.md")),
+            .committed_source_ending_with("-plover.md")),
         "watch did not commit the second source within 60 s"
     );
     assert!(

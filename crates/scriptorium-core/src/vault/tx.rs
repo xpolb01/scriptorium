@@ -302,7 +302,14 @@ fn apply_and_commit(
         let abs = root.join(rel.as_std_path());
         match op {
             Pending::Put(content) => {
-                write_with_fsync(&abs, content.as_bytes())?;
+                // Ingest writes its copy of a source before it commits, so
+                // the same bytes may already be on disk. Rewriting them
+                // would truncate a file another process may be reading.
+                if std::fs::read(&abs).is_ok_and(|current| current == content.as_bytes()) {
+                    sync_file(&abs)?;
+                } else {
+                    write_with_fsync(&abs, content.as_bytes())?;
+                }
             }
             Pending::Append(suffix) => {
                 append_with_fsync(&abs, suffix.as_bytes())?;
@@ -340,6 +347,22 @@ fn write_with_fsync(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         file.sync_all()
             .map_err(|e| Error::io(path.to_path_buf(), e))?;
     }
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// Make a file already on disk durable, as [`write_with_fsync`] does,
+/// without rewriting it.
+fn sync_file(path: &std::path::Path) -> Result<()> {
+    // Open for writing, without truncating: Windows flushes only a handle
+    // that may write.
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| Error::io(path.to_path_buf(), e))?;
     if let Some(parent) = path.parent() {
         sync_dir(parent)?;
     }
@@ -494,6 +517,35 @@ mod tests {
         tx2.delete(Utf8Path::new("wiki/foo.md")).unwrap();
         tx2.commit("rm").unwrap();
         assert!(!vault.root().join("wiki/foo.md").as_std_path().exists());
+    }
+
+    #[test]
+    fn put_file_commits_identical_bytes_on_disk_without_rewriting_them() {
+        let (_dir, vault) = fresh_vault();
+        let rel = Utf8Path::new("sources/articles/copy.md");
+        let abs = vault.root().join(rel).into_std_path_buf();
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, "same bytes\n").unwrap();
+        let then = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        File::options()
+            .write(true)
+            .open(&abs)
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+
+        let mut tx = vault.begin();
+        tx.put_file(rel, "same bytes\n".into()).unwrap();
+        tx.commit("stage copy").unwrap();
+
+        let modified = std::fs::metadata(&abs).unwrap().modified().unwrap();
+        assert_eq!(modified, then, "the file was rewritten");
+        let repo = git2::Repository::open(vault.root().as_std_path()).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        assert!(
+            tree.get_path(rel.as_std_path()).is_ok(),
+            "copy not committed"
+        );
     }
 
     #[test]
