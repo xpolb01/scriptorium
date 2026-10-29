@@ -195,7 +195,10 @@ fn queue_dir_path(vault: &Vault) -> PathBuf {
 ///
 /// A staged session note is deleted only when git holds a copy of its
 /// content: after an ingest commit, after a near-duplicate skip of an
-/// unchanged committed file, or as a duplicate of a committed source.
+/// unchanged committed file, or as a duplicate of a committed source. A
+/// note changed since the drain read it, such as one a resumed session
+/// exported again during the LLM call, keeps its marker, so the next drain
+/// handles the new content.
 ///
 /// Errors short-circuit only on lock-acquisition or fatal IO; per-marker
 /// errors accumulate in `DrainFailure`.
@@ -332,21 +335,23 @@ pub async fn drain(
         match hash_store_contains(vault, &hash) {
             Ok(true) => {
                 report.skipped_dup += 1;
-                let _ = fs::remove_file(&marker_path);
                 // The content was ingested before, so a staged session note
                 // is redundant, as on the success path below. Delete it only
                 // when a stored copy exists: the hash store also holds
                 // hashes of notes that were never stored. The near-duplicate
                 // gate once skipped every session note as a copy of itself,
-                // and the drain recorded the hash anyway.
+                // and the drain recorded the hash anyway. A note changed
+                // since the drain read it keeps its marker.
                 if !cfg.dry_run
                     && is_staged_session_note(vault, &marker.source)
                     && stored
                         .get_or_insert_with(|| stored_canonical_hashes(vault))
                         .contains(&hash)
+                    && !remove_note_if_unchanged(&marker.source, &hash)
                 {
-                    let _ = fs::remove_file(&marker.source);
+                    continue;
                 }
+                let _ = fs::remove_file(&marker_path);
                 continue;
             }
             Ok(false) => {}
@@ -405,18 +410,22 @@ pub async fn drain(
                     });
                     continue;
                 }
-                let _ = fs::remove_file(&marker_path);
-                // Session source files are redundant after ingest — the
-                // interned copy in sources/articles/, or the committed file
-                // a near-duplicate skip matched, is canonical in git.
-                if is_staged_session_note(vault, &marker.source) {
-                    let _ = fs::remove_file(&marker.source);
-                }
                 stored = None;
                 report.ingested += 1;
                 if ingest_report.redundant {
                     report.redundant_skips += 1;
                 }
+                // Session source files are redundant after ingest — the
+                // interned copy in sources/articles/, or the committed file
+                // a near-duplicate skip matched, is canonical in git. The
+                // ingest read the note before the LLM call; a note changed
+                // since keeps its marker, so the next drain handles it.
+                if is_staged_session_note(vault, &marker.source)
+                    && !remove_note_if_unchanged(&marker.source, &hash)
+                {
+                    continue;
+                }
+                let _ = fs::remove_file(&marker_path);
             }
             Err(e) => {
                 report.failures.push(DrainFailure {
@@ -696,6 +705,21 @@ fn is_staged_session_note(vault: &Vault, source: &Path) -> bool {
         .as_std_path()
         .canonicalize()
         .is_ok_and(|sessions| source.starts_with(sessions))
+}
+
+/// Deletes the note at `path` and returns true when it still holds UTF-8
+/// text with the canonical hash `hash`: the content the drain read before
+/// ingesting or matching it. A note changed since, or unreadable, is left
+/// in place and the result is false.
+fn remove_note_if_unchanged(path: &Path, hash: &str) -> bool {
+    let unchanged = fs::read(path)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .is_some_and(|text| canonical_hash(&text) == hash);
+    if unchanged {
+        let _ = fs::remove_file(path);
+    }
+    unchanged
 }
 
 /// True when HEAD's tree holds the vault-relative file `rel` with the same
@@ -1072,6 +1096,20 @@ mod tests {
         assert_ne!(canonical_hash("a\n\nb"), canonical_hash("a\nb"));
     }
 
+    #[test]
+    fn remove_note_if_unchanged_compares_canonical_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = canonical_hash("Session ID: a\nbody line\n");
+        let same = write_source(dir.path(), "same.md", "Session ID: b\nbody line\n");
+        assert!(remove_note_if_unchanged(&same, &hash));
+        assert!(!same.exists());
+        let changed = write_source(dir.path(), "changed.md", "Session ID: a\nnew line\n");
+        assert!(!remove_note_if_unchanged(&changed, &hash));
+        assert!(changed.exists());
+        let gone = dir.path().join("gone.md");
+        assert!(!remove_note_if_unchanged(&gone, &hash));
+    }
+
     fn write_marker_file(vault: &Vault, name: &str, marker: &QueueMarker) {
         let dir = vault.meta_dir().join(QUEUE_SUBDIR).into_std_path_buf();
         fs::create_dir_all(&dir).unwrap();
@@ -1125,6 +1163,11 @@ mod tests {
     }
 
     fn ingest_plan_mock() -> crate::llm::MockProvider {
+        crate::llm::MockProvider::constant(ingest_plan_json())
+    }
+
+    /// The plan [`ingest_plan_mock`] returns: one new page.
+    fn ingest_plan_json() -> String {
         use crate::llm::prompts::{IngestAction, IngestPageAction, IngestPlan};
         let plan = IngestPlan {
             summary: "drain dedup test".into(),
@@ -1140,7 +1183,7 @@ mod tests {
             log_entry: "drain ingest".into(),
             redundant: false,
         };
-        crate::llm::MockProvider::constant(serde_json::to_string(&plan).unwrap())
+        serde_json::to_string(&plan).unwrap()
     }
 
     #[tokio::test]
@@ -1441,6 +1484,44 @@ mod tests {
         assert_eq!((report.ingested, report.failures.len()), (0, 1));
         assert!(note.exists(), "HEAD does not hold the edited content");
         assert_eq!(list_queued(&vault).unwrap().len(), 1);
+    }
+
+    /// The ingest reads a note before the LLM call. A writer that replaces
+    /// the note meanwhile, such as a resumed session exporting it again,
+    /// leaves content git does not hold: the drain keeps the note and its
+    /// marker, and the next drain ingests the new content.
+    #[tokio::test]
+    async fn drain_keeps_session_note_changed_during_ingest() {
+        use crate::llm::{CompletionResponse, Usage};
+        let (dir, vault) = make_ingest_vault();
+        let sessions = dir.path().join("sources").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let cfg = || DrainConfig {
+            debounce: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let note = write_source(&sessions, "resumed.md", &long_body("first"));
+        enqueue(&vault, &note, None).unwrap();
+        let rewrite = note.clone();
+        let plan = ingest_plan_json();
+        let rewriting_provider = crate::llm::MockProvider::with_handler(move |_req| {
+            fs::write(&rewrite, long_body("second")).unwrap();
+            Ok(CompletionResponse {
+                text: plan.clone(),
+                usage: Usage::default(),
+                model: "mock-1".into(),
+            })
+        });
+
+        let report = drain(&vault, &rewriting_provider, cfg()).await.unwrap();
+        assert_eq!((report.ingested, report.failures.len()), (1, 0));
+        assert_eq!(fs::read_to_string(&note).unwrap(), long_body("second"));
+        assert_eq!(list_queued(&vault).unwrap().len(), 1);
+
+        let report = drain(&vault, &distinct_plan_mock(), cfg()).await.unwrap();
+        assert_eq!((report.ingested, report.failures.len()), (1, 0));
+        assert!(!note.exists(), "git holds the new content");
+        assert_eq!(list_queued(&vault).unwrap(), [] as [QueueMarker; 0]);
     }
 
     /// The hash store can name content whose only other copy is an
