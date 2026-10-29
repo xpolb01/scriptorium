@@ -64,7 +64,8 @@ pub struct DrainConfig {
     pub debounce: Duration,
     /// Cap on markers processed per drain run. `None` = unlimited.
     pub max_per_run: Option<usize>,
-    /// Skip ingest, just dedup-log.
+    /// Count what a drain would skip, and ingest or delete nothing: every
+    /// marker and note stays. See [`drain`].
     pub dry_run: bool,
 }
 
@@ -207,6 +208,10 @@ fn queue_dir_path(vault: &Vault) -> PathBuf {
 /// note one last time just before deleting it; a write that lands between
 /// that read and the delete is lost.
 ///
+/// A dry run (`cfg.dry_run`) counts what a drain would skip as young,
+/// missing or duplicate, and stops there: it ingests nothing, deletes no
+/// marker or note, and records no drain stats.
+///
 /// Errors short-circuit only on lock-acquisition or fatal IO; per-marker
 /// errors accumulate in `DrainFailure`.
 #[allow(clippy::too_many_lines)]
@@ -313,7 +318,9 @@ pub async fn drain(
 
         if !marker.source.exists() {
             report.skipped_missing += 1;
-            let _ = fs::remove_file(&marker_path);
+            if !cfg.dry_run {
+                let _ = fs::remove_file(&marker_path);
+            }
             continue;
         }
 
@@ -357,8 +364,8 @@ pub async fn drain(
         // A hash recorded after a near-duplicate skip has only a near-copy
         // in git. Such a note is ingested like a new one, so the gate or the
         // LLM settles it. A note changed since the drain read it keeps its
-        // marker. A dry run deletes no note.
-        let staged = !cfg.dry_run && is_staged_session_note(vault, &marker.source);
+        // marker. A dry run counts the duplicate and deletes nothing.
+        let staged = is_staged_session_note(vault, &marker.source);
         if recorded
             && (!staged
                 || stored
@@ -366,6 +373,9 @@ pub async fn drain(
                     .contains(&hash))
         {
             report.skipped_dup += 1;
+            if cfg.dry_run {
+                continue;
+            }
             if staged {
                 match remove_note_if_unchanged(&marker.source, &hash) {
                     Ok(true) => {}
@@ -387,8 +397,9 @@ pub async fn drain(
             continue;
         }
 
+        // A dry run ingests nothing and keeps the marker, so the next real
+        // drain still finds the note.
         if cfg.dry_run {
-            let _ = fs::remove_file(&marker_path);
             continue;
         }
 
@@ -481,7 +492,9 @@ pub async fn drain(
     }
 
     report.finished_at = Utc::now();
-    let _ = record_drain_stats(vault, &report);
+    if !cfg.dry_run {
+        let _ = record_drain_stats(vault, &report);
+    }
     Ok(report)
 }
 
@@ -1820,6 +1833,69 @@ mod tests {
         let report = drain(&vault, &ingest_plan_mock(), cfg(true)).await.unwrap();
         assert_eq!(report.skipped_dup, 1);
         assert!(again.exists(), "a dry run must not delete sources");
+    }
+
+    /// A dry run changes nothing on disk: every marker and note stays, and
+    /// no drain stats are recorded, so a real drain afterwards handles each
+    /// note. It counts a note as a duplicate only when a real drain would:
+    /// a staged note whose recorded hash has no stored copy is ingested.
+    #[tokio::test]
+    async fn drain_dry_run_keeps_every_marker() {
+        let (dir, vault) = make_ingest_vault();
+        let sessions = dir.path().join("sources").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let cfg = |dry_run| DrainConfig {
+            debounce: Duration::from_secs(0),
+            dry_run,
+            ..Default::default()
+        };
+        let first = write_source(&sessions, "first.md", &long_body("stored"));
+        enqueue(&vault, &first, None).unwrap();
+        let report = drain(&vault, &ingest_plan_mock(), cfg(false))
+            .await
+            .unwrap();
+        assert_eq!((report.ingested, report.failures.len()), (1, 0));
+        let stats_path = vault.meta_dir().join(DRAIN_STATS_FILE).into_std_path_buf();
+        let stats = fs::read_to_string(&stats_path).unwrap();
+
+        // A copy of the stored note, a new note, a note whose hash is
+        // recorded but not stored, and a marker whose note is gone.
+        let dup = write_source(&sessions, "dup.md", &long_body("stored"));
+        let new = write_source(&sessions, "new.md", &long_body("new"));
+        let unstored = write_source(&sessions, "unstored.md", &long_body("unstored"));
+        hash_store_append(&vault, &canonical_hash(&long_body("unstored"))).unwrap();
+        let gone = write_source(&sessions, "gone.md", &long_body("gone"));
+        for note in [&dup, &new, &unstored, &gone] {
+            enqueue(&vault, note, None).unwrap();
+        }
+        fs::remove_file(&gone).unwrap();
+        let counts = |r: &DrainReport| {
+            (
+                r.ingested,
+                r.skipped_dup,
+                r.skipped_missing,
+                r.failures.len(),
+            )
+        };
+
+        let report = drain(&vault, &distinct_plan_mock(), cfg(true))
+            .await
+            .unwrap();
+        assert_eq!(counts(&report), (0, 1, 1, 0));
+        assert_eq!(list_queued(&vault).unwrap().len(), 4);
+        assert!(dup.exists() && new.exists() && unstored.exists());
+        assert_eq!(
+            fs::read_to_string(&stats_path).unwrap(),
+            stats,
+            "no stats recorded"
+        );
+
+        let report = drain(&vault, &distinct_plan_mock(), cfg(false))
+            .await
+            .unwrap();
+        assert_eq!(counts(&report), (2, 1, 1, 0));
+        assert_eq!(list_queued(&vault).unwrap(), [] as [QueueMarker; 0]);
+        assert!(!dup.exists() && !new.exists() && !unstored.exists());
     }
 
     /// Within one run: a duplicate builds the stored-hash set, a new note
