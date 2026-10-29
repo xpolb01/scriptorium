@@ -562,78 +562,135 @@ arm.
 sequenceDiagram
     actor User
     participant CLI as scriptorium-cli
-    participant Core as core::ingest::ingest
-    participant Schema as schema::Schema
+    participant Core as core::ingest
     participant LLM as LlmProvider
     participant Tx as VaultTx
     participant Git
 
-    User->>CLI: scriptorium ingest path/to/foo.md
-    CLI->>Core: ingest(vault, provider, source_path)
-    Core->>Core: read file bytes
-    Core->>Core: intern_source() → sources/articles/<hash>-foo.md
-    Core->>Schema: Schema::load(vault).render(budget)
-    Schema-->>Core: rendered schema string
-    Core->>LLM: complete(ingest_prompt(schema, label, text))
-    LLM-->>Core: JSON text
-    Core->>Core: parse as IngestPlan
-    Core->>Core: vault.scan() for existing pages
-    loop each IngestPageAction
-        Core->>Tx: write_page(new or updated Page)
+    User->>CLI: scriptorium ingest [--dry-run] [--force] foo.md
+    CLI->>Core: ingest_with_options(vault, provider, path, options)
+    Core->>Core: read bytes, extract text
+    alt near-copy of an interned source, no --force
+        Core-->>CLI: IngestReport { commit_id: "skipped-near-duplicate" }
+    else new source
+        Core->>Core: intern into sources/ (a dry run only works out the path)
+        Core->>Core: load schema, pick related pages
+        Core->>LLM: complete(ingest_prompt(schema, pages, text))
+        LLM-->>Core: IngestPlan JSON
+        Core->>Core: clean up the plan (empty bodies, links, stems)
+        Core->>Tx: write_page per action, append log.md, put index.md
+        alt --dry-run
+            Core-->>CLI: IngestReport { commit_id: "dry-run", dry_run_diff }
+        else real run
+            Core->>Tx: commit("[ingest] summary")
+            Tx->>Tx: take vault.lock, validate, fsync
+            Tx->>Git: commit_paths
+            Git-->>Tx: commit id
+            Tx-->>Core: commit id
+            Core-->>CLI: IngestReport { commit_id, created, updated }
+        end
     end
-    Core->>Tx: append("log.md", "## [DATE] ingest | summary")
-    Core->>Tx: commit("[ingest] summary")
-    Tx->>Tx: validate() — mechanical lint
-    Tx->>Tx: acquire vault.lock
-    Tx->>Tx: fsync each staged file
-    Tx->>Git: commit_paths
-    Git-->>Tx: commit id
-    Tx-->>Core: commit id
-    Core-->>CLI: IngestReport { source, commit_id, created, updated, summary }
     CLI-->>User: "ingest: 2 created, 0 updated, commit abc123..."
 ```
 
 **Steps in detail** (see
 [`crates/scriptorium-core/src/ingest.rs`](../crates/scriptorium-core/src/ingest.rs)):
 
-1. **Read** the source file as UTF-8 bytes. Non-UTF-8 is rejected (v1 ingest
-   is `.md` / `.txt` only; binary formats are deferred).
-2. **Intern** the source into `sources/<category>/<hash_prefix>-<slug>.<ext>`.
-   If a file with that content hash already exists in the vault, no copy is
-   made — the reference is reused. Slugification lowercases and replaces
-   non-alphanumeric runs with dashes; category comes from the extension
-   (`md`/`txt` → `articles`, `pdf` → `pdfs`, `html` → `web`, else `data`).
-3. **Load the schema.** `Schema::load` reads `CLAUDE.md` from the vault root,
-   falling back to `AGENTS.md`, falling back to an empty schema.
-4. **Render** the schema under a token budget
-   (`provider.context_window() / 4`). For a typical 200k-token window, ~50k
-   tokens are reserved for the schema; the rest goes to source text,
-   retrieved pages, and the response.
-5. **Build the prompt.** `llm::prompts::ingest_prompt` produces a
-   `CompletionRequest` with the rendered schema as the system prompt, the
-   source text in the user message, and `IngestPlan::schema()` as the
-   response-schema hint.
-6. **Call the LLM.** The provider returns JSON text; we parse it as
-   `IngestPlan { summary, pages, log_entry }`.
-7. **Translate to a `VaultTx`.** For each `IngestPageAction`:
-   - On **create**, build a fresh `Frontmatter` (new ULID, now, now, tags,
-     sources = [interned_path]).
-   - On **update**, clone the existing page, update the `updated` timestamp,
-     replace tags and body, append the source to the sources list if not
-     already present. **The `id` and `created` fields are preserved.**
-   - Call `tx.write_page(&page)`.
-8. **Log** — append `## [YYYY-MM-DD] ingest | <summary>` and the LLM's
-   `log_entry` to `log.md`. Appends accumulate if you call them multiple
-   times in the same transaction.
-9. **Commit** with the message `[ingest] <summary>`. If validation fails
-   (e.g. the LLM's plan introduces a broken wikilink), the commit aborts
-   and `ingest()` returns an error. Nothing landed on disk.
-
-**Retrieval is not in v1 ingest.** The plan reserves a spot for passing
-"relevant existing pages" into the prompt, but v1 passes an empty slice.
-That means the LLM writes pages blind to what's already in the vault; you
-get duplicates until `reindex` + a smarter retrieval lands. The query flow
-does retrieval properly; ingest will grow into it in a later pass.
+1. **Read and extract.** Read the source bytes and extract the text with
+   `extract::extract_source_text`: markdown and plain text as UTF-8; HTML,
+   PDF and Office formats through a converter (see
+   [Source formats](../README.md#source-formats)).
+2. **Near-duplicate gate.** Unless `force` is set, a source of 40 words or
+   more is compared with every interned source: the files in
+   `sources/{articles,pdfs,web,data}/` whose names start with a
+   12-character hex hash and `-`, up to 512 KiB, that read as UTF-8 (a PDF
+   itself is skipped; its `.extracted.md` sibling is compared). At a
+   shingle Jaccard similarity of 0.92 or more, ingest stops before the LLM
+   call and writes nothing. It returns `commit_id = "skipped-near-duplicate"`
+   and `redundant = true`, with a summary that names the match. Dry runs
+   run the gate too. Other files under `sources/`, such as session notes in
+   `sources/sessions/` or files dropped in by hand, are not compared.
+3. **Intern.** The source's path is
+   `sources/<category>/<hash12>-<slug>.<ext>`: the first 12 hex characters
+   of its SHA-256, then its file name as a slug (lowercase, other
+   characters collapsed to `-`, non-ASCII letters kept, at most 64
+   characters). The category comes from the extension:
+   `md`/`markdown`/`txt`/`text` → `articles`, `pdf` → `pdfs`,
+   `html`/`htm` → `web`, anything else → `data`. The file is written only
+   if nothing exists at that path yet. If this run wrote it and the ingest
+   fails later, before its commit, the file is deleted again; a write that
+   itself fails part-way is not cleaned up. A dry run only works out the
+   path.
+4. **Load the schema.** `Schema::load` reads `CLAUDE.md` from the vault
+   root, falling back to `AGENTS.md`, then to an empty schema. It is
+   rendered within a quarter of the provider's context window
+   (`provider.context_window() / 4`): for a 200k-token window, about 50k
+   tokens. The rest goes to the source text, related pages and the reply.
+5. **Pick related pages.** Up to `MAX_RELEVANT_PAGES` (10) existing pages
+   go into the prompt: pages whose title or file stem appears in the source
+   text, merged with the nearest pages by embeddings when the caller passes
+   an embeddings store. Only `social facebook` passes one today; `ingest`,
+   `bulk-ingest`, `watch`, the MCP `scriptorium_ingest` tool and the queue
+   drain use the title match alone. The prompt also lists every `wiki/`
+   page path, so the model knows which `[[wikilinks]]` resolve.
+6. **`pre_ingest` hook.** When hooks are passed in, the `pre_ingest` hook
+   runs and can abort the ingest. Only the CLI `ingest` command passes them
+   (the vault's configured hooks), on dry runs too. See
+   [§3.21](#321-lifecycle-hooks).
+7. **Call the LLM.** `llm::prompts::ingest_prompt` puts the rendered schema
+   in the system prompt and the source text in the user message, with
+   `IngestPlan::schema()` as the response-schema hint. The reply is parsed
+   leniently into an `IngestPlan`: a summary, page actions, a log entry and
+   a `redundant` flag. If it can't be parsed, the prompt and the reply are
+   saved to `<vault>/.ingest-failures/<timestamp>-<stem>.json`, a learning
+   is recorded, and the ingest fails.
+8. **Redundant source.** If the plan marks the source redundant (with no
+   page actions), a real run commits only the source and a
+   `[skip] redundant — <path>` line in `log.md`, as `[ingest:skip] <path>`.
+   A dry run returns that change set as a preview instead.
+9. **Clean up the plan.**
+   - A page action with an empty body that would create a new page is
+     dropped.
+   - Wikilinks are normalized. A link whose target matches no existing page
+     and no page in the plan, ignoring case, is unlinked: `[[ghost]]`
+     becomes `ghost`, and `[[ghost|label]]` becomes `label`. A link that
+     matches a page only in a different case (`[[Target]]` for
+     `target.md`) is kept, and fails validation at commit (step 12).
+   - Paths must start with `wiki/`, end in `.md` and contain no `..`. A
+     create whose stem matches exactly one existing page becomes an update
+     of that page. An update of a missing path is retargeted to the one page
+     with that stem, or creates a new page when no page has it. A stem that
+     matches two or more existing pages, or two writes to the same stem in
+     one plan, fails the ingest.
+10. **Translate to a `VaultTx`.** The source is staged at its interned
+    path, so it lands in the same commit as the pages that cite it. A
+    converted source stages its extracted text as a `<path>.extracted.md`
+    sibling instead, plus the raw file when that is valid UTF-8 (HTML). A
+    binary raw file (PDF, Office, EPUB) is never staged: it stays in
+    `sources/` untracked.
+    Then, for each page action:
+    - On **create**, build a fresh `Frontmatter` (new ULID, now, now, tags,
+      `sources = [interned path]`).
+    - On **update**, clone the existing page, set `updated` to now, replace
+      the tags and the body (an empty body keeps the current one), and
+      append the source to `sources` if it is not there yet. **The `id` and
+      `created` fields are preserved.**
+    - Record the action's `source_quote` under `source_quotes`, and its
+      `supersedes` list. Each page it supersedes gets a `superseded_by`
+      marker, unless the plan writes that page too: then the plan's
+      version is written as is, without the marker.
+11. **Log and index.** Append `## [YYYY-MM-DD] ingest | <summary>` and the
+    plan's log entry to `log.md`, and regenerate `index.md` if it changed.
+12. **Commit.** A dry run returns `tx.diff()` with `commit_id = "dry-run"`
+    and drops the transaction ([§9.2](#92-dry-runs)). A real run commits
+    as `[ingest] <summary>`
+    ([§3.4](#34-vaulttx--the-mutation-pipeline)). Validation runs under
+    the vault lock over the whole vault with the staged writes overlaid,
+    so an error-level lint issue anywhere, such as a broken link in a page
+    edited by hand, aborts the commit and nothing is written.
+    After the commit the `post_ingest` hook runs, and the CLI and the MCP
+    tool refresh the embeddings store (`embed::reindex`, which skips
+    unchanged chunks), so the new pages are searchable at once.
 
 ### 3.6 Query flow
 
@@ -1069,11 +1126,38 @@ be triggered by cron, Claude Code hooks, or the MCP tool.
 
 ### 3.17 Bulk ingest
 
-[`bulk_ingest`](../crates/scriptorium-core/src/bulk_ingest.rs) processes
-an entire directory of source files with checkpoint resume. A checkpoint
-file tracks which files have been successfully ingested; interrupted
-imports pick up where they left off. Progress is reported via `indicatif`
-progress bars in the CLI.
+[`bulk_ingest`](../crates/scriptorium-core/src/bulk_ingest.rs) ingests
+every eligible file in a directory, with one ingest ([§3.5](#35-ingest-flow))
+and one commit per file. A file whose ingest fails is reported and the
+run goes on. A file that can't be read for the already-interned check
+below stops the whole run instead, before the final checkpoint save.
+
+- **Eligible files** are `md`, `markdown`, `txt`, `text`, `feature`,
+  `html`, `htm`, `pdf`, `docx`, `pptx`, `xlsx` and `epub` files up to
+  5 MB, found by a recursive walk with the `ignore` crate's default
+  filters. Hidden files, paths matched by `.ignore` files and, inside a
+  git repository, git-ignored paths are left out, and a directory the
+  walk can't read is skipped without an error. Neither shows in the
+  report, so check the discovered count against what you expect.
+- **Skipped files.** A file whose content hash prefix already names a file
+  under `sources/` counts as already interned. A file listed in this
+  directory's checkpoint is skipped too.
+- **No `--force`, no hooks.** Each file is ingested with `force: false`
+  and without hooks, so the near-duplicate gate applies. A near-copy is
+  skipped without an LLM call and still counts as ingested.
+- **Checkpoint.** `.scriptorium/bulk-ingest-checkpoint.json` lists the
+  files processed from the directory and is saved every 10 files. A real
+  run with no failures deletes it at the end; any other run saves it, so
+  an interrupted or partly failed import resumes where it stopped.
+  `--fresh` deletes it before the run.
+- **Dry runs.** `--dry-run` ingests each file as a dry run, so nothing
+  lands in `sources/`, `wiki/` or git. It still saves the checkpoint,
+  though, so a real run of the same directory afterwards skips every file
+  the dry run listed. Pass `--fresh` to that run.
+
+The CLI prints `[n/total] path` per file, then a report with the counts:
+discovered, skipped (checkpoint), skipped (already interned), ingested
+and failed.
 
 ### 3.18 Social media import
 
@@ -1214,13 +1298,12 @@ provider swaps, or embedding model upgrades.
 
 ## 5. Testing
 
-307 tests across three layers, zero clippy warnings, zero fmt diffs.
+Every test in the default run is offline: no network, no API keys.
 
-**Unit tests** (~280 in `scriptorium-core`, ~15 in `scriptorium-mcp`):
-inline with each module under `#[cfg(test)] mod tests`. Every meaningful
-struct has at least one test; the wikilink parser, link graph, patch apply
-logic, embeddings store, hybrid search fusion, dedup, learnings, and hooks
-each have comprehensive coverage.
+**Unit tests**: inline with each module under `#[cfg(test)] mod tests`.
+Every meaningful struct has at least one test; the wikilink parser, link
+graph, patch apply logic, embeddings store, hybrid search fusion, dedup,
+learnings, and hooks each have comprehensive coverage.
 
 **Property tests** (in `page.rs`): `proptest` generates random
 `Frontmatter` / body pairs and asserts `Page::parse(page.to_markdown()) ==
@@ -1228,27 +1311,41 @@ page` for any normalized page. This is the invariant that lets round-trips
 stay stable through gray_matter's whitespace handling.
 
 **End-to-end tests** (in
-[`crates/scriptorium-core/tests/e2e.rs`](../crates/scriptorium-core/tests/e2e.rs)):
-run against a fixture vault at
+[`crates/scriptorium-core/tests/e2e.rs`](../crates/scriptorium-core/tests/e2e.rs)).
+The read-only tests run against a fixture vault at
 `crates/scriptorium-core/tests/fixtures/sample-vault/` containing 4 wiki
 pages (`transformers`, `attention`, `bert`, `orphan-note`), one deliberate
 broken link (from `transformers` → `does-not-exist`), and one orphan page
-(`orphan-note`). The e2e tests exercise:
+(`orphan-note`). Tests that write get a fresh temporary vault. The e2e
+tests exercise:
 
 - `scan` on the fixture vault, asserting the expected page set
 - `LinkGraph` construction, asserting backlinks + broken + orphan counts
 - `lint::run` end-to-end, asserting the exact issue set
-- Mock-driven ingest: create a new page, update an existing page, and
-  abort-on-broken-link (the LLM proposes a page that would introduce a
-  broken wikilink → commit aborts)
+- Mock-driven ingest: create a page, update one (keeping its `id`), unlink
+  plan links that resolve to nothing instead of aborting, handle empty
+  bodies, salvage a missing log entry, and save a failure record when the
+  reply can't be parsed
+- Dry runs that write nothing, followed by a real ingest or bulk ingest of
+  the same files; the near-duplicate gate
+- The ingest queue (enqueue, dedup, drain) and the embeddings refresh after
+  an ingest
 - Mock-driven query: retrieve + citation validation (including the case
   where the LLM hallucinates a citation and the pipeline strips it)
 - The mock provider's round-trip through a structured-response fixture
 
+**Retrieval eval** (in
+[`crates/scriptorium-core/tests/retrieval_eval.rs`](../crates/scriptorium-core/tests/retrieval_eval.rs)):
+runs the code behind `scriptorium bench` on a synthetic multi-hop vault
+with frozen embedding vectors, and fails when any case's rank differs
+from the committed `baseline.json`. Its doc comment explains how to
+update the baseline or re-record the vectors.
+
 **Live provider tests** (in `tests/live_claude.rs` and
-`tests/live_gemini.rs`): integration tests that hit real APIs. Gated behind
-API key environment variables — they run in CI when keys are available and
-are skipped locally otherwise.
+`tests/live_gemini.rs`): integration tests that hit the real APIs. They
+are `#[ignore]`d, so neither `cargo test` nor CI runs them. Run one by
+hand with `cargo test -p scriptorium-core --test live_claude -- --ignored`;
+it skips itself when the provider's API key is not set.
 
 **All default tests use `MockProvider`.** No network, no API keys, no
 flakiness. `EmbeddingsStore::in_memory()` gives the mock-driven tests their
@@ -1256,14 +1353,33 @@ own temporary SQLite DB. The mock provider replays canned fixtures, produces
 deterministic SHA-256-derived embedding vectors, and does not enforce
 response schemas — tests supply valid JSON fixtures directly.
 
-**Commands**:
+**Gates.** Run these from the repository root before you push:
 
 ```sh
-cargo test --workspace                                  # 307 tests, <2s
-cargo clippy --workspace --all-targets -- -D warnings   # zero warnings
-cargo fmt --check                                       # zero diffs
+cargo fmt --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo +1.94.1 check --locked --workspace --all-targets   # rust-version
 cargo doc --workspace --no-deps --document-private-items
 ```
+
+- **CI runs none of them.** GitHub Actions has two workflows:
+  `retrieval-eval.yml` runs the retrieval eval when the core crate, the
+  lockfile or the toolchain changes, and `ontology.yml` runs the ontology
+  crate's own gates. Clippy, fmt and the rest of the tests for the root
+  workspace run only on your machine.
+- **New stable, new lints.** `rust-toolchain.toml` follows the `stable`
+  channel and `[workspace.lints.clippy]` turns on `pedantic`, so a new
+  Rust release can fail the clippy gate on code that has not changed.
+  So far each one was handled by fixing the code, with no new `#[allow]`s
+  or `[workspace.lints]` changes; see
+  [#35](https://github.com/xpolb01/scriptorium/pull/35) for Rust 1.99.
+- **`rust-version` is 1.94.** The `cargo +1.94.1 check` line keeps the
+  code building on it.
+- **The ontology is a separate workspace.**
+  `crates/scriptorium-ontology` is excluded from the root workspace and
+  has its own `Cargo.lock`, so the commands above skip it. Its gates are
+  in [ONTOLOGY.md](ONTOLOGY.md#tests).
 
 ---
 
@@ -1297,12 +1413,13 @@ These were explicitly listed as "deferred" in v1 and are now implemented:
   with macOS Keychain storage. See [§3.20](#320-setup-wizard-and-keychain-integration).
 - **Lifecycle hooks** — configurable shell commands at pipeline events.
   See [§3.21](#321-lifecycle-hooks).
+- **PDF, Office and HTML sources** — PDFs through `pdftotext`, or the
+  `docling` CLI when `pdftotext` is missing or fails; docx/pptx/xlsx/epub
+  through `docling`; local HTML through Readability. See
+  [Source formats](../README.md#source-formats).
 
 ### Still deferred
 
-- **PDF source ingestion.** `ingest` reads via `String::from_utf8`, so
-  binary PDFs fail. Adding PDF support means wiring in a text extractor
-  (and acknowledging that scanned PDFs will need OCR).
 - **HTTP / SSE MCP transport.** The server is stdio only. Remote access
   would need `axum` + auth tokens.
 - **LLM-assisted lint rules.** `stale` (outdated claims) and
@@ -1465,7 +1582,10 @@ safety net is the provider trait's `max_attempts` + per-call timeout
 (`retry.rs`), which bounds a single stuck call to ~360 seconds. For
 longer-running operations (`reindex`, `watch`), hit Ctrl-C — the worker
 drops mid-call, no partial commit gets left behind because all writes go
-through `VaultTx::commit`.
+through `VaultTx::commit`. A real ingest stopped this way after it
+interned its source can leave that copy untracked in `sources/`, where
+the next ingest of the file can skip it as a near-duplicate; see
+[§9.3](#93-troubleshooting).
 
 ### 9.2 Dry runs
 
@@ -1485,28 +1605,44 @@ shows the change set:
 ingest DRY RUN: would create 5 page(s), update 0 — nothing written.
          summary: Architecture overview of Health Hub...
          diff:
+           Update index.md (3120 bytes)
+           Append log.md (412 bytes)
+           Create sources/articles/1f3a9c0b2e7d-big-source.md (18233 bytes)
            Create wiki/entities/health-hub.md (2134 bytes)
            Create wiki/entities/hono-api-server.md (981 bytes)
            ...
 ```
 
-**Two things to know about dry runs:**
+**What to know about dry runs:**
 
 - Nothing lands in `sources/`, `wiki/`, `log.md` or git, also when the
   plan judges the source redundant. The preview names the path the source
-  will be interned at, so its `sources:` frontmatter is accurate. A copy
-  left in `sources/` would make the real ingest that follows skip the file
-  as a near-duplicate of itself.
+  will be interned at, so its `sources:` frontmatter is accurate. To
+  ingest for real, run the same command without `--dry-run`; it needs no
+  `--force`.
+- The near-duplicate gate runs first, dry run or not. For a near-copy of
+  an interned source the output says `would create 0 page(s), update 0`,
+  the summary reads `skipped: near-duplicate of <path> (similarity …)`,
+  and no LLM call is made. Add `--force` to preview or ingest it anyway.
 - The LLM call *does* happen and *does* cost money. `--dry-run` is a
   "don't commit" flag, not a "don't call the LLM" flag. The usage.jsonl
-  line is still written.
+  line is still written, and a reply that can't be parsed still leaves a
+  record in `.ingest-failures/`.
+- The CLI still runs the `pre_ingest` hook, which can have side effects
+  of its own.
+- `bulk-ingest --dry-run` writes no pages either, but it saves the
+  checkpoint ([§3.17](#317-bulk-ingest)), so pass `--fresh` to the real
+  run that follows.
 
 ### 9.3 Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `llm ingest returned invalid IngestPlan json: ...` | The LLM returned non-JSON or JSON that doesn't match the `IngestPlan` shape. Rare with Claude/OpenAI strict-mode, more common with Ollama or Gemini JSON mode. | Inspect the `raw = ...` error message to see what came back. Usually means your schema (in `CLAUDE.md`) is confusing the model; tighten the rules. |
-| `vault tx validation failed: broken_link: broken wikilink [[foo]]` | The LLM generated a wikilink to a page that doesn't exist in the vault. Usually happens on first ingest when the model invents cross-references. | Your retrieval isn't surfacing the target. Check if there's an existing page with a close title — the title-match retrieval is cheap but imperfect. Re-run and see if the model self-corrects, or manually create the missing page. |
+| `llm ingest returned invalid IngestPlan json: ...` | The LLM returned non-JSON or JSON that doesn't match the `IngestPlan` shape. Rare with Claude/OpenAI strict-mode, more common with Ollama or Gemini JSON mode. | Open the newest file in `<vault>/.ingest-failures/`: it holds the raw reply, the parse error and the prompt. Usually means your schema (in `CLAUDE.md`) is confusing the model; tighten the rules. |
+| `vault tx validation failed: broken_link: ...` | A page links to a page that doesn't exist. Validation covers the whole vault with the staged writes overlaid, so the link can be in a page you edited by hand, not in this write. During an ingest it can also come from the plan: ingest unlinks targets that match no page in any case, but keeps a link that differs from the page's file name only in case (`[[Target]]` for `target.md`), and links resolve case-sensitively. | Run `scriptorium lint`. It checks the vault on disk, so a link it reports is in an existing page: create the target or remove the brackets, commit, and retry. If lint is clean, the link came from the plan; re-run the ingest. |
+| `ingest: 0 created, 0 updated, commit skipped-near-duplicate`, summary `skipped: near-duplicate of sources/...` | The source is a near-copy (similarity 0.92 or more) of a file interned under `sources/`. If `git status sources/` shows that file as untracked, it is either the copy of an ingest still running (an ingest writes its copy before the LLM call and commits it at the end) or a leftover: from an ingest stopped before its commit, from a copy whose write failed part-way, or from a dry run on a build before [#34](https://github.com/xpolb01/scriptorium/pull/34), which copied the source and left it there. | If it really is a copy, nothing to do. Otherwise re-run with `--force`. Once no other ingest is running (CLI, `watch`, the MCP server or the drain job), an untracked match is a leftover. Move it out of `sources/` so it stops matching, but don't delete it: it can be the only copy, because the drain deletes a session note after skipping it as a near-duplicate. Then ingest the moved file; if its content is already in the vault, the gate skips it. |
+| `bulk-ingest` ingests nothing; the report counts every file under `Skipped (checkpoint)` | A checkpoint from an earlier run of the same directory lists them, for example one from `bulk-ingest --dry-run`. | Re-run with `--fresh`. |
+| `bulk-ingest` counts a file you never ingested under `Skipped (already interned)` | A file under `sources/` already starts with that file's hash prefix: the same content was ingested before, possibly under another name, or an earlier ingest of it left an uncommitted copy (see the near-duplicate row). `--fresh` does not bypass this check. | From the vault root, run `find sources -name '<prefix>*'`, where `<prefix>` is the first 12 characters of `shasum -a 256 FILE`. If `git ls-files` lists one of the matches, the content is in the vault; for a PDF, Office or EPUB file that is its `.extracted.md` sibling, since scriptorium never commits the raw file. To ingest it again anyway, run `scriptorium ingest --force FILE`. If none of the matches is tracked and no other ingest is running, they are leftovers: move them out of `sources/` and re-run. |
 | `gemini returned 429: ... limit: 0` | Your Google project has Gemini API quota of zero (free tier is disabled or not enabled). | Enable the Generative Language API in the Google Cloud Console and attach a billing account, or switch to a different provider. |
 | `SCRIPTORIUM_ANTHROPIC_API_KEY env var is not set` | No API key in the process environment. | `export SCRIPTORIUM_ANTHROPIC_API_KEY=sk-ant-...` or put it in your shell profile, or store it in the macOS Keychain under the `scriptorium-anthropic` service. |
 | `vault tx validation failed: frontmatter.duplicate_id` | Two pages ended up with the same ULID, usually from a bad edit or a merge. | Manually change one of the `id:` fields. Regenerating a ULID via `uuidgen` won't work — use [a ULID generator](https://github.com/ulid/spec) or crib one from the test fixture. |

@@ -167,10 +167,14 @@ enum Command {
         /// Override the model declared in config (e.g. "claude-sonnet-4-6").
         #[arg(long)]
         model: Option<String>,
-        /// Start fresh, ignoring any existing checkpoint.
+        /// Start fresh: delete the checkpoint first, so the files it lists
+        /// are no longer skipped. Needed after a `--dry-run` of the same
+        /// directory.
         #[arg(long)]
         fresh: bool,
-        /// Dry run: report what would be ingested without committing.
+        /// Dry run: run each file as `ingest --dry-run` and report, without
+        /// writing pages or committing. The checkpoint is still saved, so
+        /// pass `--fresh` to the real run that follows.
         #[arg(long)]
         dry_run: bool,
     },

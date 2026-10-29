@@ -210,8 +210,12 @@ operations; post-hooks are fire-and-forget. Configured in
 |---------|-------------|
 | `init [PATH]` | Scaffold a fresh vault with templates + `git init` |
 | `setup` | Interactive wizard: providers, API keys (macOS Keychain), config |
-| `ingest <SOURCE>` | Ingest a local file or `--url` into the vault (`--force` skips the near-duplicate gate) |
-| `bulk-ingest <DIR>` | Batch ingest a directory with checkpoint resume |
+| `ingest <SOURCE>` | Ingest a local file or `--url` into the vault (`--dry-run` previews the change set without touching `sources/`, `wiki/` or git; `--force` skips the near-duplicate gate) |
+| `bulk-ingest <DIR>` | Ingest every eligible file in a directory, one commit per file, resuming from a checkpoint (`--fresh` discards it; `--dry-run` writes no pages but still saves it) |
+| `ingest-enqueue <SOURCE>` | Queue a source for a later drain, without calling the LLM |
+| `ingest-drain` | Dedup the queue, then ingest the remaining sources one at a time |
+| `ingest-queue --list\|--stats\|--clear` | Inspect or clear the ingest queue |
+| `drain install\|uninstall\|status` | Manage the launchd job that drains the queue every 60s (`--vault PATH`, not `-C`) |
 | `query <QUESTION>` | Ask a question with hybrid retrieval and citations |
 | `reindex [--rebuild]` | Rebuild the embeddings store (idempotent; `--rebuild` drops cached rows first) |
 | `lint [--fix]` | Run mechanical integrity checks, optionally auto-fix |
@@ -230,18 +234,30 @@ operations; post-hooks are fire-and-forget. Configured in
 | `learn list\|search\|add\|prune` | Manage the self-learning journal |
 | `social facebook` | Import Facebook data exports |
 | `vault list\|add\|remove\|default\|show` | Multi-vault registry |
+| `hooks <SUBCOMMAND>` | Claude Code hook telemetry: record events in SQLite, check and list hook registrations |
+| `log emit\|tail`, `trace <SUBCOMMAND>` | Write and read the OTel-shaped log and span store |
+
+Commands that work on a vault use `-C PATH` when it is given, else the
+current directory when it is a vault, else the registered default vault
+(`vault default`). `drain install` and `drain status` ignore `-C`: pass
+`--vault PATH` (default `~/scriptorium-vault`). Commands that call a model
+accept `--provider` to override the configured one.
 
 ## Source formats
 
 Ingest routes each source through the best available extractor: markdown
 and text natively; local HTML through the same Readability engine as URL
-ingest; **PDF via `pdftotext`** (poppler) when installed, falling back to
-the **`docling` CLI** (which also unlocks docx/pptx/xlsx/epub and OCR for
-scanned documents). External converters are feature-detected
-subprocesses — the scriptorium binary stays pure Rust. Raw bytes are
-interned unchanged under `sources/`; converted binaries additionally get
-a git-tracked `<source>.extracted.md` sibling used for audits and quote
-verification.
+ingest; **PDF via `pdftotext`** (poppler) when installed, or the
+**`docling` CLI** when `pdftotext` is missing or fails; docx/pptx/xlsx/epub
+via `docling`. Scanned PDFs need `docling`'s OCR, which runs only when
+`pdftotext` is not installed: a PDF that `pdftotext` reads as empty is
+rejected, even with `docling` installed. External converters are
+feature-detected subprocesses — the scriptorium binary stays pure Rust.
+Raw bytes are interned unchanged under `sources/`. Converted sources also
+get a `<source>.extracted.md` sibling, used for audits and quote
+verification. Git tracks the sibling, and the raw file when it is text
+(markdown, plain text, HTML); a raw PDF, Office or EPUB file stays in
+`sources/` untracked.
 
 ## Retrieval quality & evaluation
 
@@ -268,18 +284,24 @@ still appear in the source file), `supersedes` / `superseded_by`
 (`supports` / `contradicts` / `supersedes` / `part_of` / `see_also`).
 The ingest curator fills `source_quote` and `supersedes` automatically.
 
-Every command accepts `-C PATH` to target a vault other than `.`, and
-`--provider` to override the configured LLM.
-
 ## Build, test, check
 
 ```sh
 cargo build --workspace
-cargo test  --workspace                                 # 307 tests, <2s
-cargo clippy --workspace --all-targets -- -D warnings   # zero warnings
-cargo fmt --check                                       # zero diffs
+cargo fmt --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo +1.94.1 check --locked --workspace --all-targets   # rust-version
 cargo doc --workspace --no-deps --document-private-items
 ```
+
+CI does not run these for the root workspace (it runs only the retrieval
+eval and the ontology crate's gates), so run them before you push. The
+toolchain follows `stable`, and a new Rust release can add clippy lints
+that fail on unchanged code. `crates/scriptorium-ontology` is a separate
+workspace with its own gates; see
+[`docs/ONTOLOGY.md`](docs/ONTOLOGY.md#tests). More in
+[ARCHITECTURE §5](docs/ARCHITECTURE.md#5-testing).
 
 ## Further reading
 
@@ -291,7 +313,7 @@ cargo doc --workspace --no-deps --document-private-items
   shipped with `scriptorium init`. This is the contract between you and
   the LLM: page conventions, tag vocabulary, what it must never do.
 - **[`crates/scriptorium-core/tests/e2e.rs`](crates/scriptorium-core/tests/e2e.rs)** —
-  the full pipeline under a mock LLM in under 100ms.
+  the full pipeline under a mock LLM, with no network or API keys.
 
 ## License
 

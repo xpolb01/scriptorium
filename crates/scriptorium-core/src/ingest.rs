@@ -5,7 +5,13 @@
 //! tests under `tests/e2e.rs` using a [`MockProvider`](crate::llm::MockProvider).
 //!
 //! ```text
-//! source.md  ──►  read + hash + intern into sources/
+//! source  ──►  read + extract text
+//!                 │
+//!                 ▼
+//!          near-duplicate gate  ──►  near-copy: skip, nothing written
+//!                 │
+//!                 ▼
+//!          intern into sources/  (a dry run only works out the path)
 //!                 │
 //!                 ▼
 //!     Schema::render()  ──►  ingest_prompt()  ──►  LLM.complete()
@@ -16,19 +22,20 @@
 //!      for each page action:  vault.begin() → write_page()
 //!                              │
 //!                              ▼
-//!                        log.md append
+//!                  log.md append, index.md refresh
 //!                              │
 //!                              ▼
 //!                       tx.commit()  ──►  git commit id
+//!                       (a dry run returns tx.diff() instead)
 //! ```
 //!
 //! Retrieval of "relevant existing pages" uses a title-match heuristic by
 //! default: pages whose title or filename stem appear as case-insensitive
 //! substrings of the source text are passed into the prompt so the LLM can
-//! prefer updating an existing page over creating a near-duplicate. The
-//! match is capped at [`MAX_RELEVANT_PAGES`] to keep the prompt under
-//! budget. Embeddings-based retrieval is the natural upgrade once query
-//! infrastructure is proven to scale.
+//! prefer updating an existing page over creating a near-duplicate.
+//! [`ingest_with_retrieval`] also merges in the nearest pages by
+//! embeddings when it is given an embeddings store. The list is capped at
+//! [`MAX_RELEVANT_PAGES`] to keep the prompt under budget.
 
 use std::fs;
 use std::path::Path;
@@ -55,33 +62,39 @@ pub const MAX_RELEVANT_PAGES: usize = 10;
 #[derive(Debug, Clone)]
 pub struct IngestReport {
     /// Vault-relative path where the source was interned (on a dry run,
-    /// where it would be).
+    /// where it would be). When the near-duplicate gate skipped the
+    /// source, the interned source it matched.
     pub source: Utf8PathBuf,
-    /// The git commit id (40-char hex) created for this ingest, or the
-    /// string `"dry-run"` if this was a dry-run that did not commit.
+    /// The git commit id (40-char hex) created for this ingest, the string
+    /// `"dry-run"` if this was a dry run that did not commit, or
+    /// `"skipped-near-duplicate"` if the near-duplicate gate skipped the
+    /// source before the LLM call and nothing was written.
     pub commit_id: String,
     /// Number of new wiki pages created (or that would have been created).
     pub created: usize,
     /// Number of existing wiki pages updated (or that would have been).
     pub updated: usize,
-    /// One-line `summary` field returned by the LLM.
+    /// One-line `summary` field returned by the LLM, or the skip message
+    /// naming the match when the near-duplicate gate skipped the source.
     pub summary: String,
     /// Preview of the change set if this was a dry run. Empty on a real
     /// commit.
     pub dry_run_diff: Vec<crate::vault::ChangeSummary>,
-    /// True if the LLM judged the source redundant relative to existing
-    /// pages. The source was archived and a `[skip] redundant` log line
-    /// added, but no wiki pages were created or updated.
+    /// True if no wiki pages were created or updated because the source
+    /// adds nothing new. Either the near-duplicate gate skipped it
+    /// (nothing written), or the LLM judged it redundant relative to
+    /// existing pages: a real run then commits the source and a
+    /// `[skip] redundant` log line, and a dry run previews that.
     pub redundant: bool,
 }
 
 /// Run the full ingest pipeline for a single source file.
 ///
 /// The source is interned into `sources/<category>/<hash_prefix>-<slug>.<ext>`
-/// (copied if it is not already inside the vault). The LLM's `IngestPlan` is
-/// translated into a [`VaultTx`](crate::vault::VaultTx) containing one
-/// `write_page` per page action plus a single append to `log.md`. The whole
-/// batch is committed atomically.
+/// (written unless a file already exists at that path). The LLM's
+/// `IngestPlan` is translated into a [`VaultTx`](crate::vault::VaultTx)
+/// containing one `write_page` per page action plus a single append to
+/// `log.md`. The whole batch is committed atomically.
 ///
 /// Calls [`ingest_with_options`] with defaults; prefer that function if you
 /// need dry-run mode.
