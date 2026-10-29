@@ -29,7 +29,9 @@ pub struct Extracted {
     pub converter: Option<&'static str>,
 }
 
-/// Route `raw` (read from `source_path`) through the right extractor.
+/// Route `raw` (read from `source_path`) through the right extractor. The
+/// text always comes from `raw`: the external converters read a copy of
+/// it, not `source_path`, which may have changed since it was read.
 pub fn extract_source_text(source_path: &Path, raw: &[u8]) -> Result<Extracted> {
     let ext = source_path
         .extension()
@@ -37,11 +39,29 @@ pub fn extract_source_text(source_path: &Path, raw: &[u8]) -> Result<Extracted> 
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "pdf" => extract_pdf(source_path),
-        "docx" | "pptx" | "xlsx" | "epub" => extract_via_docling(source_path, &ext),
+        "pdf" => with_copy(source_path, raw, extract_pdf),
+        "docx" | "pptx" | "xlsx" | "epub" => {
+            with_copy(source_path, raw, |copy| extract_via_docling(copy, &ext))
+        }
         "html" | "htm" => extract_local_html(source_path, raw),
         _ => utf8_text(raw),
     }
+}
+
+/// Run `convert` on a copy of `raw` in a temp dir, under the file name of
+/// `source_path`.
+fn with_copy<T>(
+    source_path: &Path,
+    raw: &[u8],
+    convert: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
+    let tmp = tempfile::tempdir().map_err(|e| Error::Other(anyhow::anyhow!("tempdir: {e}")))?;
+    let name = source_path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("source"));
+    let copy = tmp.path().join(name);
+    std::fs::write(&copy, raw).map_err(|e| Error::io(&copy, e))?;
+    convert(&copy)
 }
 
 fn utf8_text(raw: &[u8]) -> Result<Extracted> {
@@ -203,6 +223,64 @@ mod tests {
     fn non_utf8_markdown_still_errors() {
         let err = extract_source_text(Path::new("note.md"), &[0xff, 0xfe, 0x00]).unwrap_err();
         assert!(err.to_string().contains("not UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn converters_read_a_copy_of_the_bytes_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deck.pptx");
+        std::fs::write(&path, b"written later").unwrap();
+        let seen = with_copy(&path, b"read first", |copy| {
+            assert_eq!(copy.file_name(), path.file_name());
+            Ok(std::fs::read(copy).unwrap())
+        })
+        .unwrap();
+        assert_eq!(seen, b"read first");
+    }
+
+    /// A minimal one-page PDF, all ASCII, that shows `text`.
+    fn ascii_pdf(text: &str) -> Vec<u8> {
+        use std::fmt::Write as _;
+        let stream = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
+        let length = stream.len();
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+             /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_string(),
+            format!("<< /Length {length} >>\nstream\n{stream}\nendstream"),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            writeln!(pdf, "{} 0 obj\n{body}\nendobj", i + 1).unwrap();
+        }
+        let (xref, size) = (pdf.len(), objects.len() + 1);
+        writeln!(pdf, "xref\n0 {size}\n0000000000 65535 f ").unwrap();
+        for offset in offsets {
+            writeln!(pdf, "{offset:010} 00000 n ").unwrap();
+        }
+        writeln!(pdf, "trailer\n<< /Size {size} /Root 1 0 R >>").unwrap();
+        writeln!(pdf, "startxref\n{xref}\n%%EOF").unwrap();
+        pdf.into_bytes()
+    }
+
+    /// An all-ASCII PDF is valid UTF-8, so the ingest drain hands it on. Its
+    /// text must come from the bytes the drain read, not from the file,
+    /// which may have changed since.
+    #[test]
+    fn pdf_text_comes_from_the_bytes_given() {
+        if !tool_on_path("pdftotext") {
+            return; // nothing to convert with
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.pdf");
+        std::fs::write(&path, ascii_pdf("written later")).unwrap();
+        let e = extract_source_text(&path, &ascii_pdf("read first")).unwrap();
+        assert!(e.text.contains("read first"), "{}", e.text);
     }
 
     #[test]

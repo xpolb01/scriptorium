@@ -128,10 +128,14 @@ pub struct IngestOptions {
 /// as a near-duplicate of an existing one and skipped before any LLM
 /// call. Exact re-ingests are already idempotent via hash interning;
 /// this catches re-exports and lightly-edited copies.
-const NEAR_DUP_THRESHOLD: f32 = 0.92;
+pub(crate) const NEAR_DUP_THRESHOLD: f32 = 0.92;
 
 /// Sources larger than this are not compared (cost guard).
 const NEAR_DUP_MAX_BYTES: u64 = 512 * 1024;
+
+/// [`IngestReport::commit_id`] when the near-duplicate gate skipped the
+/// source. Nothing was written or committed.
+pub const NEAR_DUPLICATE_SKIP: &str = "skipped-near-duplicate";
 
 /// Run the ingest pipeline with configurable options. See [`ingest`] for the
 /// default path and [`IngestOptions`] for the knobs.
@@ -151,7 +155,6 @@ pub async fn ingest_with_options(
 /// the source text is embedded and the nearest wiki page chunks are used as
 /// context, much more effective than the default substring title matching,
 /// especially for non-English content.
-#[allow(clippy::too_many_lines)]
 pub async fn ingest_with_retrieval(
     vault: &Vault,
     provider: &dyn LlmProvider,
@@ -161,10 +164,49 @@ pub async fn ingest_with_retrieval(
     embed_provider: Option<&dyn LlmProvider>,
     embed_model: Option<&str>,
 ) -> Result<IngestReport> {
-    // 1. Read the source and extract text (routes PDFs/Office/HTML through
-    //    the best available extractor; plain UTF-8 for md/txt as before).
     let raw = fs::read(source_path).map_err(|e| Error::io(source_path.to_path_buf(), e))?;
-    let extracted = crate::extract::extract_source_text(source_path, &raw)?;
+    let retrieval = Retrieval {
+        store: embed_store,
+        provider: embed_provider,
+        model: embed_model,
+    };
+    ingest_bytes_with_retrieval(vault, provider, source_path, &raw, options, retrieval).await
+}
+
+/// Like [`ingest_with_options`], but ingests `raw` as the content of
+/// `source_path` instead of reading the file, so a caller that read and
+/// checked the source ingests exactly the bytes it checked.
+pub(crate) async fn ingest_bytes(
+    vault: &Vault,
+    provider: &dyn LlmProvider,
+    source_path: &Path,
+    raw: &[u8],
+    options: IngestOptions,
+) -> Result<IngestReport> {
+    let retrieval = Retrieval::default();
+    ingest_bytes_with_retrieval(vault, provider, source_path, raw, options, retrieval).await
+}
+
+/// The embeddings-based retrieval inputs of [`ingest_with_retrieval`].
+#[derive(Clone, Copy, Default)]
+struct Retrieval<'a> {
+    store: Option<&'a crate::embed::EmbeddingsStore>,
+    provider: Option<&'a dyn LlmProvider>,
+    model: Option<&'a str>,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn ingest_bytes_with_retrieval(
+    vault: &Vault,
+    provider: &dyn LlmProvider,
+    source_path: &Path,
+    raw: &[u8],
+    options: IngestOptions,
+    retrieval: Retrieval<'_>,
+) -> Result<IngestReport> {
+    // 1. Extract text from the source (routes PDFs/Office/HTML through the
+    //    best available extractor; plain UTF-8 for md/txt as before).
+    let extracted = crate::extract::extract_source_text(source_path, raw)?;
     let converter = extracted.converter;
     let source_text = extracted.text;
 
@@ -176,7 +218,7 @@ pub async fn ingest_with_retrieval(
         if let Some((existing, sim)) = find_near_duplicate_source(vault, &source_text) {
             return Ok(IngestReport {
                 source: existing.clone(),
-                commit_id: "skipped-near-duplicate".into(),
+                commit_id: NEAR_DUPLICATE_SKIP.into(),
                 created: 0,
                 updated: 0,
                 summary: format!(
@@ -195,11 +237,11 @@ pub async fn ingest_with_retrieval(
     //    LLM: the near-duplicate gate skips their file as a copy of it.
     // Capture the raw bytes' UTF-8 form now — `raw` is shadowed by the
     // parsed plan later, and converted-source staging needs the original.
-    let raw_utf8: Option<String> = std::str::from_utf8(&raw).ok().map(ToString::to_string);
+    let raw_utf8: Option<String> = std::str::from_utf8(raw).ok().map(ToString::to_string);
     let (interned, newly_interned) = if options.dry_run {
-        (interned_path(source_path, &raw), false)
+        (interned_path(source_path, raw), false)
     } else {
-        intern_source(vault, source_path, &raw)?
+        intern_source(vault, source_path, raw)?
     };
     let mut intern_guard = InternGuard::new(vault, &interned, newly_interned);
 
@@ -225,9 +267,9 @@ pub async fn ingest_with_retrieval(
     let embed_pages = retrieve_via_embeddings(
         &prior_scan.pages,
         &source_text,
-        embed_store,
-        embed_provider,
-        embed_model,
+        retrieval.store,
+        retrieval.provider,
+        retrieval.model,
     )
     .await;
 
