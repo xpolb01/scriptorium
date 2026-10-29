@@ -4,6 +4,7 @@
 .scriptorium/embeddings.sqlite-wal
 .scriptorium/embeddings.sqlite-shm
 .scriptorium/vault.lock
+.scriptorium/embed.lock
 .scriptorium/graph.json
 .scriptorium/lint-state.json
 .scriptorium/usage.jsonl

@@ -11,6 +11,9 @@
 //! network for real providers. The mock provider returns immediately so the
 //! integration tests stay fast.
 
+use std::fs::OpenOptions;
+use std::time::Duration;
+
 use tracing::debug;
 
 use super::{
@@ -228,6 +231,11 @@ async fn contextualize_chunks(
 /// [`EmbeddingsStore::retain_page_versions`] directly, or inspect
 /// [`EmbeddingsStore::len`] before and after. Most callers just want
 /// "how many new chunks did I pay to embed this run", which is `total`.
+///
+/// Runs take `<vault>/.scriptorium/embed.lock` in turn, across processes,
+/// from the scan to the prune. Without it, a run that scanned before
+/// another run committed and embedded a page would prune that page's rows.
+/// A run waits for as long as another run holds the lock.
 pub async fn reindex(
     vault: &Vault,
     store: &EmbeddingsStore,
@@ -248,9 +256,50 @@ pub async fn reindex_with_strategy(
     reindex_contextual(vault, store, provider, model, strategy, None).await
 }
 
+/// File, under the vault's meta dir, that reindex runs take in turn across
+/// processes. See [`reindex`].
+const EMBED_LOCK_FILE: &str = "embed.lock";
+
+/// How long a reindex run waits before it tries [`EMBED_LOCK_FILE`] again.
+const EMBED_LOCK_RETRY: Duration = Duration::from_millis(200);
+
 /// Like [`reindex_with_strategy`], with optional contextual chunk
 /// augmentation via `chat` (see [`embed_page_contextual`]).
 pub async fn reindex_contextual(
+    vault: &Vault,
+    store: &EmbeddingsStore,
+    provider: &dyn LlmProvider,
+    model: &str,
+    strategy: ChunkStrategy,
+    chat: Option<&dyn LlmProvider>,
+) -> Result<usize> {
+    let meta = vault.meta_dir().into_std_path_buf();
+    std::fs::create_dir_all(&meta).map_err(|e| Error::io(&meta, e))?;
+    let lock_path = meta.join(EMBED_LOCK_FILE);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| Error::io(&lock_path, e))?;
+    let mut lock = fd_lock::RwLock::new(file);
+    // Poll rather than block: a blocking wait would stall the async
+    // runtime's thread, and another task in this process may hold the lock.
+    loop {
+        match lock.try_write() {
+            Ok(_guard) => {
+                return reindex_locked(vault, store, provider, model, strategy, chat).await;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(Error::io(&lock_path, e)),
+        }
+        tokio::time::sleep(EMBED_LOCK_RETRY).await;
+    }
+}
+
+/// The body of [`reindex_contextual`], run while it holds the embed lock.
+async fn reindex_locked(
     vault: &Vault,
     store: &EmbeddingsStore,
     provider: &dyn LlmProvider,
@@ -292,11 +341,13 @@ pub async fn reindex_contextual(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::MockProvider;
+    use crate::llm::{CompletionRequest, CompletionResponse, LlmError, MockProvider};
     use crate::vault::page::{Frontmatter, PageId};
     use camino::Utf8PathBuf;
     use chrono::{TimeZone, Utc};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use tokio::sync::{Notify, Semaphore};
 
     fn make_page(stem: &str, body: &str) -> Page {
         let now = Utc.with_ymd_and_hms(2026, 4, 6, 12, 0, 0).unwrap();
@@ -346,5 +397,93 @@ mod tests {
             .unwrap();
         assert_eq!(inserted, 0);
         assert_eq!(store.len().unwrap(), 0);
+    }
+
+    /// Embeds like [`MockProvider`], but each `embed` call first reports
+    /// that it started, then waits until the test opens `gate`.
+    struct GatedEmbedder {
+        inner: MockProvider,
+        entered: Arc<Notify>,
+        gate: Arc<Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for GatedEmbedder {
+        async fn complete(
+            &self,
+            req: CompletionRequest,
+        ) -> std::result::Result<CompletionResponse, LlmError> {
+            self.inner.complete(req).await
+        }
+
+        async fn embed(&self, texts: &[String]) -> std::result::Result<Vec<Vec<f32>>, LlmError> {
+            self.entered.notify_one();
+            let _permit = self.gate.acquire().await.expect("gate is never closed");
+            self.inner.embed(texts).await
+        }
+
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn context_window(&self) -> usize {
+            self.inner.context_window()
+        }
+
+        fn embedding_dim(&self) -> usize {
+            self.inner.embedding_dim()
+        }
+    }
+
+    /// Run A scans, then stalls in the provider. A page is written and run B
+    /// indexes it. When A finishes, its prune must keep B's rows for the new
+    /// page.
+    #[tokio::test]
+    async fn concurrent_reindex_keeps_rows_of_a_page_written_after_its_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("wiki")).unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let write = |page: &Page| {
+            let path = dir.path().join(page.path.as_str());
+            std::fs::write(path, page.to_markdown().unwrap()).unwrap();
+        };
+        write(&make_page("alpha", "Alpha body.\n"));
+        let store = EmbeddingsStore::in_memory().unwrap();
+        let entered = Arc::new(Notify::new());
+        let gate = Arc::new(Semaphore::new(0));
+        let gated = GatedEmbedder {
+            inner: MockProvider::constant(""),
+            entered: Arc::clone(&entered),
+            gate: Arc::clone(&gate),
+        };
+        let plain = MockProvider::constant("");
+
+        let run_a = reindex(&vault, &store, &gated, "mock-1");
+        let write_then_run_b = async {
+            // Run A has scanned and waits in the provider.
+            entered.notified().await;
+            write(&make_page("beta", "Beta body.\n"));
+            let open_gate_later = async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                gate.add_permits(1);
+            };
+            let (run_b, ()) =
+                tokio::join!(reindex(&vault, &store, &plain, "mock-1"), open_gate_later);
+            run_b
+        };
+        let (run_a, run_b) = tokio::join!(run_a, write_then_run_b);
+        run_a.unwrap();
+        run_b.unwrap();
+
+        let pages = vault.scan().unwrap().pages;
+        assert_eq!(pages.len(), 2);
+        for page in pages {
+            let hash = page.content_hash().unwrap();
+            assert!(
+                store.has_any_version(page.frontmatter.id, &hash).unwrap(),
+                "{} lost its embeddings",
+                page.path
+            );
+        }
     }
 }
