@@ -20,6 +20,17 @@ pub enum LlmError {
     #[error("response did not validate against schema: {0}")]
     SchemaValidation(String),
 
+    /// A structured reply that is not one complete JSON value of the
+    /// requested shape. `reply` is kept for failure records but never
+    /// displayed or debug-printed: it can quote vault text.
+    #[error("structured reply rejected: {reason}")]
+    InvalidStructuredReply {
+        reason: String,
+        reply: RedactedReply,
+        usage: super::Usage,
+        model: String,
+    },
+
     #[error("response could not be parsed: {0}")]
     InvalidResponse(String),
 
@@ -43,6 +54,34 @@ pub enum LlmError {
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// Model output carried for diagnostics only: `Debug` and `Display` show its
+/// size, never its text. Read it with [`RedactedReply::expose`].
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct RedactedReply(String);
+
+impl RedactedReply {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    /// The reply text, for writing a failure record inside the vault.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for RedactedReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} bytes redacted>", self.0.len())
+    }
+}
+
+impl std::fmt::Display for RedactedReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} bytes redacted>", self.0.len())
+    }
 }
 
 impl LlmError {

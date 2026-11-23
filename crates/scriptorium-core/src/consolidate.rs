@@ -124,7 +124,10 @@ pub async fn find_duplicate_groups(
     Ok(out)
 }
 
+// Unknown fields are an error: `{"merged_body":"draft","error":"merge
+// incomplete"}` must not be committed as a merge.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MergedBody {
     merged_body: String,
 }
@@ -275,9 +278,42 @@ async fn merge_bodies(chat: &dyn LlmProvider, survivor: &Page, others: &[&Page])
         .complete(req)
         .await
         .map_err(|e| Error::Other(anyhow::anyhow!("merge llm: {e}")))?;
-    let payload = crate::llm::extract_json_payload(&resp.text);
-    let parsed: MergedBody = serde_json::from_str(&payload)
-        .map_err(|e| Error::Other(anyhow::anyhow!("merge response parse: {e}")))?;
+    // The merge must be one JSON object. A reply that is complete JSON on
+    // its own is taken as-is. Otherwise, if its first JSON container is an
+    // array (complete or cut off, with or without prose before it), it is
+    // refused: salvaging the object out of
+    // `[{"merged_body":"draft"},"merge incomplete"]` would commit the draft.
+    // Only prose around one object gets the salvage pass (non-strict
+    // providers). A refusal leaves every page as it was.
+    let not_an_object = || Error::Other(anyhow::anyhow!("merge response is not a JSON object"));
+    let unfenced = crate::llm::strip_json_fence(&resp.text);
+    let payload = if serde_json::from_str::<serde::de::IgnoredAny>(&unfenced).is_ok() {
+        unfenced
+    } else if unfenced
+        .find(['{', '['])
+        .is_some_and(|i| unfenced[i..].starts_with('['))
+    {
+        return Err(not_an_object());
+    } else {
+        crate::llm::extract_json_payload(&resp.text)
+    };
+    // Category and position only: serde's message can quote page text.
+    let parse_err = |e: serde_json::Error| {
+        Error::Other(anyhow::anyhow!(
+            "merge response parse: {:?} at line {} column {}",
+            e.classify(),
+            e.line(),
+            e.column()
+        ))
+    };
+    // Serde would also fill a struct from a sequence (`["text"]`), so check
+    // the root first; then parse the text itself (not a `Value`, which would
+    // keep only the last of two `merged_body` keys).
+    let root: serde_json::Value = serde_json::from_str(&payload).map_err(parse_err)?;
+    if !root.is_object() {
+        return Err(not_an_object());
+    }
+    let parsed: MergedBody = serde_json::from_str(&payload).map_err(parse_err)?;
     if parsed.merged_body.trim().is_empty() {
         return Err(Error::Other(anyhow::anyhow!("merge produced empty body")));
     }
@@ -308,6 +344,47 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn page(title: &str, body: &str) -> Page {
+        Page {
+            path: camino::Utf8PathBuf::from(format!("wiki/concepts/{title}.md")),
+            frontmatter: crate::vault::Frontmatter::new(title),
+            body: body.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_rejects_a_reply_that_reports_failure() {
+        let (a, b) = (page("a", "A body"), page("b", "B body"));
+        for reply in [
+            r#"{"merged_body":"partial draft","error":"merge incomplete"}"#,
+            r#"[{"merged_body":"partial draft"},"merge incomplete"]"#,
+            r#"["merge incomplete"]"#,
+            r#"[{"merged_body":"partial draft"},"#,
+            r#""merge incomplete""#,
+            r#"{"merged_body":"complete page","merged_body":"merge incomplete"}"#,
+            "```json\n{\"merged_body\":\"a\",\"merged_body\":\"merge incomplete\"}\n```",
+            "Merged:\n{\"merged_body\":\"a\",\"merged_body\":\"merge incomplete\"}",
+            "Here is the result:\n[{\"merged_body\":\"partial draft\"},\"merge incomplete\"]",
+            "Here is the result:\n[{\"merged_body\":\"partial draft\"},",
+            "```json\n[{\"merged_body\":\"partial draft\"},\"merge incomplete\"]\n```",
+            // serde names an unknown field in its message: the error must not.
+            r#"{"merged_body":"draft","SECRET-MARKER":1}"#,
+        ] {
+            let mock = crate::llm::MockProvider::constant(reply);
+            let err = merge_bodies(&mock, &a, &[&b]).await.unwrap_err();
+            assert!(!format!("{err:#}").contains("SECRET-MARKER"), "{err:#}");
+        }
+        for ok in [
+            r#"{"merged_body":"merged"}"#,
+            "```json\n{\"merged_body\":\"merged\"}\n```",
+            // Prose around one object is still salvaged (non-strict providers).
+            "Here you go:\n{\"merged_body\":\"merged\"}",
+        ] {
+            let mock = crate::llm::MockProvider::constant(ok);
+            assert_eq!(merge_bodies(&mock, &a, &[&b]).await.unwrap(), "merged");
+        }
+    }
 
     #[test]
     fn cosine_basics() {

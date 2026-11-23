@@ -52,7 +52,10 @@ impl FaithfulnessReport {
     }
 }
 
+// Unknown fields are an error: `{"error":"unable to assess","claims":[]}`
+// must not score as a perfect audit.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JudgeResponse {
     claims: Vec<ClaimVerdict>,
 }
@@ -103,22 +106,29 @@ pub async fn judge_faithfulness(
         temperature: Some(0.0),
         response_schema: Some(schema.clone()),
     };
-    let resp = provider
-        .complete(build_req(8192))
-        .await
-        .map_err(|e| Error::Other(anyhow::anyhow!("faithfulness judge: {e}")))?;
+    // Near-empty or cut-off output almost always means the completion budget
+    // was eaten by proxy-side reasoning — retry once with a bigger budget.
+    let retry = || async {
+        let resp = provider
+            .complete(build_req(16_384))
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("faithfulness judge (retry): {e}")))?;
+        Ok(score_report(parse_claims(&resp.text)?))
+    };
+    let resp = match provider.complete(build_req(8192)).await {
+        Ok(resp) => resp,
+        // Cut off, or (from a provider that validates) empty or not one JSON
+        // value: the same budget symptom as a near-empty reply.
+        Err(
+            crate::llm::LlmError::Truncated { .. }
+            | crate::llm::LlmError::SchemaValidation(_)
+            | crate::llm::LlmError::InvalidStructuredReply { .. },
+        ) => return retry().await,
+        Err(e) => return Err(Error::Other(anyhow::anyhow!("faithfulness judge: {e}"))),
+    };
     match parse_claims(&resp.text) {
         Ok(claims) => Ok(score_report(claims)),
-        // Near-empty output almost always means the completion budget was
-        // eaten by proxy-side reasoning — retry once with a bigger budget.
-        Err(_) if resp.text.trim().len() < 10 => {
-            let resp = provider
-                .complete(build_req(16_384))
-                .await
-                .map_err(|e| Error::Other(anyhow::anyhow!("faithfulness judge (retry): {e}")))?;
-            let claims = parse_claims(&resp.text)?;
-            Ok(score_report(claims))
-        }
+        Err(_) if resp.text.trim().len() < 10 => retry().await,
         Err(e) => Err(e),
     }
 }
@@ -128,6 +138,28 @@ pub async fn judge_faithfulness(
 /// for (observed with OpenAI-compatible proxies that pass the schema as a
 /// hint rather than enforcing it).
 fn parse_claims(text: &str) -> Result<Vec<ClaimVerdict>> {
+    // A reply that is itself complete JSON (strict mode, or the OpenAI
+    // provider's validated prompt mode) counts only through its top-level
+    // form: a claims wrapper or a bare verdict array. Mining it for a nested
+    // array would score `{"error":"unable to assess","evidence":[]}` as a
+    // perfect audit.
+    let trimmed = text.trim();
+    if serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_ok() {
+        // Typed parse from the original text: duplicate `claims` keys are an
+        // error here, where a `Value` would silently keep the last one.
+        let claims = if trimmed.starts_with('[') {
+            serde_json::from_str::<Vec<ClaimVerdict>>(trimmed).ok()
+        } else {
+            serde_json::from_str::<JudgeResponse>(trimmed)
+                .ok()
+                .map(|w| w.claims)
+        };
+        return claims.ok_or_else(|| {
+            Error::Other(anyhow::anyhow!(
+                "faithfulness judge returned JSON without a claims list"
+            ))
+        });
+    }
     let payload = crate::llm::extract_json_payload(text);
     if let Ok(wrapper) = serde_json::from_str::<JudgeResponse>(&payload) {
         return Ok(wrapper.claims);
@@ -265,6 +297,63 @@ mod tests {
         let report = judge_faithfulness(&mock, "s", "c").await.unwrap();
         assert_eq!(report.claims.len(), 2);
         assert!((report.score - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn complete_json_counts_only_through_its_top_level_form() {
+        for text in [
+            r#"{"error":"unable to assess","evidence":[]}"#,
+            r#"{"claims":"none","notes":[]}"#,
+            r#"{"claims":[{"claim":"x","supported":false}],"claims":[]}"#,
+            r#"{"error":"unable to assess","claims":[]}"#,
+        ] {
+            let mock = MockProvider::constant(text);
+            assert!(judge_faithfulness(&mock, "s", "c").await.is_err(), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_truncated_first_reply_retries_with_the_larger_budget() {
+        use crate::llm::{CompletionResponse, LlmError, Usage};
+        let truncated = |req: &crate::llm::CompletionRequest| LlmError::Truncated {
+            provider: "mock".into(),
+            output_tokens: u64::from(req.max_tokens),
+            max_tokens: req.max_tokens,
+        };
+        let mock = MockProvider::with_handler(move |req| {
+            if req.max_tokens < 16_384 {
+                Err(truncated(req))
+            } else {
+                Ok(CompletionResponse {
+                    text: r#"{"claims":[{"claim":"a","supported":true}]}"#.into(),
+                    usage: Usage::default(),
+                    model: "mock".into(),
+                })
+            }
+        });
+        let report = judge_faithfulness(&mock, "s", "c").await.unwrap();
+        assert_eq!(report.claims.len(), 1);
+        // Truncated again at the larger budget: an error, not a score.
+        let mock = MockProvider::with_handler(move |req| Err(truncated(req)));
+        assert!(judge_faithfulness(&mock, "s", "c").await.is_err());
+        // An empty reply rejected by a validating provider retries the same way.
+        let mock = MockProvider::with_handler(move |req| {
+            if req.max_tokens < 16_384 {
+                Err(LlmError::InvalidStructuredReply {
+                    reason: "not one complete JSON value".into(),
+                    reply: crate::llm::RedactedReply::new(""),
+                    usage: Usage::default(),
+                    model: "mock".into(),
+                })
+            } else {
+                Ok(CompletionResponse {
+                    text: r#"{"claims":[]}"#.into(),
+                    usage: Usage::default(),
+                    model: "mock".into(),
+                })
+            }
+        });
+        assert!(judge_faithfulness(&mock, "s", "c").await.is_ok());
     }
 
     #[tokio::test]

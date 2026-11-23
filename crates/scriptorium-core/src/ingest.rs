@@ -349,10 +349,45 @@ async fn ingest_bytes_with_retrieval(
     }
 
     // 5. Call the LLM and parse the structured response.
-    let response = provider
-        .complete(req)
-        .await
-        .map_err(|e| Error::Other(anyhow::anyhow!("llm ingest call: {e}")))?;
+    let response = match provider.complete(req).await {
+        Ok(response) => response,
+        // A reply the provider rejected as structured output (prompt-mode
+        // schema): keep it in the failure record like any unparseable plan,
+        // and keep it out of the error.
+        Err(crate::llm::LlmError::InvalidStructuredReply {
+            reason,
+            reply,
+            usage,
+            model,
+        }) => {
+            let response = crate::llm::CompletionResponse {
+                text: reply.expose().to_owned(),
+                usage,
+                model,
+            };
+            let _ = record_usage(
+                &vault.meta_dir(),
+                "ingest",
+                provider.name(),
+                &response.model,
+                &response.usage,
+            );
+            let saved = record_parse_failure(
+                vault,
+                source_path,
+                label,
+                provider.name(),
+                &response,
+                &format!("rejected with the schema in the system prompt: {reason}"),
+                &req_for_failure,
+            );
+            return Err(Error::Other(anyhow::anyhow!(
+                "llm ingest returned an invalid structured reply ({reason}); {}",
+                failure_record_note(saved)
+            )));
+        }
+        Err(e) => return Err(Error::Other(anyhow::anyhow!("llm ingest call: {e}"))),
+    };
     // Best-effort usage logging; don't let a failed log block the ingest.
     let _ = record_usage(
         &vault.meta_dir(),
@@ -365,42 +400,25 @@ async fn ingest_bytes_with_retrieval(
     let raw: crate::llm::prompts::IngestPlanRaw = match parse_plan_tolerant(&salvaged) {
         Ok(r) => r,
         Err(parse_err) => {
-            // Persist the full context so the bug is debuggable after the
-            // fact. Don't let a failure to write the failure record mask
-            // the underlying parse error — log and continue on secondary
-            // failures.
-            if let Err(persist_err) = persist_ingest_failure(
+            let saved = record_parse_failure(
                 vault,
                 source_path,
+                label,
                 provider.name(),
                 &response,
-                &parse_err,
+                &parse_err.to_string(),
                 &req_for_failure,
-            ) {
-                tracing::warn!(
-                    error = %persist_err,
-                    "failed to persist ingest-failure record"
-                );
-            }
-            // Auto-capture a learning about this failure.
-            let _ = crate::learnings::capture(
-                vault,
-                &crate::learnings::Learning {
-                    ts: Utc::now(),
-                    skill: "ingest".into(),
-                    learning_type: crate::learnings::LearningType::Pitfall,
-                    key: format!("parse-fail-{label}"),
-                    insight: format!("Ingest parse failed on '{label}': {parse_err}"),
-                    confidence: 6,
-                    source: crate::learnings::LearningSource::Observed,
-                    tags: vec!["ingest".into(), "parse-error".into()],
-                    files: vec![source_path.display().to_string()],
-                },
             );
 
+            // Category and position only: serde's message can quote a field
+            // value (source text), and this error reaches CLI telemetry
+            // outside the vault. The full reply is in the failure record.
             return Err(Error::Other(anyhow::anyhow!(
-                "llm ingest returned invalid IngestPlan json: {parse_err}; \
-                 raw response saved to <vault>/.ingest-failures/"
+                "llm ingest returned invalid IngestPlan json ({:?} at line {} column {}); {}",
+                parse_err.classify(),
+                parse_err.line(),
+                parse_err.column(),
+                failure_record_note(saved)
             )));
         }
     };
@@ -1310,12 +1328,64 @@ fn sha256_hex_of_line_endings(mut content: impl std::io::Read) -> std::io::Resul
 /// Failures to write the record are NOT propagated — the caller is already
 /// in an error path and the primary error (the parse failure) should
 /// surface unchanged. A secondary write failure is logged via `tracing`.
+fn failure_record_note(saved: bool) -> &'static str {
+    if saved {
+        "raw response saved to <vault>/.ingest-failures/"
+    } else {
+        "the raw response could not be saved (see the log)"
+    }
+}
+
+/// Persist the full context of an unusable ingest reply so the bug is
+/// debuggable after the fact, and capture a learning about it. Returns
+/// whether the failure record was written. Secondary failures are logged,
+/// never returned: they must not mask the parse error.
+fn record_parse_failure(
+    vault: &Vault,
+    source_path: &Path,
+    label: &str,
+    provider_name: &str,
+    response: &crate::llm::CompletionResponse,
+    parse_error: &str,
+    req: &crate::llm::CompletionRequest,
+) -> bool {
+    let persisted = persist_ingest_failure(
+        vault,
+        source_path,
+        provider_name,
+        response,
+        parse_error,
+        req,
+    );
+    if let Err(persist_err) = &persisted {
+        tracing::warn!(
+            error = %persist_err,
+            "failed to persist ingest-failure record"
+        );
+    }
+    let _ = crate::learnings::capture(
+        vault,
+        &crate::learnings::Learning {
+            ts: Utc::now(),
+            skill: "ingest".into(),
+            learning_type: crate::learnings::LearningType::Pitfall,
+            key: format!("parse-fail-{label}"),
+            insight: format!("Ingest parse failed on '{label}': {parse_error}"),
+            confidence: 6,
+            source: crate::learnings::LearningSource::Observed,
+            tags: vec!["ingest".into(), "parse-error".into()],
+            files: vec![source_path.display().to_string()],
+        },
+    );
+    persisted.is_ok()
+}
+
 fn persist_ingest_failure(
     vault: &Vault,
     source_path: &Path,
     provider_name: &str,
     response: &crate::llm::CompletionResponse,
-    parse_error: &serde_json::Error,
+    parse_error: &str,
     req: &crate::llm::CompletionRequest,
 ) -> Result<()> {
     let dir = vault.root().join(".ingest-failures");
@@ -1335,9 +1405,13 @@ fn persist_ingest_failure(
         "model": response.model,
         "input_tokens": response.usage.input_tokens,
         "output_tokens": response.usage.output_tokens,
-        "parse_error": parse_error.to_string(),
+        "parse_error": parse_error,
         "raw_response": response.text,
         "prompt_system": req.system,
+        // The schema the reply had to match. Delivered as `response_format`,
+        // or appended to the system prompt when the backend refuses a forced
+        // tool call (then `parse_error` says so).
+        "response_schema": req.response_schema,
         "prompt_user_messages": user_messages,
     });
     let pretty = serde_json::to_string_pretty(&record)
