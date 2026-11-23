@@ -165,10 +165,15 @@ pub async fn query(
         &resp.model,
         &resp.usage,
     );
+    // The error never quotes the reply (or serde's message, which can quote
+    // a field value): it reaches CLI telemetry and MCP logs outside the vault.
     let answer: QueryAnswer = serde_json::from_str(&resp.text).map_err(|e| {
         Error::Other(anyhow::anyhow!(
-            "llm query returned invalid QueryAnswer json: {e}; raw = {}",
-            resp.text
+            "llm query returned invalid QueryAnswer json ({} bytes; {:?} at line {} column {})",
+            resp.text.len(),
+            e.classify(),
+            e.line(),
+            e.column()
         ))
     })?;
 

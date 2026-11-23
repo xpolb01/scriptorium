@@ -30,13 +30,29 @@ pub enum Retry {
 pub async fn with_retry<T, F, Fut>(
     max_attempts: u32,
     overall_timeout: Duration,
-    mut attempt: F,
+    attempt: F,
 ) -> Result<T, LlmError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, Retry>>,
 {
     let deadline = tokio::time::Instant::now() + overall_timeout;
+    with_retry_until(max_attempts, deadline, overall_timeout, attempt).await
+}
+
+/// [`with_retry`] against an absolute `deadline` the caller already holds,
+/// so several calls can share one budget. `overall_timeout` only labels the
+/// timeout error.
+pub async fn with_retry_until<T, F, Fut>(
+    max_attempts: u32,
+    deadline: tokio::time::Instant,
+    overall_timeout: Duration,
+    mut attempt: F,
+) -> Result<T, LlmError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, Retry>>,
+{
     let mut delay = Duration::from_millis(250);
     let mut last_err: Option<LlmError> = None;
 
@@ -87,6 +103,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn with_retry_until_makes_no_attempt_after_the_deadline() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&calls);
+        let past = tokio::time::Instant::now() - Duration::from_millis(1);
+        let res: Result<(), LlmError> =
+            with_retry_until(3, past, Duration::from_secs(1), move || {
+                c.fetch_add(1, Ordering::Relaxed);
+                async { Ok(()) }
+            })
+            .await;
+        assert!(matches!(res, Err(LlmError::Timeout { .. })));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
 
     #[tokio::test]
     async fn succeeds_on_first_try() {

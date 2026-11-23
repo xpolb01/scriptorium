@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 pub use claude::{ClaudeConfig, ClaudeProvider};
-pub use error::LlmError;
+pub use error::{LlmError, RedactedReply};
 pub use gemini::{GeminiConfig, GeminiProvider};
 pub use mock::MockProvider;
 pub use ollama::{OllamaConfig, OllamaProvider};
@@ -171,16 +171,36 @@ where
 {
     let resp = provider.complete(req).await?;
     let payload = extract_json_payload(&resp.text);
-    serde_json::from_str(&payload)
-        .map_err(|e| LlmError::InvalidResponse(format!("json parse: {e}")))
+    // Category and position only: serde's message can quote a field value
+    // (vault text), and callers log this error.
+    serde_json::from_str(&payload).map_err(|e| {
+        LlmError::InvalidResponse(format!(
+            "json parse: {:?} at line {} column {}",
+            e.classify(),
+            e.line(),
+            e.column()
+        ))
+    })
 }
 
 /// Locate the JSON object inside an LLM response that may be wrapped in
 /// markdown fences or surrounded by prose. Strips one optional ```` ```json ````
 /// or ```` ``` ```` fence, then narrows to the outermost `{...}` span.
 pub fn extract_json_payload(text: &str) -> String {
+    let unfenced = strip_json_fence(text);
+    if let (Some(start), Some(end)) = (unfenced.find('{'), unfenced.rfind('}')) {
+        if end >= start {
+            return unfenced[start..=end].to_string();
+        }
+    }
+    unfenced
+}
+
+/// The reply with surrounding whitespace and one leading/trailing markdown
+/// code fence removed; nothing else is cut.
+pub fn strip_json_fence(text: &str) -> String {
     let trimmed = text.trim();
-    let unfenced = trimmed
+    trimmed
         .strip_prefix("```json")
         .or_else(|| trimmed.strip_prefix("```JSON"))
         .or_else(|| trimmed.strip_prefix("```"))
@@ -190,13 +210,7 @@ pub fn extract_json_payload(text: &str) -> String {
                 let rest = rest.trim_start_matches(['\n', '\r', ' ']);
                 rest.strip_suffix("```").map_or(rest, str::trim).to_string()
             },
-        );
-    if let (Some(start), Some(end)) = (unfenced.find('{'), unfenced.rfind('}')) {
-        if end >= start {
-            return unfenced[start..=end].to_string();
-        }
-    }
-    unfenced
+        )
 }
 
 #[cfg(test)]
@@ -231,5 +245,35 @@ mod extract_json_payload_tests {
     fn preserves_nested_objects() {
         let raw = "```json\n{\"a\":{\"b\":1}}\n```";
         assert_eq!(extract_json_payload(raw), "{\"a\":{\"b\":1}}");
+    }
+}
+
+#[cfg(test)]
+mod complete_as_tests {
+    use super::{complete_as, CompletionRequest, Message, MockProvider, Role};
+
+    #[derive(Debug, serde::Deserialize)]
+    struct Ranked {
+        #[allow(dead_code)]
+        ranking: Vec<u32>,
+    }
+
+    #[tokio::test]
+    async fn parse_error_does_not_quote_the_reply() {
+        let mock = MockProvider::constant(r#"{"ranking":["SECRET-MARKER"]}"#);
+        let req = CompletionRequest {
+            system: "rank".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: "q".into(),
+            }],
+            max_tokens: 64,
+            temperature: Some(0.0),
+            response_schema: Some(serde_json::json!({"type": "object"})),
+        };
+        let err = complete_as::<Ranked>(&mock, req).await.unwrap_err();
+        let shown = format!("{err} {err:?}");
+        assert!(shown.contains("json parse"), "{shown}");
+        assert!(!shown.contains("SECRET-MARKER"), "{shown}");
     }
 }

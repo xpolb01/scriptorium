@@ -21,8 +21,8 @@ use scriptorium_core::lint::{
     self, broken_links::BROKEN, frontmatter::DUPLICATE_ID, orphans::RULE as ORPHAN, Severity,
 };
 use scriptorium_core::llm::{
-    CompletionRequest, IngestAction, IngestPageAction, IngestPlan, LlmProvider, MockProvider,
-    QueryAnswer,
+    CompletionRequest, CompletionResponse, IngestAction, IngestPageAction, IngestPlan, LlmError,
+    LlmProvider, MockProvider, QueryAnswer, RedactedReply, Usage,
 };
 use scriptorium_core::query;
 use scriptorium_core::vault::{Action, LinkGraph, Vault};
@@ -446,6 +446,107 @@ async fn query_returns_cited_answer_via_mock() {
         !report.retrieved.is_empty(),
         "should retrieve at least one page"
     );
+}
+
+#[tokio::test]
+async fn query_error_does_not_quote_the_reply() {
+    let (_dir, vault) = empty_test_vault();
+    let store = EmbeddingsStore::in_memory().unwrap();
+    let embed_mock = MockProvider::constant("unused");
+    let reply = MockProvider::constant(r#"{"excerpt":"SECRET-MARKER private vault text"}"#);
+    let err = query::query(
+        &vault,
+        &store,
+        &reply,
+        &embed_mock,
+        "mock-1",
+        "what is in the vault?",
+        5,
+        &scriptorium_core::config::SearchConfig::default(),
+    )
+    .await
+    .unwrap_err();
+    let shown = format!("{err:#}");
+    assert!(shown.contains("invalid QueryAnswer json"), "{shown}");
+    assert!(!shown.contains("SECRET-MARKER"), "{shown}");
+}
+
+#[tokio::test]
+async fn ingest_parse_error_does_not_quote_the_reply() {
+    let (dir, vault) = empty_test_vault();
+    let reply = MockProvider::constant(
+        r#"{"summary":"s","pages":[],"log_entry":"l","redundant":"SECRET-MARKER source excerpt"}"#,
+    );
+    let source = dir.path().join("sources/articles/one.md");
+    std::fs::write(&source, "one").unwrap();
+    let err = ingest::ingest(&vault, &reply, &source).await.unwrap_err();
+    let shown = format!("{err:#}");
+    assert!(shown.contains("invalid IngestPlan json"), "{shown}");
+    assert!(!shown.contains("SECRET-MARKER"), "{shown}");
+}
+
+/// A provider whose structured replies are all rejected, as the OpenAI
+/// provider does in prompt mode when a reply is not one schema-shaped value.
+struct RejectsStructuredReplies;
+
+#[async_trait::async_trait]
+impl LlmProvider for RejectsStructuredReplies {
+    async fn complete(&self, _req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        Err(LlmError::InvalidStructuredReply {
+            reason: "reply is not one complete JSON value".into(),
+            reply: RedactedReply::new("Here is the plan: SECRET-MARKER {\"summary\""),
+            usage: Usage {
+                input_tokens: 7,
+                output_tokens: 11,
+            },
+            model: "stub-1".into(),
+        })
+    }
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
+        Ok(texts.iter().map(|_| vec![0.0; 4]).collect())
+    }
+    fn name(&self) -> &str {
+        "stub"
+    }
+    fn context_window(&self) -> usize {
+        200_000
+    }
+    fn embedding_dim(&self) -> usize {
+        4
+    }
+}
+
+#[tokio::test]
+async fn ingest_keeps_a_rejected_structured_reply_in_the_failure_record() {
+    let (dir, vault) = empty_test_vault();
+    let source = dir.path().join("sources/articles/one.md");
+    std::fs::write(&source, "one").unwrap();
+    let err = ingest::ingest(&vault, &RejectsStructuredReplies, &source)
+        .await
+        .unwrap_err();
+    let shown = format!("{err:#} {err:?}");
+    assert!(shown.contains("invalid structured reply"), "{shown}");
+    assert!(shown.contains("raw response saved"), "{shown}");
+    assert!(!shown.contains("SECRET-MARKER"), "{shown}");
+
+    let failures: Vec<_> = std::fs::read_dir(dir.path().join(".ingest-failures"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&failures[0]).unwrap()).unwrap();
+    assert!(record["raw_response"]
+        .as_str()
+        .unwrap()
+        .contains("SECRET-MARKER"));
+    assert_eq!(record["model"], "stub-1");
+    assert_eq!(record["output_tokens"], 11);
+    assert!(record["response_schema"].is_object(), "{record}");
+    assert!(record["parse_error"]
+        .as_str()
+        .unwrap()
+        .contains("schema in the system prompt"));
 }
 
 #[tokio::test]
